@@ -919,3 +919,35 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_handler);
 }
+
+/* ---------------------------------------------------------------------------
+ * Boot-harness wiring
+ *
+ * The recompiled games call lv2_syscall() (defined in the PPU boot harness,
+ * runtime/ppu/ppu_loader.cpp). That harness now consults this global table via
+ * lv2_try_syscall(), so the CRT's semaphore / mutex / memory / fs syscalls hit
+ * the real implementations registered above instead of a return-0 logger stub.
+ * Call lv2_init_syscalls() once at startup.
+ * -----------------------------------------------------------------------*/
+lv2_syscall_table g_lv2_syscalls;
+
+void lv2_init_syscalls(void)
+{
+    lv2_register_all_syscalls(&g_lv2_syscalls);
+}
+
+/* Returns 1 (and sets gpr[3] from the handler) if `num` is a registered
+ * syscall; 0 if unregistered (the caller keeps its own stub behaviour). The
+ * comparison against the static-inline sentinel is reliable here because this
+ * TU and lv2_syscall_table_init share the same instance. */
+int lv2_try_syscall(ppu_context* ctx)
+{
+    uint32_t num = (uint32_t)ctx->gpr[11];
+    if (num >= LV2_SYSCALL_MAX)
+        return 0;
+    lv2_syscall_fn h = g_lv2_syscalls.handlers[num];
+    if (!h || h == lv2_syscall_unimplemented)
+        return 0;
+    ctx->gpr[3] = (uint64_t)h(ctx);
+    return 1;
+}
