@@ -340,6 +340,12 @@ for who did what — thank you, everyone.
 
 ## Changelog
 
+### v0.6.2 — *"Boot Sequence"* (June 2026)
+- **PPU boot scaffold** (thanks [@pauloadrianoalves](https://github.com/pauloadrianoalves), PR #3): `runtime/ppu/` (loader, HLE dispatch, sysprx, filesystem) + `runtime/host/host_main.c` — the per-game path that loads a lifted PPU image, links it with the HLE runtime, and boots it. Built per-game against the lifter-generated `ppu_recomp.h`, so it's excluded from the game-agnostic runtime library. See `docs/PPU_RECOMP.md`.
+- **RSX shader decompilers** (thanks [@pauloadrianoalves](https://github.com/pauloadrianoalves)): `rsx_fp_decompiler` / `rsx_vp_decompiler` translate NV40 fragment/vertex programs to host shaders, with a validation-test corpus. See `docs/RSX_FRAGMENT_PROGRAM.md`.
+- **PPU tooling**: `tools/ppu_loader.py` (image manifest / OPD table / TOC / imports) and `tools/gen_hle_nids.py`.
+- *Note:* PR #3's SPU lifter/disassembler and `nid_database` changes were **not** taken — they predate and would regress the v0.6.0 SPU subsystem and the v0.6.1 NID fix.
+
 ### v0.6.1 — *"Many Hands"* (June 2026)
 *The community showed up. Most of this release came in over the wall as pull requests — almost all of it discovered by [**@canersaka**](https://github.com/canersaka) while stress-testing the toolkit against a 22 MB / ~45,000-function **Yakuza: Dead Souls** port, which turns out to be a fantastic fuzzer for everything we got subtly wrong. Huge thanks to every contributor below.*
 

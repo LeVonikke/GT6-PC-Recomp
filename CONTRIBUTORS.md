@@ -62,6 +62,22 @@ wrong. Landed in **v0.6.1 "Many Hands"**:
 - **`tools/show_func.py`** — dump a single lifted function's C and/or its
   original PowerPC disassembly from the chunked output.
 
+### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
+Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
+in **v0.6.2** — the SPU portions were superseded by the v0.6.0 SPU subsystem and
+not taken):
+- **PPU boot scaffold** — `runtime/ppu/` (loader, HLE dispatch, sysprx, fs) +
+  `runtime/host/host_main.c`: the per-game path that loads a lifted PPU image,
+  links it with the HLE runtime, and boots it. Compiled per-game against the
+  lifter-generated `ppu_recomp.h`, so it lives outside the game-agnostic runtime
+  library build.
+- **RSX shader decompilers** — `libs/video/rsx_fp_decompiler.*` and
+  `rsx_vp_decompiler.*`: NV40 fragment/vertex program → host shader translation,
+  with a validation-test corpus.
+- **Tooling** — `tools/ppu_loader.py` (image manifest / OPD table / TOC / imports
+  extraction) and `tools/gen_hle_nids.py`.
+- **Docs** — `docs/PPU_RECOMP.md`, `docs/RSX_FRAGMENT_PROGRAM.md`.
+
 ### Lucas Picoli — [@LucasPicoli](https://github.com/LucasPicoli)
 - **Linux/GCC build fixes** — glibc's `st_atime`/`st_mtime`/`st_ctime` macros
   were shadowing identically named `CellFsStat` / `CellSaveData` members; five
