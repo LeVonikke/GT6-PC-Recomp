@@ -89,3 +89,4 @@ ehthumbs.db
 # Harness batch-run outputs (per-title JSON, work dirs, REPORT.md)
 _harness/
 .pr_review/
+_drill/
