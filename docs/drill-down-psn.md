@@ -86,6 +86,34 @@ needs the SPU recompilation path, not just PPU.
 3. **Native indies** (Everyday Shooter, Gravity Crash, Echochrome) — each a
    unique 10–14k-function engine; Echochrome additionally needs SPU.
 
+## Boot follow-up — Sonic & Gunstar now boot (and confirm the clustering)
+
+Pointed the generic boot harness at the two SEGA hubs (best-recall IDA-seeded
+lift → clang-cl, ~33 MB exes). Both **execute real PPC code to the CRT** — the
+same milestone Tokyo Jungle and Simpsons reached:
+
+| title | lifted funcs | entry OPD | CRT syscalls hit | wall |
+|---|---:|---|---|---|
+| Gunstar Heroes | 15,464 | 0x1856F0 | **94** (sys_semaphore_post) | abort() |
+| Sonic 1 | ~16k | 0x185AE0 | **988 + 94** | abort() |
+| Tokyo Jungle | 25,696 | 0x3428F0 | 988 | abort() |
+
+The clustering shows up even in the boot trace: **Sonic calls both `988` (Tokyo
+Jungle's syscall) and `94` (Gunstar's)** — the SEGA shell straddles both. All
+three hit the *same wall*: the boot harness's `lv2_syscall` only hand-implements
+a few syscalls (352, 330); the CRT's `sys_semaphore_post`(94) and `988` fall to
+a logger-stub returning 0, which derails a CRT table walk into `abort()`.
+
+**Unified next step (advances all three at once):** wire the boot harness's
+`lv2_syscall` to the real `runtime/syscalls` table (`lv2_register`) instead of
+the inline stub — the semaphore/memory/sync syscalls already exist there. Each
+boot's trace + projects are under `D:\recomp\ps3games\{gunstar,sonic1}\project\`
+(`BOOT_TRACE.txt`).
+
+These were near-free to bring up: at 88–95% import overlap they reused the
+Simpsons/Tokyo-Jungle stubs and toolkit fixes verbatim — exactly the payoff the
+clustering predicted.
+
 ## Caveats
 - Function counts are `.opd`-hardened `find_functions` (pre-`--seed-json`); the
   Ghidra/IDA cross-check would refine them per title.
