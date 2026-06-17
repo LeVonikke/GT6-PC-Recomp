@@ -23,7 +23,7 @@ front doors:
 | 3 | profile | seconds | `elf_parser.py` → machine, entry, **image base**, segments, memsz |
 | 4 | functions | seconds | `find_functions.py` → function count, `.opd`-seeded starts, verify |
 | 5 | lift | minutes–GBs | `ppu_lifter.py -j N` → generated C chunks, giant-function warnings (**opt-in**) |
-| 6 | crosscheck | ~1 min/binary | `ghidra_analyze.py` headless → compares `find_functions` to Ghidra's function set; reports **recall** (functions Ghidra finds that we miss) + `extra` (**opt-in**, needs Ghidra at `c:\tools\ghidra`) |
+| 6 | crosscheck | ~10–60 s/binary | `--oracle ghidra\|ida\|both`: runs Ghidra (`ghidra_analyze.py`) and/or IDA (`ida_analyze.py`) headless and compares `find_functions` to their function set. Reports **recall** (functions the oracle finds that we miss) + `extra`; with `both`, a **high-confidence** recall vs the set Ghidra and IDA agree on. The gap is recoverable via `find_functions --seed-json`. (**opt-in**, needs Ghidra at `c:\tools\ghidra` / IDA via Python 3.11 idalib) |
 
 Each title is isolated, timed and resumable; one title's failure never aborts the
 batch. Per-title results land in `<out>/results/*.json`; `report` aggregates them
