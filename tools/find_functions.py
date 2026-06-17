@@ -536,19 +536,32 @@ def collect_opd_seeds(elf, exec_ranges: list[tuple[int, int]],
         if ph.p_type == PT_LOAD and ph.p_filesz > 0 and not (ph.p_flags & 1):
             data_segs.append((ph.p_vaddr, elf.get_segment_data(i)))
 
-    data_ranges = [(v, v + len(d)) for v, d in data_segs]
-
     def in_exec(a: int) -> bool:
         return any(lo <= a < hi for lo, hi in exec_ranges)
 
-    def in_data(a: int) -> bool:
-        return any(lo <= a < hi for lo, hi in data_ranges)
+    # The TOC (r2) base every descriptor points at is NOT required to land inside
+    # a file-backed data range: it commonly sits in BSS, or even in the gap just
+    # past a segment's end (a TOC base is typically .got + 0x8000). Requiring
+    # in_data(toc) drops whole tables (flOw, Marvel UA seeded 0 this way). The
+    # real OPD signature is instead "a constant `toc` shared across many
+    # descriptors, each with a valid 4-aligned text `code`". So we only require
+    # the toc to be a plausible non-code data pointer: nonzero, not in the text,
+    # and within the bounding span of the loadable non-exec segments (memsz, so
+    # BSS and inter-segment gaps count). The >=16 exact-repeat threshold below is
+    # what actually discriminates a table from coincidence.
+    nonexec = [ph for ph in elf.program_headers
+               if ph.p_type == PT_LOAD and ph.p_memsz > 0 and not (ph.p_flags & 1)]
+    data_lo = min((ph.p_vaddr for ph in nonexec), default=0)
+    data_hi = max((ph.p_vaddr + ph.p_memsz for ph in nonexec), default=0)
+
+    def plausible_toc(a: int) -> bool:
+        return a != 0 and not in_exec(a) and data_lo <= a < data_hi
 
     toc_freq: Counter = Counter()
     for vaddr, dat in data_segs:
         for off in range(0, len(dat) - 7, 4):
             code, toc = struct.unpack_from(fmt, dat, off)
-            if code % 4 == 0 and in_exec(code) and in_data(toc):
+            if code % 4 == 0 and in_exec(code) and plausible_toc(toc):
                 toc_freq[toc] += 1
 
     keep = {t for t, c in toc_freq.items() if c >= 16}
@@ -636,6 +649,15 @@ def main() -> None:
                 seeds = collect_opd_seeds(elf, exec_ranges, big_endian)
                 _note(f"opd scan: {len(seeds)} descriptor code addresses "
                       f"({time.time() - t:.1f}s)")
+                # A large text segment with ~no descriptors almost always means a
+                # missed .opd table (wrong endianness, unusual layout), not a
+                # genuinely descriptor-less binary -- pointer-only/virtual
+                # functions will be invisible to the lifter. Flag it loudly.
+                text_bytes = sum(hi - lo for lo, hi in exec_ranges)
+                if text_bytes > 0x40000 and len(seeds) <= 1:
+                    _note(f"WARNING: only {len(seeds)} .opd descriptor(s) found in "
+                          f"{text_bytes // 1024} KB of text -- the table was likely "
+                          f"missed; address-taken functions may go undetected")
         except Exception as exc:
             print(f"Warning: ELF parse failed ({exc}), treating as raw", file=sys.stderr)
             all_insns = disassemble_bytes(file_data, base_addr, big_endian)
