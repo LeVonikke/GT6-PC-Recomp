@@ -163,10 +163,13 @@ extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
     }
 }
 
+/* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
+extern "C" int lv2_try_syscall(ppu_context* ctx);
+
 /* lv2 syscall dispatch: r11 = syscall number, args in r3.. (PPC ABI).
- * Most syscalls are still stubbed (logged, return CELL_OK), but a few that the
- * CRT needs at boot are implemented so the real boot log becomes visible and
- * execution keeps progressing. */
+ * A few syscalls the CRT needs at boot are handled inline (boot-tuned); the
+ * rest are dispatched to the real lv2 table, and only genuinely-unregistered
+ * numbers fall through to the return-CELL_OK stub. */
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     uint64_t num = ctx->gpr[11];
@@ -215,6 +218,12 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         return;
     }
     default: {
+        /* Consult the real lv2 syscall table (semaphore / mutex / cond /
+         * rwlock / event / timer / memory / vm / fs / spu). Initialised by
+         * lv2_init_syscalls() at boot. Unregistered numbers fall through to the
+         * return-0 stub below (which is what got the CRT this far). */
+        if (lv2_try_syscall(ctx))
+            return;
         static int logged = 0;
         if (logged < 30) {
             fprintf(stderr, "[ppu] lv2_syscall %llu (stub)\n", (unsigned long long)num);

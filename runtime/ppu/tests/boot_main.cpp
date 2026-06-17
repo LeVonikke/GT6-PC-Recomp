@@ -54,6 +54,7 @@ static void derive_vfs_root(const char* eboot)
 /* Host-provided symbols the runtime + HLE libs need. */
 extern "C" uint8_t* vm_base = nullptr;
 extern "C" uint32_t ppu_vm_size;   /* defined in ppu_loader.cpp (OOB guard) */
+extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
 /* g_ps3_guest_caller is defined (default NULL) by libs/system/cellSysutil.c in
  * the runtime library; the boot harness installs no guest callbacks, so we just
  * leave it at its default rather than re-defining it (would be a duplicate
@@ -83,6 +84,7 @@ int main(int argc, char** argv)
     ppu_hle_init();          /* firmware import NID -> HLE handlers */
     ppu_sysprx_register();   /* boot-critical CRT (sys_initialize_tls, ...) */
     ppu_fs_register();       /* cellFs VFS over the real game directory */
+    lv2_init_syscalls();     /* real lv2 syscall table (semaphore/memory/fs/...) */
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
     int rc = ppu_run(entry, STACK_TOP);
