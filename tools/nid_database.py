@@ -411,6 +411,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     # against the harness corpus (June 2026). compute_nid(name) == the imported
     # NID, so these names are definitive. Frequency = # of corpus titles. ----
     ("cellGcmSys", "_cellGcmInitBody"),                       # 0x15bae46b x6
+    ("cellGcmSys", "_cellGcmFunc15"),                         # 0x3a33c1fd x6
     ("cellNetCtl", "cellNetCtlNetStartDialogLoadAsync"),      # 0x04459230 x6
     ("cellNetCtl", "cellNetCtlNetStartDialogUnloadAsync"),    # 0x0f1f13d3 x6
     ("sysPrxForUser", "sys_initialize_tls"),                  # 0x744680a2 x6
