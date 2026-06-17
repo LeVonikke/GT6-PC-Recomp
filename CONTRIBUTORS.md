@@ -78,6 +78,17 @@ not taken):
   extraction) and `tools/gen_hle_nids.py`.
 - **Docs** — `docs/PPU_RECOMP.md`, `docs/RSX_FRAGMENT_PROGRAM.md`.
 
+### gnome41 — [@gnome41](https://github.com/gnome41)
+While porting *DBZ Budokai HD*, [gnome41's fork](https://github.com/gnome41/ps3recomp-dbz-budokai-hd)
+surfaced and fixed real bugs in the shared SDK that have been incorporated
+upstream:
+- the AltiVec VX-form **11-bit XO extraction** fix (~3,800 instructions were
+  mis-decoded);
+- **19 additional VMX integer lifter handlers** + `crorc` / `crandc`;
+- **SPU decoder corrections** (RI16 branch forms, channel opcodes per the IBM
+  Cell BE manual);
+- a `find_functions.py` walrus-syntax fix.
+
 ### Lucas Picoli — [@LucasPicoli](https://github.com/LucasPicoli)
 - **Linux/GCC build fixes** — glibc's `st_atime`/`st_mtime`/`st_ctime` macros
   were shadowing identically named `CellFsStat` / `CellSaveData` members; five
