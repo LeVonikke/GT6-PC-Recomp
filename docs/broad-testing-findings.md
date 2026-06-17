@@ -27,15 +27,17 @@ the western SDK versions dominate — good for prioritization.
 Corpus: Tekken 6, Marvel Ultimate Alliance, Simpsons Arcade, Tokyo Jungle, flOw
 (plus `tornado.self`). All are PS3 PPU executables.
 
-| Binary | machine | image base | functions | `.opd` seeded | notes |
-|---|---|---|---:|---:|---|
-| scout/tekken6.elf | PPC64 | 0x00010000 | 36,166 | 18,234 | healthy `.opd` |
-| scout/simpsons.elf | PPC64 | 0x00010000 | 56,606 | 24,150 | healthy `.opd` |
-| scout/mua.elf | PPC64 | 0x00010000 | 28,088 | **1** | `.opd` not located |
-| tokyojungle/EBOOT.elf | PPC64 | 0x00010000 | 11,231 | 3,816 | healthy `.opd` |
-| simpsons/EBOOT.elf | PPC64 | 0x00010000 | 5,170 | 889 | lifted tier-5 OK |
-| flow/EBOOT.elf | PPC64 | 0x00010000 | 31,008 | **1** | `.opd` not located |
-| scout/tornado.self | — | — | — | — | **blocked: no klicensee** |
+_Updated after the `.opd` detection fix (see §3.1) and the import-NID stage._
+
+| Binary | machine | image base | functions | `.opd` seeded | imports (libs) | notes |
+|---|---|---|---:|---:|---:|---|
+| scout/tekken6.elf | PPC64 | 0x00010000 | 36,213 | 18,281 | 399 (27) | |
+| scout/simpsons.elf | PPC64 | 0x00010000 | 56,640 | 24,184 | 180 (15) | |
+| scout/mua.elf | PPC64 | 0x00010000 | **51,388** | **23,410** | 126 (11) | was 28,088 / 1 before `.opd` fix |
+| tokyojungle/EBOOT.elf | PPC64 | 0x00010000 | 11,231 | 3,816 | 318 (24) | |
+| simpsons/EBOOT.elf | PPC64 | 0x00010000 | 5,170 | 889 | 256 (20) | lifted tier-5 OK |
+| flow/EBOOT.elf | PPC64 | 0x00010000 | **51,547** | **20,613** | 140 (12) | was 31,008 / 1 before `.opd` fix |
+| scout/tornado.self | — | — | — | — | — | **blocked: no klicensee** |
 
 Tier-5 lift validated on the Simpsons EBOOT: **5,170 detected → 14,560 lifted**
 functions (mid-function tail-entries + gap-resident targets expand the count),
@@ -45,37 +47,65 @@ exercised the whole freshly-merged lifter stack (VMX handlers #8 + parallel #11
 
 ## 3. Things we learned (actionable)
 
-1. **`.opd` seeding is a big win where the table is found** — Tekken 6, Simpsons
-   Arcade, Tokyo Jungle all seed thousands of address-taken functions (caner
-   #13 doing exactly its job). **But two binaries (Marvel UA, flOw) seed only 1**
-   — the shape-detector isn't locating their `.opd` (section names stripped /
-   non-standard layout / older dumps). *Next:* make `find_functions`' `.opd`
-   shape-detection more robust, and emit a loud warning when 0–1 descriptors are
-   found on a binary this large (it almost always means a missed table, not a
-   table-less binary). This is the single highest-leverage correctness follow-up.
-2. **Image base is uniformly `0x00010000`** across every retail PS3 EXEC sampled —
+### 3.1 `.opd` detection — found and fixed
+
+The first run flagged that Marvel UA and flOw seeded only **1** `.opd` descriptor
+while the others seeded thousands. Root cause (now fixed): the shape-detector
+required the descriptor's TOC word to land inside a *file-backed* data range, but
+the r2/TOC base every descriptor shares routinely sits in **BSS or the gap just
+past a segment's end** (a TOC base is typically `.got + 0x8000`). So whole tables
+were rejected and every address-taken (virtual/callback) function went
+undetected — the exact setup that crashes on the first call through a function
+pointer. The fix relaxes the TOC test to a plausible-pointer check against the
+bounding span of loadable non-exec segments (`memsz`, so BSS/gaps count); the
+`≥16` exact-repeat threshold still discriminates a real table. Results:
+
+- **flOw: 31,008 → 51,547** functions (+20,613 address-taken)
+- **Marvel UA: 28,088 → 51,388** (+23,410)
+- Tokyo Jungle / Tekken 6 / Simpsons: unchanged or +tens (no regression)
+
+`find_functions` now also warns loudly when a large text segment yields ≤1
+descriptors. (Builds on caner's `.opd` seeding, #13.)
+
+### 3.2 Stub-prioritization ranking — now built
+
+The harness now extracts each EBOOT's firmware imports (via `ppu_loader.py`'s
+`proc_prx_param → libstub` walk, from PR #3) and resolves NIDs to names, then
+aggregates a cross-title ranking — the 360 harness's killer feature, for PS3.
+Across the 6-binary corpus, imported by **all 6**:
+
+- **Libraries:** `cellAudio`, `cellSysutil`, `sys_net`, `cellGcmSys`,
+  `cellSysmodule`, `sys_io`, `cellNetCtl`, `sysPrxForUser`, `sys_fs`.
+- **Functions (named):** `cellGcmGetConfiguration`, `cellGcmGetControlRegister`,
+  `cellGcmMapMainMemory`, `cellPadGetData`/`cellPadInit`, `cellFsFstat`/
+  `cellFsOpendir`, `cellAudioPortOpen`/`Close`, `cellVideoOutConfigure`,
+  `cellSysutilRegisterCallback`/`CheckCallback`, `sys_ppu_thread_exit`,
+  `sys_lwmutex_unlock`, `sys_time_get_system_time`.
+
+That's a concrete, evidence-ranked stub work-list. Run over more titles it gets
+sharper. (A handful of NIDs don't resolve yet — e.g. `cellNetCtl::0xbd5a59fc` —
+candidates for growing the NID database.)
+
+### 3.3 Other observations
+
+1. **Image base is uniformly `0x00010000`** across every retail PS3 EXEC sampled —
    far less variance than the 360 side's high-base titles. The toolkit can lean
    on that assumption (and flag anything that deviates, as the report does).
-3. **Decryption coverage is the scaling bottleneck for PSN**, not analysis.
+2. **Decryption coverage is the scaling bottleneck for PSN**, not analysis.
    `tornado.self` (and the entire NPDRM library) needs the per-title klicensee
    (RAP/rif) before `ps3sce` can produce an ELF. We have exactly one RAP
    (Tokyo Jungle). *Next:* wire `klics.txt` / a RAP store into the decrypt tier so
    the harness can fan out over titles we *do* have keys for.
-4. **We can't yet build the 360 harness's killer feature — the top-NID-imports
-   stub-prioritization list — for EXEC ELFs.** `elf_parser --imports` only
-   resolves PRX imports; a linked EBOOT carries its imports in the
-   `.sceStub.text` / lib.stub section. *Next:* add an import extractor that walks
-   an EXEC's stub section, pulls the NID table, and resolves it through the
-   (now-correct, post-#9) `nid_database`. Run across the corpus, that yields the
-   "which kernel/PRX functions does every game need" ranking that drives stub
-   work — the same way the 360 report does.
 
 ## 4. Suggested next steps (in priority order)
 
-1. `.opd` detection robustness + a "suspiciously few descriptors" warning.
-2. EXEC import-NID extractor → wire into the harness → cross-title stub-priority
-   ranking.
-3. RAP/klicensee store for the decrypt tier → fan the harness out over the PSN
-   titles we have keys for (start with the minis: smallest, simplest, fastest).
-4. Tier-3 build/boot tiers (compile the lifted C, attempt a boot) once a target
-   game's runtime is far enough along — mirrors the 360 harness tiers 3–4.
+1. ~~`.opd` detection robustness~~ — **done** (§3.1).
+2. ~~EXEC import-NID extractor → cross-title stub-priority ranking~~ — **done** (§3.2).
+3. **Implement the top-ranked stubs** the ranking surfaced, in title-count order
+   (the `cellGcmSys` / `cellAudio` / `sys_io` / `cellSysutil` cluster), and grow
+   the NID database to cover the unresolved high-frequency NIDs.
+4. **RAP/klicensee store for the decrypt tier** → fan the harness out over the
+   PSN titles we have keys for (start with the minis: smallest, simplest,
+   fastest), which sharpens the stub ranking with real catalog breadth.
+5. **Tier build/boot stages** (compile the lifted C, attempt a boot) once a
+   target game's runtime is far enough along — mirrors the 360 harness tiers 3–4.
