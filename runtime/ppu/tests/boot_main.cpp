@@ -53,8 +53,10 @@ static void derive_vfs_root(const char* eboot)
 
 /* Host-provided symbols the runtime + HLE libs need. */
 extern "C" uint8_t* vm_base = nullptr;
-typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
-extern "C" ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
+/* g_ps3_guest_caller is defined (default NULL) by libs/system/cellSysutil.c in
+ * the runtime library; the boot harness installs no guest callbacks, so we just
+ * leave it at its default rather than re-defining it (would be a duplicate
+ * symbol at link). */
 
 /* The game's allocator maps its heap at 0x20000000+ (user memory) and touches
  * regions as high as ~0x50000000. The flat VM treats every address as valid RAM,
