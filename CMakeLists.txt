@@ -37,16 +37,22 @@ file(GLOB_RECURSE HLE_SOURCES
     "libs/misc/*.c"
     "libs/hardware/*.c"
 )
+# Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
+list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
     "runtime/*.c"
     "runtime/*.cpp"
 )
-# Exclude test harnesses (e.g. runtime/spu/tests/*): they have their own main()
-# and #include per-game generated headers (spu_recomp.h) that don't exist in a
-# plain runtime-library build.
-list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/")
+# Exclude:
+#  - test harnesses (runtime/*/tests/*): they have their own main() and #include
+#    per-game generated headers (spu_recomp.h) that a plain library build lacks.
+#  - the PPU boot scaffold (runtime/ppu/, runtime/host/): these are compiled
+#    per-game against the lifter-generated ppu_recomp.h (and the game's RSX/D3D12
+#    backend), not as part of the game-agnostic runtime library. See
+#    docs/PPU_RECOMP.md.
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/")
 
 # ---------------------------------------------------------------------------
 # Static library
