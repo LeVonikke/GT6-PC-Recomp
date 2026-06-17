@@ -70,7 +70,7 @@ int main(int argc, char** argv)
 
     vm_base = (uint8_t*)calloc(1, VM_SIZE);
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
-    extern uint32_t ppu_vm_size; ppu_vm_size = VM_SIZE;   /* enable OOB guard */
+    extern "C" uint32_t ppu_vm_size; ppu_vm_size = VM_SIZE;   /* enable OOB guard */
 
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) { printf("load failed\n"); return 1; }

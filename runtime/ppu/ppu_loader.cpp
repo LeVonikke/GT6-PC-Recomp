@@ -110,6 +110,14 @@ static ppu_fn ppu_lookup(uint32_t a)
 
 extern "C" uint32_t ppu_function_count(void) { return g_fn_count; }
 
+/* Bridge the lifter-emitted function_table[] (declared in ppu_recomp.h) into the
+ * address->function hash map. The host boot harness calls this once at startup. */
+extern "C" void ppu_recomp_register(void)
+{
+    for (uint64_t i = 0; i < function_table_count; i++)
+        ppu_register_function(function_table[i].addr, function_table[i].func);
+}
+
 /* Indirect call (bctrl/bctr): CTR holds the already-OPD-resolved code address. */
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
