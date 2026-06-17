@@ -340,6 +340,13 @@ for who did what — thank you, everyone.
 
 ## Changelog
 
+### v0.6.3 — *"Knowing the Names"* (June 2026)
+- **NID resolution, doubled+**: `nid_database` now auto-scans `libs/` + `runtime/` for every function the toolkit implements (`load_implemented()`), and ships 44 more curated names recovered by exact-NID brute-force against the harness corpus. Resolution went from 175 → 421 of the 660 distinct NIDs the sample titles import; the harness stub-prioritization ranking is now fully named through the high-frequency tiers.
+- **Harness stub-prioritization ranking**: a new non-gating `imports` stage (via `ppu_loader`'s `proc_prx_param` → libstub walk) extracts each EBOOT's firmware imports and resolves them, and the report ranks the most-imported libraries and functions across titles — the data that says which stubs to write next.
+- **`cellNetCtl` net-start dialog** implemented (`LoadAsync`/`UnloadAsync`, imported by every sampled title): posts the `LOADED`/`FINISHED` sysutil callback events so games clear the boot-time "connect to PSN" gate, and reports a connected result.
+- **`cellGcmSetupContext()`** — reusable core of `_cellGcmInitBody` (the function `cellGcmInit`'s SDK macro actually calls). Captures the proven `CellGcmContextData` layout (begin/end/current/callback) from the shipping Simpsons port so game bridges stop hand-rolling it.
+- **`.opd` function detection hardened**: the TOC base may live in BSS / a segment gap, so detection no longer requires it inside a file-backed range — recovered ~20–23k address-taken functions each on flOw and Marvel Ultimate Alliance.
+
 ### v0.6.2 — *"Boot Sequence"* (June 2026)
 - **PPU boot scaffold** (thanks [@pauloadrianoalves](https://github.com/pauloadrianoalves), PR #3): `runtime/ppu/` (loader, HLE dispatch, sysprx, filesystem) + `runtime/host/host_main.c` — the per-game path that loads a lifted PPU image, links it with the HLE runtime, and boots it. Built per-game against the lifter-generated `ppu_recomp.h`, so it's excluded from the game-agnostic runtime library. See `docs/PPU_RECOMP.md`.
 - **RSX shader decompilers** (thanks [@pauloadrianoalves](https://github.com/pauloadrianoalves)): `rsx_fp_decompiler` / `rsx_vp_decompiler` translate NV40 fragment/vertex programs to host shaders, with a validation-test corpus. See `docs/RSX_FRAGMENT_PROGRAM.md`.

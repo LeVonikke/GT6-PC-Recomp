@@ -292,7 +292,32 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     return CELL_OK;
 }
 
-/* NID: 0x15BAE46B */
+/* Reusable _cellGcmInitBody core (NID 0x15BAE46B). See cellGcmSys.h for why the
+ * guest vm is injected as callbacks. The CellGcmContextData layout here is the
+ * one proven in the shipping Simpsons port (begin@0/end@4/current@8/callback@C);
+ * getting it wrong makes the game read `current` as the callback OPD and stall
+ * in cellGcmFlush. The command buffer is the start of the game's IO region. */
+u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress,
+                        CellGcmGuestAlloc galloc, CellGcmGuestWrite32 gwrite32)
+{
+    if (cmdSize < 0x10000)
+        cmdSize = 0x10000;
+
+    cellGcmInit(cmdSize, ioSize, ioAddress);
+
+    u32 cmdbuf = ioAddress;                 /* FIFO lives at the IO region start */
+    u32 cdata  = galloc ? galloc(16, 16) : 0;
+    if (cdata && gwrite32) {
+        gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
+        gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
+        gwrite32(cdata + 0x8, cmdbuf);              /* current */
+        gwrite32(cdata + 0xC, 0);                   /* callback OPD (bridge fills) */
+        if (ctx_out_addr)
+            gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
+    }
+    return cdata;
+}
+
 s32 cellGcmGetConfiguration(CellGcmConfig* config)
 {
     if (!config)
