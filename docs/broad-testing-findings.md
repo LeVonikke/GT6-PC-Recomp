@@ -86,7 +86,34 @@ That's a concrete, evidence-ranked stub work-list. Run over more titles it gets
 sharper. (A handful of NIDs don't resolve yet — e.g. `cellNetCtl::0xbd5a59fc` —
 candidates for growing the NID database.)
 
-### 3.3 Other observations
+### 3.3 Ghidra cross-check — find_functions recall is ~72%
+
+A new opt-in harness tier (6) runs Ghidra headless and compares its function set
+to `find_functions`'. On the Simpsons EBOOT (Ghidra ~33 s):
+
+| | count |
+|---|---:|
+| find_functions | 5,170 |
+| Ghidra | 3,681 |
+| agree | 2,644 |
+| **missed** (Ghidra found, we didn't) | **1,037** → recall **71.8%** |
+| extra (we found, Ghidra didn't) | 2,526 |
+
+Two signals worth chasing:
+- **We miss ~1,000 functions Ghidra finds** (e.g. `0x10338`, `0x107D8`,
+  `0x10C0C`…). These are reached by Ghidra's recursive call-target analysis but
+  aren't in `.opd` and lack a standard prologue — a real recall gap the lifter
+  would inherit. *Next:* fold Ghidra's (or IDA's) confirmed starts back as
+  additional seeds, or strengthen the call-target pass.
+- **We also have ~2,500 "extra" starts** Ghidra doesn't list. Many are genuine
+  `.opd`-listed address-taken functions Ghidra folded into callers; some may be
+  false positives. The cross-check gives the exact addresses to audit.
+
+This is the kind of quality measurement that only falls out of running detection
+against an independent tool at scale — and `e:\ida` (IDA headless) is a second
+oracle we can add the same way.
+
+### 3.4 Other observations
 
 1. **Image base is uniformly `0x00010000`** across every retail PS3 EXEC sampled —
    far less variance than the 360 side's high-base titles. The toolkit can lean
