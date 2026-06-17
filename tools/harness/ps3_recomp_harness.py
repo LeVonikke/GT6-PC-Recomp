@@ -57,12 +57,15 @@ FIND_FUNCS = TOOLS_DIR / "find_functions.py"
 PPU_LIFTER = TOOLS_DIR / "ppu_lifter.py"
 PPU_LOADER = TOOLS_DIR / "ppu_loader.py"
 GHIDRA_ANALYZE = TOOLS_DIR / "ghidra_analyze.py"
+IDA_ANALYZE = TOOLS_DIR / "ida_analyze.py"
 
 DEFAULTS = {
     "psn_root": r"Z:\Roms\PS3\PSN",
     "out": str(TOOLS_DIR.parent / "_harness"),
     "sevenzip": r"C:\Program Files\7-Zip\7z.exe",
     "ps3sce": r"D:\recomp\ps3games\ps3sce\ps3sce",
+    # IDA's idalib is installed in a specific Python (IDA Pro 9.1 -> 3.11).
+    "ida_python": r"C:\Users\nedch\AppData\Local\Programs\Python\Python311\python.exe",
 }
 
 # A PSN archive name carries the title-id and region:  "Name PSN [NPUZ-00401].rar"
@@ -358,51 +361,85 @@ def stage_imports(elf: Path, work: Path, cfg) -> dict:
     return r
 
 
+def _norm_addr(a):
+    return int(a, 16) if isinstance(a, str) else int(a)
+
+
+def _oracle_functions(name, elf, work, cfg):
+    """Run one external oracle (Ghidra or IDA) and return (set_of_addrs, seconds,
+    error). Import thunks are dropped — they're stub trampolines, not real
+    functions our lifter must cover."""
+    odir = work / name
+    shutil.rmtree(odir, ignore_errors=True)
+    if name == "ghidra":
+        cmd = [sys.executable, GHIDRA_ANALYZE, elf, "-o", odir, "--max-cpu", str(cfg.ghidra_cpu)]
+    else:  # ida — must run under the interpreter idalib is installed in (3.11)
+        cmd = [cfg.ida_python, IDA_ANALYZE, elf, "-o", odir]
+    rc, out, err, dur = run(cmd, timeout=cfg.t_ghidra)
+    fjson = odir / "functions.json"
+    if rc != 0 or not fjson.exists():
+        return None, round(dur, 1), f"{name} rc={rc}: {(err or out).strip()[-140:]}"
+    try:
+        data = json.loads(fjson.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None, round(dur, 1), f"{name}: unreadable functions.json"
+    addrs = {_norm_addr(x["addr"]) for x in data if not x.get("thunk")}
+    if not cfg.keep_ghidra:
+        shutil.rmtree(odir, ignore_errors=True)
+    return addrs, round(dur, 1), None
+
+
 def stage_crosscheck(elf: Path, work: Path, cfg, ff_path) -> dict:
-    """Cross-check find_functions against an industrial disassembler (Ghidra
-    headless). Measures recall — how many functions Ghidra finds that we miss —
-    which is the quality signal for our boundary detection. Slow (minutes per
-    binary), so it lives at the top tier and is opt-in.
+    """Cross-check find_functions against one or two industrial disassemblers
+    (Ghidra and/or IDA headless). Recall = how many of the oracle's functions we
+    also find; the gap is address-taken / call-graph-recovered functions our
+    detector misses. With both oracles, the set they AGREE on is high-confidence
+    — functions we miss there are almost certainly real. Opt-in (top tier).
     """
     r = {"status": "fail"}
     if not ff_path or not Path(ff_path).exists():
         r["error"] = "no find_functions output (needs tier >= 4)"
         return r
-    gout = work / "ghidra"
-    shutil.rmtree(gout, ignore_errors=True)
-    cmd = [sys.executable, GHIDRA_ANALYZE, elf, "-o", gout, "--max-cpu", str(cfg.ghidra_cpu)]
-    rc, out, err, dur = run(cmd, timeout=cfg.t_ghidra)
-    r["ghidra_s"] = round(dur, 1)
-    gfuncs = gout / "functions.json"
-    if rc != 0 or not gfuncs.exists():
-        r["error"] = f"ghidra rc={rc}: {(err or out).strip()[-160:]}"
-        shutil.rmtree(gout, ignore_errors=True)
-        return r
-
-    def norm(a):
-        return int(a, 16) if isinstance(a, str) else int(a)
     try:
-        gj = json.loads(gfuncs.read_text())
-        fj = json.loads(Path(ff_path).read_text())
+        ours = {_norm_addr(f["start"]) for f in json.loads(Path(ff_path).read_text())}
     except (json.JSONDecodeError, OSError):
-        r["error"] = "unreadable function json"
+        r["error"] = "unreadable find_functions json"
         return r
 
-    ours = {norm(f["start"]) for f in fj}
-    # Ghidra flags import thunks; exclude them from the recall denominator since
-    # they're stub trampolines, not real functions our lifter must cover.
-    theirs = {norm(g["addr"]) for g in gj if not g.get("thunk")}
-    agree = ours & theirs
-    missed = theirs - ours                     # Ghidra found, we didn't (recall gap)
-    extra = ours - theirs                       # we found, Ghidra didn't
-    r.update(status="ok",
-             n_ours=len(ours), n_ghidra=len(theirs), n_agree=len(agree),
-             n_missed=len(missed), n_extra=len(extra),
-             recall_pct=round(100 * len(agree) / max(1, len(theirs)), 1))
-    if missed:
-        r["missed_sample"] = [f"0x{a:08X}" for a in sorted(missed)[:12]]
-    if not cfg.keep_ghidra:
-        shutil.rmtree(gout, ignore_errors=True)
+    want = {"ghidra": ["ghidra"], "ida": ["ida"], "both": ["ghidra", "ida"]}[cfg.oracle]
+    sets, errs = {}, []
+    for name in want:
+        addrs, secs, err = _oracle_functions(name, elf, work, cfg)
+        r[f"{name}_s"] = secs
+        if err:
+            errs.append(err)
+        else:
+            sets[name] = addrs
+            agree = ours & addrs
+            r[f"recall_{name}_pct"] = round(100 * len(agree) / max(1, len(addrs)), 1)
+            r[f"n_{name}"] = len(addrs)
+    if not sets:
+        r["error"] = "; ".join(errs) or "no oracle produced output"
+        return r
+
+    r["n_ours"] = len(ours)
+    # union recall + (when both ran) the high-confidence both-agree recall
+    union = set().union(*sets.values())
+    r.update(status="ok", oracles=list(sets.keys()),
+             n_union=len(union), n_missed=len(union - ours), n_extra=len(ours - union),
+             recall_pct=round(100 * len(ours & union) / max(1, len(union)), 1))
+    if len(sets) == 2:
+        both = sets["ghidra"] & sets["ida"]
+        r["n_both_agree"] = len(both)
+        r["n_missed_high_conf"] = len(both - ours)
+        r["recall_high_conf_pct"] = round(100 * len(ours & both) / max(1, len(both)), 1)
+        miss = both - ours
+    else:
+        miss = union - ours
+    if miss:
+        r["missed_sample"] = [f"0x{a:08X}" for a in sorted(miss)[:12]]
+    if errs:
+        r["partial_error"] = "; ".join(errs)
     return r
 
 
@@ -669,25 +706,39 @@ def cmd_report(cfg):
         cc_rows = [(r["title"], r["stages"]["crosscheck"]) for r in elf_rows
                    if r["stages"].get("crosscheck", {}).get("status") == "ok"]
         if cc_rows:
-            tot_ghidra = sum(c["n_ghidra"] for _, c in cc_rows)
-            tot_agree = sum(c["n_agree"] for _, c in cc_rows)
-            A("### Function-detection cross-check (find_functions vs Ghidra)\n")
-            A("_Recall = how many of Ghidra's functions our detector also finds "
-              "(higher is better — a recall gap means address-taken/called functions "
-              "the lifter would miss). `extra` = starts we find that Ghidra doesn't "
-              "(real `.opd` functions Ghidra folded, or our false positives)._\n")
-            A(f"- **Corpus recall: {round(100*tot_agree/max(1,tot_ghidra),1)}%** "
-              f"({tot_agree}/{tot_ghidra} Ghidra functions also found)\n")
-            A("| Binary | find_functions | Ghidra | agree | missed | extra | recall | ghidra (s) |\n"
-              "|---|---:|---:|---:|---:|---:|---:|---:|")
+            tot_union = sum(c["n_union"] for _, c in cc_rows)
+            tot_hit = sum(c["n_union"] - c["n_missed"] for _, c in cc_rows)
+            has_both = any("recall_high_conf_pct" in c for _, c in cc_rows)
+            A("### Function-detection cross-check (find_functions vs Ghidra/IDA)\n")
+            A("_Recall = how many of the oracle's functions our detector also finds "
+              "(a gap means address-taken / call-graph-recovered functions the lifter "
+              "would miss — recoverable via `find_functions --seed-json`). `extra` = "
+              "starts we find the oracle doesn't (real `.opd` functions it folded, or "
+              "our false positives). With both oracles, **high-conf** recall is measured "
+              "against the set Ghidra and IDA agree on._\n")
+            A(f"- **Corpus recall (vs oracle union): {round(100*tot_hit/max(1,tot_union),1)}%** "
+              f"({tot_hit}/{tot_union})\n")
+            hdr = "| Binary | oracles | find_functions | union | missed | extra | recall |"
+            sep = "|---|---|---:|---:|---:|---:|---:|"
+            if has_both:
+                hdr += " high-conf recall |"
+                sep += "---:|"
+            A(hdr + "\n" + sep)
             for t, c in cc_rows:
-                A(f"| {t[:30]} | {c['n_ours']} | {c['n_ghidra']} | {c['n_agree']} "
-                  f"| {c['n_missed']} | {c['n_extra']} | {c.get('recall_pct', '-')}% "
-                  f"| {c.get('ghidra_s', '-')} |")
+                row = (f"| {t[:28]} | {'+'.join(c.get('oracles', []))} | {c['n_ours']} "
+                       f"| {c['n_union']} | {c['n_missed']} | {c['n_extra']} "
+                       f"| {c.get('recall_pct', '-')}% |")
+                if has_both:
+                    row += (f" {c.get('recall_high_conf_pct', '-')}% "
+                            f"({c.get('n_missed_high_conf', '-')} missed) |"
+                            if "recall_high_conf_pct" in c else " - |")
+                A(row)
             A("")
             worst = min(cc_rows, key=lambda tc: tc[1].get("recall_pct", 100))
             if worst[1].get("missed_sample"):
-                A(f"Sample functions missed on **{worst[0]}** (Ghidra found, we didn't): "
+                lbl = ("both oracles agree, we didn't find"
+                       if "recall_high_conf_pct" in worst[1] else "oracle found, we didn't")
+                A(f"Sample functions missed on **{worst[0]}** ({lbl}): "
                   + ", ".join(f"`{a}`" for a in worst[1]["missed_sample"]) + "\n")
 
         # giant functions + lift failures
@@ -761,6 +812,11 @@ def main():
                     help="keep the Ghidra export dirs (tier 6)")
     pa.add_argument("--ghidra-cpu", dest="ghidra_cpu", type=int, default=4,
                     help="analyzeHeadless -max-cpu (tier 6)")
+    pa.add_argument("--oracle", choices=["ghidra", "ida", "both"], default="ghidra",
+                    help="tier-6 cross-check oracle(s) (default: ghidra). 'both' "
+                         "reports a high-confidence recall vs the set Ghidra and IDA agree on")
+    pa.add_argument("--ida-python", dest="ida_python",
+                    help="interpreter idalib is installed in (default: Python 3.11)")
     pa.add_argument("--t-lift", dest="t_lift", type=int)
     pa.add_argument("--t-ghidra", dest="t_ghidra", type=int)
     pa.add_argument("--out")
@@ -774,7 +830,8 @@ def main():
     for f, d in [("psn_root", None), ("probe", 0), ("elf_root", None), ("max_tier", 4),
                  ("limit", None), ("force", False), ("jobs", 0), ("keep_lifted", False),
                  ("t_lift", None), ("sevenzip", None), ("ps3sce", None),
-                 ("keep_ghidra", False), ("ghidra_cpu", 4), ("t_ghidra", None)]:
+                 ("keep_ghidra", False), ("ghidra_cpu", 4), ("t_ghidra", None),
+                 ("oracle", "ghidra"), ("ida_python", None)]:
         if not hasattr(args, f):
             setattr(args, f, d)
     if getattr(args, "jobs", 0) in (0, None):
