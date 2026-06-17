@@ -335,6 +335,29 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Changelog
 
+### v0.6.1 — *"Many Hands"* (June 2026)
+*The community showed up. Most of this release came in over the wall as pull requests — almost all of it discovered by [**@canersaka**](https://github.com/canersaka) while stress-testing the toolkit against a 22 MB / ~45,000-function **Yakuza: Dead Souls** port, which turns out to be a fantastic fuzzer for everything we got subtly wrong. Huge thanks to every contributor below.*
+
+**Correctness — decode & lift** (thanks [@canersaka](https://github.com/canersaka)):
+- **NID computation, fixed** (`nid_database.py`): the suffix constant was truncated to 12 bytes and corrupted past byte 8, and the digest was read big-endian. The authoritative 16-byte suffix + little-endian read now matches real EBOOT import tables — `cellSysmoduleLoadModule` → `0x32267A31`. Previously matched **0 of 354** import NIDs on a real game; now 343/354 resolve. (Our own `include/ps3emu/nid.h` already documented the correct values; the Python tool just disagreed with it.)
+- **VMX/AltiVec decode tables, cross-referenced against the Power ISA manuals** (`ppu_disasm.py`): dozens of mnemonics mapped to the wrong codes (`vmaxfp`/`vminfp`, `vcfsx`/`vcfux` swapped with `vrefp`/`vrsqrtefp`, the whole `vpk*` pack family permuted, signed/unsigned `vcmpgt*` swapped, `vsumsws`, …). These decoded *silently* and lifted to valid C for the wrong operation — `vcfsx` alone was wrong 9,728× in one title.
+- **VMX lifter handlers**: `addc`/`subfc` with carry-out into XER[CA] (86% of all unlifted instructions in Yakuza — 63k of 73k), the unaligned vector loads `lvlx`/`lvrx`/`lvlxl`, `ldbrx`, `vsrw`, `vsububs`, `vsum2sws`, `vupkhsh`, `vrfim`, and `vand` (which had an implementation but was missing from the dispatch list).
+- **`sradi` decode for shifts ≥ 32**: the 6-bit shift carries its top bit in instruction bit 30, so the XO field reads 827 (which was unmapped) for shifts of 32+. Now composed correctly. *(Follow-up: removed a dead, incorrect `XO 827 → lhaux` block — real `lhaux` is XO 375.)*
+- **Function detection seeded from the `.opd` table** (`find_functions.py`): PS3 executables list a descriptor for every address-taken function (every C++ virtual, every callback) — 21,893 of them in Yakuza, of which exactly **1** was being detected by prologue scanning. Now seeds starts from `.opd` (located by shape, since section names are often stripped) + the ELF entry, bounds them at the first `blr`, and filters phantom branch targets from data decoded as code.
+- **Lifter parallelization + chunked output**: per-function translation now fans out across a process pool (`--jobs N`) — a multi-hour single-core lift on a 45k-function game drops to minutes. Plus record-form CR0 handling, runtime-matched context, and split-file C output so the generated source is actually buildable.
+
+**Runtime & libs** (thanks [@canersaka](https://github.com/canersaka)):
+- **`sys_vm` syscall family (300–313)** implemented — `sys_vm_memory_map` returned ENOSYS with an unwritten out-pointer, crashing callers on first deref. Mappings now bump-allocated from a committed 0x60000000 window.
+- **`sys_memory` allocations** now come from a committed-on-demand 0x40000000–0x50000000 window (the old bump base at 0x20000000 failed every allocate with silent ENOMEM); addresses match real-hardware traces byte-for-byte, and the bump pointer is now thread-safe.
+- **`sys_lwmutex_destroy` lv2 semantics**: returns ESRCH for a dead mutex / EBUSY for a held one (libc teardown branches on these) instead of unconditional OK; slot allocation is now locked.
+- **TTY syscall numbers** corrected to 402/403 (`lv2_syscall_table.h` had 400/402).
+- **Big-endian guest structs in `cellVideoOut`** + corrected `CellGcmContextData` layout (callback at +0xC): `GetResolution` was writing host-endian, so the guest read 720×480 as 53250×57345 and sized display buffers from garbage.
+
+**Build & tooling**:
+- **Linux/GCC build fixed** (thanks [@LucasPicoli](https://github.com/LucasPicoli)): glibc's `st_atime`/`st_mtime` macros were shadowing `CellFsStat` members; five translation units now compile clean so downstream projects get a Linux runtime to link against.
+- **Runtime test harnesses excluded from the library build** (thanks [@canersaka](https://github.com/canersaka)): `runtime/spu/tests/` defines its own `main()`; the library now builds clean with MSVC.
+- **`tools/show_func.py`** (thanks [@canersaka](https://github.com/canersaka)): dump a single lifted function's C, its original PowerPC disassembly, or both, straight from the chunked output.
+
 ### v0.6.0 — *"SPU, For Real This Time"* (June 2026)
 - **SPU recompilation, corrected end-to-end**: rebuilt `spu_disasm.py`'s opcode tables from rpcs3's authoritative SPUOpcodes.h. Pervasive mis-decodes (lqr/stqr/fsmbi were excluded from RI16 and shadowed by spurious RI10 rotate entries; RI16 branch/load forms at wrong opcodes; ~15 wrong SPU_RR entries; missing RI8 float conversions) had silently corrupted *every* SPU lift.
 - **SPU lifter fall-through fix**: `spu_lifter.py` now emits a tail-call when a function ends in a non-branch — previously such functions fell off the end and truncated execution mid-image. Added cflts/cfltu/csflt/cuflt float conversions.
