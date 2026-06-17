@@ -85,3 +85,7 @@ ehthumbs.db
 
 # Logs
 *.log
+
+# Harness batch-run outputs (per-title JSON, work dirs, REPORT.md)
+_harness/
+.pr_review/

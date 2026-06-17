@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""ps3_recomp_harness.py -- batch-run the ps3recomp analysis pipeline across a
+title library, the same way tools/tools/harness/recomp_harness.py does for the
+360 side. The point is *generalizing*: running extract -> profile -> functions
+(-> lift) over many titles turns one-off observations into a compatibility
+matrix and a catalog of recurring failure modes -- which is what actually
+hardens the toolkit (and tells us which NID stubs to ship next).
+
+Two input sources, because PS3 content reaches us at two very different stages:
+
+  * --psn-root DIR   The PSN library of *.rar archives (default Z:\\Roms\\PS3\\PSN).
+                     PSN packages are NPDRM-encrypted and frequently multi-GB, so
+                     we do NOT decrypt them wholesale. Instead we catalog every
+                     title cheaply from its filename (which encodes the title-id
+                     and region, e.g. "... [NPUZ-00083].rar") and, for a small
+                     --probe sample, extract just the PKG header (plaintext) to
+                     confirm content-id / item-count / size.
+
+  * --elf-root DIR   One or more directories of *already-decrypted* PS3 binaries
+                     (EBOOT.elf / *.elf / *.self). These get the real recomp
+                     triage: elf_parser profile, find_functions, and (opt-in)
+                     the full ppu_lifter. *.self inputs are decrypted to *.elf
+                     first via ps3sce when available.
+
+Tiers (cost grows steeply; triage is cheap and scales):
+  1 catalog  : filename -> title-id/region/category; optional PKG-header probe
+  2 decrypt  : *.self -> *.elf via ps3sce (only needed for encrypted inputs)
+  3 profile  : elf_parser.py --json  -> machine, entry, image base, segments
+  4 functions: find_functions.py     -> function count, .opd-seeded starts
+  5 lift     : ppu_lifter.py          -> generated C, giant functions (OPT-IN)
+
+Each title is isolated, timed and resumable; one title's failure never aborts
+the batch. Per-title results land in <out>/results/<id>.json. `report`
+aggregates them into REPORT.md.
+
+Usage:
+  python ps3_recomp_harness.py catalog --psn-root "Z:\\Roms\\PS3\\PSN" [--probe 10]
+  python ps3_recomp_harness.py analyze --elf-root D:\\recomp\\ps3games --max-tier 4
+  python ps3_recomp_harness.py analyze --elf-root D:\\recomp\\ps3games\\scout --max-tier 5
+  python ps3_recomp_harness.py report
+"""
+
+import argparse
+import json
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+TOOLS_DIR = Path(__file__).resolve().parent.parent          # the tools/ dir
+ELF_PARSER = TOOLS_DIR / "elf_parser.py"
+FIND_FUNCS = TOOLS_DIR / "find_functions.py"
+PPU_LIFTER = TOOLS_DIR / "ppu_lifter.py"
+
+DEFAULTS = {
+    "psn_root": r"Z:\Roms\PS3\PSN",
+    "out": str(TOOLS_DIR.parent / "_harness"),
+    "sevenzip": r"C:\Program Files\7-Zip\7z.exe",
+    "ps3sce": r"D:\recomp\ps3games\ps3sce\ps3sce",
+}
+
+# A PSN archive name carries the title-id and region:  "Name PSN [NPUZ-00401].rar"
+TITLEID_RE = re.compile(r"\[([A-Z]{4})[-_ ]?(\d{4,5})\]")
+# Coarse meaning of the 4-letter PSN content prefix (first two = region/SCE arm,
+# fourth letter = rough content class). Used only for distribution buckets.
+REGION_OF = {"NPU": "US (SCEA)", "NPE": "EU (SCEE)", "NPJ": "JP (SCEJ)",
+             "NPH": "Asia (SCEH)", "NPK": "Korea", "NPG": "JP", "NPI": "Intl"}
+CLASS_OF = {"A": "App/utility", "B": "PSN full game", "C": "PSN game",
+            "F": "PSN game", "G": "PSN game/port", "H": "App",
+            "I": "Disc-linked", "J": "PS1/minis", "Z": "Demo/minis"}
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def run(cmd, timeout, cwd=None):
+    """Run a command, never raising. Returns (rc, stdout, stderr, seconds)."""
+    t0 = time.time()
+    try:
+        p = subprocess.run([str(c) for c in cmd], cwd=cwd, timeout=timeout,
+                           capture_output=True, text=True, errors="replace")
+        return p.returncode, p.stdout or "", p.stderr or "", time.time() - t0
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout if isinstance(e.stdout, str) else ""
+        return 124, out or "", "TIMEOUT", time.time() - t0
+    except Exception as e:                       # harness must survive anything
+        return -1, "", f"{type(e).__name__}: {e}", time.time() - t0
+
+
+def slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower()) or "untitled"
+
+
+# --------------------------------------------------------------------- catalog
+
+def parse_titleid(name: str):
+    m = TITLEID_RE.search(name)
+    if not m:
+        return None, None, None
+    prefix, num = m.group(1), m.group(2)
+    title_id = f"{prefix}{num}"
+    region = REGION_OF.get(prefix[:3], "Unknown")
+    cls = CLASS_OF.get(prefix[3], "Unknown")
+    return title_id, region, cls
+
+
+def parse_pkg_header(data: bytes) -> dict:
+    """Parse the plaintext PS3 .pkg header (no decryption required)."""
+    if len(data) < 0x80 or data[:4] != b"\x7fPKG":
+        return {"ok": False, "error": "not a PKG"}
+    rev, ptype = struct.unpack_from(">HH", data, 4)
+    item_count = struct.unpack_from(">I", data, 0x14)[0]
+    total_size = struct.unpack_from(">Q", data, 0x18)[0]
+    content_id = data[0x30:0x30 + 0x24].split(b"\x00")[0].decode("ascii", "replace")
+    return {"ok": True,
+            "pkg_revision": f"0x{rev:04X}",
+            "finalized": bool(rev & 0x8000),
+            "pkg_type": ptype,
+            "item_count": item_count,
+            "total_size": total_size,
+            "content_id": content_id}
+
+
+def probe_pkg_header(rar: Path, cfg) -> dict:
+    """Extract the nested PKG far enough to read its plaintext 0x80-byte header.
+
+    PSN rars nest: outer.rar -> inner.rar -> *.pkg. Extraction is purged right
+    after; for huge titles this still writes the full pkg once, so probing is
+    deliberately limited to a small sample via --probe.
+    """
+    tmp = Path(cfg.out) / "_probe" / slug(rar.stem)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        rc, _, err, _ = run([cfg.sevenzip, "x", rar, f"-o{tmp}", "-y"], timeout=cfg.t_extract)
+        if rc != 0:
+            return {"ok": False, "error": f"7z outer rc={rc}"}
+        inner = next((p for p in tmp.rglob("*.rar")), None)
+        if inner:
+            run([cfg.sevenzip, "x", inner, f"-o{tmp / 'inner'}", "-y"], timeout=cfg.t_extract)
+        pkg = next((p for p in tmp.rglob("*.pkg")), None) or next((p for p in tmp.rglob("*.PKG")), None)
+        if not pkg:
+            return {"ok": False, "error": "no pkg found"}
+        with open(pkg, "rb") as f:
+            return parse_pkg_header(f.read(0x100))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_catalog(cfg):
+    root = Path(cfg.psn_root)
+    rars = sorted(p for p in root.rglob("*.rar"))
+    log(f"{len(rars)} PSN archives under {root}")
+    results_dir = Path(cfg.out) / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # cheap pass over everything: filename -> title-id/region/class + size
+    catalog = []
+    for rar in rars:
+        title_id, region, cls = parse_titleid(rar.name)
+        catalog.append({"name": rar.stem, "title_id": title_id, "region": region,
+                        "content_class": cls, "rar_mb": round(rar.stat().st_size / 1048576, 1),
+                        "lib": rar.parent.name})
+    (Path(cfg.out) / "catalog.json").write_text(json.dumps(catalog, indent=2))
+
+    # optional: enrich the N smallest titles with a real PKG-header probe
+    if cfg.probe:
+        sample = sorted(rars, key=lambda p: p.stat().st_size)[:cfg.probe]
+        log(f"probing PKG headers of {len(sample)} smallest titles")
+        for i, rar in enumerate(sample, 1):
+            hdr = probe_pkg_header(rar, cfg)
+            tid, region, cls = parse_titleid(rar.name)
+            rec = {"title": rar.stem, "id": slug(rar.stem), "source": "psn",
+                   "title_id": tid, "region": region, "content_class": cls,
+                   "rar_mb": round(rar.stat().st_size / 1048576, 1),
+                   "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "stages": {"catalog": {"status": "ok" if hdr.get("ok") else "fail", **hdr}}}
+            (results_dir / f"cat_{slug(rar.stem)}.json").write_text(json.dumps(rec, indent=2))
+            log(f"  [{i}/{len(sample)}] {rar.stem}: {hdr.get('content_id', hdr.get('error'))}")
+    cmd_report(cfg)
+
+
+# --------------------------------------------------------------------- analyze
+
+def stage_decrypt(binp: Path, work: Path, cfg) -> dict:
+    """If the input is an encrypted SELF, decrypt to ELF via ps3sce."""
+    r = {"status": "ok", "elf": str(binp)}
+    head = binp.read_bytes()[:4] if binp.stat().st_size >= 4 else b""
+    if head == b"\x7fELF":
+        return r                                   # already an ELF
+    if head != b"SCE\x00":
+        r.update(status="fail", error=f"unknown magic {head!r}")
+        return r
+    sce = Path(cfg.ps3sce)
+    exe = sce if sce.exists() else Path(str(sce) + ".exe")
+    if not exe.exists():
+        r.update(status="fail", error="ps3sce not found")
+        return r
+    out_elf = work / (binp.stem + ".dec.elf")
+    rc, _, err, dur = run([exe, "-d", binp, out_elf], timeout=cfg.t_decrypt, cwd=str(exe.parent))
+    r["decrypt_s"] = round(dur, 1)
+    if rc == 0 and out_elf.exists() and out_elf.read_bytes()[:4] == b"\x7fELF":
+        r["elf"] = str(out_elf)
+    else:
+        r.update(status="fail", error=f"ps3sce rc={rc}: {err.strip()[-160:]}")
+    return r
+
+
+def stage_profile(elf: Path, cfg) -> dict:
+    r = {"status": "fail"}
+    rc, out, err, dur = run([sys.executable, ELF_PARSER, elf, "--json", "--segments"],
+                           timeout=cfg.t_profile)
+    if rc != 0:
+        r["error"] = f"elf_parser rc={rc}: {err.strip()[-160:]}"
+        return r
+    try:
+        d = json.loads(out)
+    except json.JSONDecodeError:
+        r["error"] = "elf_parser produced no JSON"
+        return r
+    eh = d.get("elf_header", {})
+    phs = d.get("program_headers", [])
+    # Only real (non-empty) PT_LOAD segments define the image; PS3 ELFs carry
+    # several placeholder PT_LOADs at vaddr 0 / memsz 0 that must not drag the
+    # computed base down to 0x0.
+    loads = [p for p in phs if p.get("type") == "PT_LOAD" and int(p.get("memsz", "0x0"), 16) > 0]
+    bases = [int(p["vaddr"], 16) for p in loads]
+    MACHINE = {"0x0014": "PPC", "0x0015": "PPC64", "0x0017": "SPU"}
+    ETYPE = {"0x0002": "EXEC", "0x0003": "DYN", "0xffa4": "PRX", "0xffa5": "PRX"}
+    r.update(status="ok",
+             machine=MACHINE.get(eh.get("machine"), eh.get("machine")),
+             elf_type=ETYPE.get(str(eh.get("type")).lower(), eh.get("type")),
+             endian=eh.get("endian"), entry=eh.get("entry"),
+             image_base=(f"0x{min(bases):08X}" if bases else None),
+             n_segments=len(phs), n_load=len(loads),
+             mem_kb=round(sum(int(p.get("memsz", "0x0"), 16) for p in loads) / 1024, 1))
+    return r
+
+
+def stage_functions(elf: Path, work: Path, cfg) -> dict:
+    r = {"status": "fail"}
+    ff = work / "functions.json"
+    rc, out, err, dur = run([sys.executable, FIND_FUNCS, elf, "--json", "-o", ff],
+                           timeout=cfg.t_functions)
+    r["functions_s"] = round(dur, 1)
+    blob = out + "\n" + err
+    if rc != 0 or not ff.exists():
+        r["error"] = f"find_functions rc={rc}: {err.strip()[-160:]}"
+        return r
+    try:
+        funcs = json.loads(ff.read_text())
+    except json.JSONDecodeError:
+        r["error"] = "functions.json unreadable"
+        return r
+    r["n_functions"] = len(funcs)
+    for key, pat in [("n_instructions", r"disassembled (\d+) instructions"),
+                     ("opd_seeded", r"seed pass: \+(\d+) seeded"),
+                     ("prologue", r"prologue pass: (\d+) functions"),
+                     ("branch_target", r"branch-target pass: (\d+) functions")]:
+        m = re.search(pat, blob)
+        if m:
+            r[key] = int(m.group(1))
+    r["opd_verified"] = "every .opd descriptor address is a function start" in blob
+    r["status"] = "ok"
+    r["functions_path"] = str(ff)
+    return r
+
+
+def stage_lift(elf: Path, ff_path: str, work: Path, cfg) -> dict:
+    r = {"status": "fail"}
+    out_dir = work / "lifted"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, PPU_LIFTER, elf, "-o", out_dir, "-j", str(cfg.jobs)]
+    if ff_path:
+        cmd += ["--functions", ff_path]
+    rc, out, err, dur = run(cmd, timeout=cfg.t_lift)
+    blob = out + "\n" + err
+    r["lift_s"] = round(dur, 1)
+    chunks = list(out_dir.glob("*.c")) + list(out_dir.glob("*.cpp"))
+    giants = re.findall(r"(0x[0-9A-Fa-f]+).{0,40}?(\d{5,}) bytes", blob)
+    if giants:
+        r["giant_functions"] = [{"addr": a, "bytes": int(b)} for a, b in giants[:10]]
+    m = re.search(r"(\d+) functions lifted", blob)
+    if m:
+        r["n_lifted"] = int(m.group(1))
+    if rc == 0 and chunks:
+        r.update(status="ok", n_chunks=len(chunks),
+                 c_mb=round(sum(c.stat().st_size for c in chunks) / 1048576, 1))
+    else:
+        r["error"] = f"ppu_lifter rc={rc}: {err.strip()[-200:]}"
+    if not cfg.keep_lifted:
+        shutil.rmtree(out_dir, ignore_errors=True)
+    return r
+
+
+STAGE_TIER = {"decrypt": 2, "profile": 3, "functions": 4, "lift": 5}
+
+
+def discover_binaries(roots):
+    """Find decrypted/encrypted PS3 executables under the given roots.
+
+    Prefer EBOOT.elf over EBOOT.BIN (same image, already decrypted) and avoid
+    cataloging both. Skip obvious SPU/PRX-only artifacts handled elsewhere.
+    """
+    seen, out = set(), []
+    pats = ["EBOOT.elf", "EBOOT.ELF", "*.elf", "EBOOT.BIN", "*.self", "*.SELF"]
+    for root in roots:
+        root = Path(root)
+        for pat in pats:
+            for p in root.rglob(pat):
+                if not p.is_file():
+                    continue
+                # De-dup the same image across container dirs (a game's EBOOT
+                # often exists in extracted/, USRDIR/, game/ at once): key on the
+                # game root + stem + byte size, so identical copies collapse to
+                # one while genuinely different binaries stay separate.
+                key = (game_label(p).name, p.stem.replace(".dec", ""), p.stat().st_size)
+                if key in seen:
+                    continue
+                # Prefer the decrypted .elf over its encrypted .bin/.self sibling
+                # (same image; the .self merely adds the SCE wrapper).
+                if p.suffix.lower() in (".bin", ".self") and (
+                        p.with_suffix(".elf").exists()
+                        or p.with_name(p.stem + ".elf").exists()):
+                    continue
+                seen.add(key)
+                out.append(p)
+    return out
+
+
+GENERIC_DIRS = {"usrdir", "game", "input", "extracted", "ps3_game", "c00", "app_home", "ps3"}
+
+
+def game_label(binp: Path) -> Path:
+    """Walk up past generic container dirs (USRDIR/game/...) to the game root."""
+    d = binp.parent
+    while d.name.lower() in GENERIC_DIRS and d.parent != d:
+        d = d.parent
+    return d
+
+
+def run_binary(binp: Path, cfg) -> dict:
+    root = game_label(binp)
+    tid = slug(f"{root.name}_{binp.parent.name}_{binp.stem}")
+    work = Path(cfg.out) / "work" / tid
+    work.mkdir(parents=True, exist_ok=True)
+    res = {"title": f"{root.name}/{binp.name}", "id": tid, "source": "elf",
+           "input": str(binp), "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "stages": {}, "max_tier_reached": 0}
+
+    dec = stage_decrypt(binp, work, cfg)
+    res["stages"]["decrypt"] = dec
+    if dec["status"] != "ok":
+        res["blocked_at"] = "decrypt"
+        return res
+    res["max_tier_reached"] = 2
+    elf = Path(dec["elf"])
+
+    order = [("profile", lambda: stage_profile(elf, cfg)),
+             ("functions", lambda: stage_functions(elf, work, cfg))]
+    if cfg.max_tier >= 5:
+        order.append(("lift", lambda: stage_lift(
+            elf, res["stages"].get("functions", {}).get("functions_path"), work, cfg)))
+
+    for name, fn in order:
+        if STAGE_TIER[name] > cfg.max_tier:
+            break
+        out = fn()
+        res["stages"][name] = out
+        if out.get("status") == "ok":
+            res["max_tier_reached"] = max(res["max_tier_reached"], STAGE_TIER[name])
+        else:
+            res["blocked_at"] = name
+            break
+    return res
+
+
+def cmd_analyze(cfg):
+    roots = [r for r in (cfg.elf_root or []) if Path(r).exists()]
+    if not roots:
+        log("no --elf-root given or none exist; nothing to analyze")
+        return
+    bins = discover_binaries(roots)
+    log(f"{len(bins)} binaries discovered under {len(roots)} root(s) | max-tier {cfg.max_tier}")
+    results_dir = Path(cfg.out) / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.limit:
+        bins = bins[:cfg.limit]
+
+    done = skipped = 0
+    for i, binp in enumerate(bins, 1):
+        tid = slug(f"{game_label(binp).name}_{binp.parent.name}_{binp.stem}")
+        rj = results_dir / f"elf_{tid}.json"
+        if rj.exists() and not cfg.force:
+            try:
+                prev = json.loads(rj.read_text())
+                if prev.get("max_tier_reached", 0) >= cfg.max_tier or prev.get("blocked_at"):
+                    skipped += 1
+                    continue
+            except json.JSONDecodeError:
+                pass
+        log(f"[{i}/{len(bins)}] {binp.parent.name}/{binp.name}")
+        res = run_binary(binp, cfg)
+        rj.write_text(json.dumps(res, indent=2))
+        b = res.get("blocked_at", "-")
+        log(f"    -> tier {res['max_tier_reached']}" + (f" (blocked at {b})" if b != "-" else " OK"))
+        done += 1
+    log(f"done: {done} processed, {skipped} skipped (resumed)")
+    cmd_report(cfg)
+
+
+# ---------------------------------------------------------------------- report
+
+def cmd_report(cfg):
+    out = []
+    A = out.append
+    A(f"# ps3recomp Harness Report\n\n_generated {time.strftime('%Y-%m-%d %H:%M')}_\n")
+
+    # ---- PSN catalog (filename pass) ----
+    cat_path = Path(cfg.out) / "catalog.json"
+    if cat_path.exists():
+        cat = json.loads(cat_path.read_text())
+        A(f"## PSN library catalog\n\n_{len(cat)} archives scanned by filename (no extraction)._\n")
+        regions = Counter(c["region"] for c in cat)
+        classes = Counter(c["content_class"] for c in cat)
+        libs = Counter(c["lib"] for c in cat)
+        total_gb = round(sum(c["rar_mb"] for c in cat) / 1024, 1)
+        named = sum(1 for c in cat if c["title_id"])
+        A(f"- **Total archive size:** {total_gb} GB across {len(cat)} titles "
+          f"({named} with a parseable title-id)")
+        A(f"- **Sub-libraries:** " + ", ".join(f"{k} ({v})" for k, v in libs.most_common()))
+        A("\n**Region distribution:**\n")
+        A("| Region | # titles |\n|---|---:|")
+        for k, v in regions.most_common():
+            A(f"| {k} | {v} |")
+        A("\n**Content-class distribution (PSN prefix 4th letter):**\n")
+        A("| Class | # titles |\n|---|---:|")
+        for k, v in classes.most_common():
+            A(f"| {k} | {v} |")
+        A("")
+
+    rows = []
+    for rj in sorted((Path(cfg.out) / "results").glob("*.json")):
+        try:
+            rows.append(json.loads(rj.read_text()))
+        except json.JSONDecodeError:
+            continue
+    elf_rows = [r for r in rows if r.get("source") == "elf"]
+    cat_rows = [r for r in rows if r.get("source") == "psn"]
+
+    # ---- PKG-header probes ----
+    if cat_rows:
+        A(f"## PKG-header probes ({len(cat_rows)})\n")
+        A("| Title | content-id | items | size (MB) |\n|---|---|---:|---:|")
+        for r in cat_rows:
+            c = r["stages"].get("catalog", {})
+            A(f"| {r['title'][:40]} | {c.get('content_id', c.get('error', '?'))} "
+              f"| {c.get('item_count', '?')} | {round(c.get('total_size', 0)/1048576, 1)} |")
+        A("")
+
+    # ---- decrypted-ELF recomp triage ----
+    if elf_rows:
+        n = len(elf_rows)
+        A(f"## Decrypted-ELF recomp triage\n\n_{n} binaries._\n")
+
+        def ok(stage):
+            return sum(1 for r in elf_rows if r["stages"].get(stage, {}).get("status") == "ok")
+        A("### Pipeline funnel\n")
+        A("| Stage | Reached OK | % |\n|---|---:|---:|")
+        for s in ["decrypt", "profile", "functions", "lift"]:
+            attempted = sum(1 for r in elf_rows if s in r["stages"])
+            if attempted:
+                A(f"| {s} | {ok(s)}/{attempted} | {round(100*ok(s)/n)}% |")
+        A("")
+
+        base_dist = Counter()
+        machines = Counter()
+        A("### Per-binary profile\n")
+        A("| Binary | machine | image base | segs | mem (KB) | functions | .opd seeded | lift |\n"
+          "|---|---|---|---:|---:|---:|---:|---|")
+        for r in elf_rows:
+            st = r["stages"]
+            prof = st.get("profile", {})
+            fn = st.get("functions", {})
+            lift = st.get("lift", {})
+            if prof.get("image_base"):
+                base_dist[prof["image_base"]] += 1
+            if prof.get("machine"):
+                machines[prof["machine"]] += 1
+            lift_cell = (f"{lift.get('n_chunks')} chunks/{lift.get('c_mb')}MB"
+                         if lift.get("status") == "ok"
+                         else (lift.get("error", "-")[:18] if lift else "-"))
+            A(f"| {r['title'][:34]} | {prof.get('machine', '-')} | {prof.get('image_base', '-')} "
+              f"| {prof.get('n_segments', '-')} | {prof.get('mem_kb', '-')} "
+              f"| {fn.get('n_functions', '-')} | {fn.get('opd_seeded', '-')} | {lift_cell} |")
+        A("")
+        if base_dist:
+            A("### Image-base distribution\n")
+            for b, c in base_dist.most_common():
+                flag = "  <- non-standard" if b not in ("0x00010000",) else ""
+                A(f"- `{b}`: {c}{flag}")
+            A("")
+        if machines:
+            A("### Machine types\n")
+            for m, c in machines.most_common():
+                A(f"- {m}: {c}")
+            A("")
+
+        # giant functions + lift failures
+        giants = [(r["title"], st["lift"]["giant_functions"])
+                  for r in elf_rows if (st := r["stages"]).get("lift", {}).get("giant_functions")]
+        if giants:
+            A("### Giant-function warnings (boundary mis-detection)\n")
+            for t, gs in giants[:20]:
+                A(f"- {t}: " + ", ".join(f"{g['addr']} ({g['bytes']//1024} KB)" for g in gs))
+            A("")
+        fails = [(r["title"], r["blocked_at"], r["stages"][r["blocked_at"]].get("error", "?"))
+                 for r in elf_rows if r.get("blocked_at")]
+        if fails:
+            A(f"### Blocked binaries ({len(fails)})\n")
+            for t, stage, err in fails[:30]:
+                A(f"- **{t}** at *{stage}*: {err}")
+            A("")
+
+    report = Path(cfg.out) / "REPORT.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("\n".join(out), encoding="utf-8")
+    log(f"report -> {report}  ({len(elf_rows)} elf, {len(cat_rows)} probed)")
+
+
+# ------------------------------------------------------------------------ main
+
+def build_cfg(args):
+    class C:
+        pass
+    c = C()
+    for k, v in vars(args).items():
+        setattr(c, k, v)
+    for k, v in DEFAULTS.items():
+        if getattr(c, k, None) is None:
+            setattr(c, k, v)
+    c.t_extract = 1200
+    c.t_decrypt = 300
+    c.t_profile = 120
+    c.t_functions = 600
+    c.t_lift = getattr(args, "t_lift", None) or 3600
+    return c
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    pc = sub.add_parser("catalog", help="catalog the PSN library by filename (+optional probe)")
+    pc.add_argument("--psn-root", dest="psn_root")
+    pc.add_argument("--probe", type=int, default=0, help="extract+read PKG header for N smallest titles")
+    pc.add_argument("--out")
+    pc.add_argument("--sevenzip")
+
+    pa = sub.add_parser("analyze", help="profile/lift decrypted ELFs under --elf-root")
+    pa.add_argument("--elf-root", dest="elf_root", action="append",
+                    help="directory of decrypted PS3 binaries (repeatable)")
+    pa.add_argument("--max-tier", dest="max_tier", type=int, default=4, choices=[2, 3, 4, 5],
+                    help="2 decrypt, 3 +profile, 4 +functions (default), 5 +lift")
+    pa.add_argument("--limit", type=int)
+    pa.add_argument("--force", action="store_true")
+    pa.add_argument("--jobs", type=int, default=0, help="ppu_lifter --jobs (0 = its default)")
+    pa.add_argument("--keep-lifted", dest="keep_lifted", action="store_true")
+    pa.add_argument("--t-lift", dest="t_lift", type=int)
+    pa.add_argument("--out")
+    pa.add_argument("--ps3sce")
+
+    rp = sub.add_parser("report", help="aggregate results into REPORT.md")
+    rp.add_argument("--out")
+
+    args = ap.parse_args()
+    # default-fill fields a given subparser may not define
+    for f, d in [("psn_root", None), ("probe", 0), ("elf_root", None), ("max_tier", 4),
+                 ("limit", None), ("force", False), ("jobs", 0), ("keep_lifted", False),
+                 ("t_lift", None), ("sevenzip", None), ("ps3sce", None)]:
+        if not hasattr(args, f):
+            setattr(args, f, d)
+    if getattr(args, "jobs", 0) in (0, None):
+        args.jobs = ""  # let ppu_lifter pick CPU count; "" -> omitted? we pass int, so default below
+        args.jobs = __import__("os").cpu_count() or 4
+    cfg = build_cfg(args)
+    {"catalog": cmd_catalog, "analyze": cmd_analyze, "report": cmd_report}[args.cmd](cfg)
+
+
+if __name__ == "__main__":
+    main()
