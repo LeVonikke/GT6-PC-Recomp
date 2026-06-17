@@ -109,9 +109,16 @@ Two signals worth chasing:
   `.opd`-listed address-taken functions Ghidra folded into callers; some may be
   false positives. The cross-check gives the exact addresses to audit.
 
-This is the kind of quality measurement that only falls out of running detection
-against an independent tool at scale — and `e:\ida` (IDA headless) is a second
-oracle we can add the same way.
+**Update — second oracle (IDA) + the gap is now closeable.** IDA Pro 9.1 headless
+(`tools/ida_analyze.py`, ~10 s/binary) is wired as a second oracle
+(`--oracle ghidra|ida|both`). With both, the high-confidence signal is the set
+**Ghidra and IDA agree on**: on the Simpsons EBOOT they agree on 2,974 functions
+and `find_functions` misses **741** of those (recall 75.1%) — two independent
+disassemblers agreeing makes those almost certainly real. And the gap is now
+recoverable: `find_functions --seed-json <ghidra|ida functions.json>` folds those
+confirmed starts in as seeds, taking Simpsons recall to **100%** and producing a
+best-of-both function list for the lifter. (On tokyojungle, `.opd` detection is
+already so strong — 11,231 vs IDA's 6,967 — that seeding adds only 17.)
 
 ### 3.4 Other observations
 
