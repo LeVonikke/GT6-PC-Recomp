@@ -90,3 +90,6 @@ ehthumbs.db
 _harness/
 .pr_review/
 _drill/
+
+# Local Claude Code settings
+.claude/
