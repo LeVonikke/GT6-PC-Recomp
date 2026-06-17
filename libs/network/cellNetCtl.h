@@ -146,6 +146,23 @@ typedef struct CellNetCtlNatInfo {
 typedef void (*cellNetCtlHandler)(s32 prev_state, s32 new_state,
                                   s32 event, s32 error_code, void* arg);
 
+/* Net-start dialog completion is signalled through the cellSysutil callback
+ * queue with these status codes (delivered as the `status` argument). */
+#define CELL_SYSUTIL_NET_CTL_NETSTART_LOADED    0x0801
+#define CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED  0x0802
+#define CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED  0x0803
+
+typedef struct CellNetCtlNetStartDialogParam {
+    s32 size;       /* caller-set: sizeof(struct) */
+    s32 type;       /* dialog type */
+    u32 cid;        /* context id */
+} CellNetCtlNetStartDialogParam;
+
+typedef struct CellNetCtlNetStartDialogResult {
+    s32 size;       /* caller-set: sizeof(struct) */
+    s32 result;     /* 0 = connected, negative = error/abort */
+} CellNetCtlNetStartDialogResult;
+
 /* ---------------------------------------------------------------------------
  * Functions
  * -----------------------------------------------------------------------*/
@@ -159,6 +176,12 @@ s32 cellNetCtlGetNatInfo(CellNetCtlNatInfo* natInfo);
 
 s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid);
 s32 cellNetCtlDelHandler(s32 hid);
+
+/* Net-start ("connect to PSN") dialog. In an offline native recomp we never
+ * show it — these report an immediate successful connection. */
+s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param);
+s32 cellNetCtlNetStartDialogAbortAsync(void);
+s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result);
 
 #ifdef __cplusplus
 }

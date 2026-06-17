@@ -6,6 +6,7 @@
  */
 
 #include "cellNetCtl.h"
+#include "cellSysutil.h"   /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
 #include <stdio.h>
 #include <string.h>
 
@@ -278,5 +279,49 @@ s32 cellNetCtlDelHandler(s32 hid)
     s_handlers[hid].arg     = NULL;
 
     printf("[cellNetCtl] DelHandler(hid=%d)\n", hid);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Net-start ("connect to PSN") dialog
+ *
+ * Real hardware shows a system dialog and signals progress asynchronously
+ * through the cellSysutil callback queue (LOADED -> FINISHED), after which the
+ * game calls UnloadAsync to retrieve the result. In an offline native recomp
+ * there is nothing to show and we are already "connected", so we immediately
+ * post LOADED + FINISHED to every registered sysutil callback slot and report a
+ * successful result on unload. This unblocks the common boot-time "connecting
+ * to network" gate without requiring a real PSN session.
+ * -----------------------------------------------------------------------*/
+
+static void netstart_broadcast(u32 status)
+{
+    /* Sysutil events target a specific slot; the game may have registered its
+     * callback on any of them, so notify all and let it filter by status. */
+    for (int slot = 0; slot < CELL_SYSUTIL_MAX_CALLBACKS; ++slot)
+        cellSysutilQueueEvent(slot, status, 0);
+}
+
+s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param)
+{
+    (void)param;
+    printf("[cellNetCtl] NetStartDialogLoadAsync() -> auto-connect\n");
+    netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_LOADED);
+    netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED);
+    return CELL_OK;
+}
+
+s32 cellNetCtlNetStartDialogAbortAsync(void)
+{
+    printf("[cellNetCtl] NetStartDialogAbortAsync()\n");
+    return CELL_OK;
+}
+
+s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
+{
+    if (result)
+        result->result = 0;   /* 0 = connected; endian-safe */
+    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0 (connected)\n");
+    netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
 }
