@@ -32,6 +32,14 @@ extern "C" uint8_t* vm_base;   /* defined by the host */
  * rather than dying. */
 extern "C" uint32_t ppu_vm_size = 0;
 
+/* PT_TLS template (captured by ppu_load_elf) + the main thread's TLS image.
+ * PPC64 ELF TLS: r13 (thread pointer) = image_base + 0x7000. The image sits in
+ * the free window just below the mmapper region (0x11000000) and above any
+ * game's high data segments, so it doesn't collide with the static image. */
+static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
+#define PPU_TLS_IMG   0x10F00000u
+#define PPU_TLS_TP    (PPU_TLS_IMG + 0x7000u)
+
 static int vm_oob(uint32_t a, uint32_t n)
 {
     if (ppu_vm_size && (uint64_t)a + n > ppu_vm_size) {
@@ -121,8 +129,42 @@ extern "C" void ppu_recomp_register(void)
 /* Indirect call (bctrl/bctr): CTR holds the already-OPD-resolved code address. */
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
-    ppu_fn fn = ppu_lookup((uint32_t)ctx->ctr);
-    if (fn) { fn(ctx); return; }
+    uint32_t addr = (uint32_t)ctx->ctr;
+    /* Null / return-to-OS sentinel: a bctr to address 0 means the guest
+     * unwound to the initial frame (or a not-yet-populated function pointer).
+     * Don't treat it as an unresolved call -- just return to the caller. */
+    if (addr == 0)
+        return;
+
+    ppu_fn fn = ppu_lookup(addr);
+    if (fn) {
+        /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
+         * chain that never converges) can dispatch recursively without bound
+         * and blow the host stack. Cap the depth, log once, then unwind. */
+        static thread_local int s_depth = 0;
+        if (s_depth > 4000) {
+            static int warned = 0;
+            if (warned++ < 8)
+                fprintf(stderr, "[ppu] recursion cap @0x%08X depth=%d -- skipping\n", addr, s_depth);
+            return;
+        }
+        s_depth++;
+        fn(ctx);
+        /* Drain the tail-call trampoline chain. Lifted functions model a tail
+         * call (`b target`) by setting g_trampoline_fn and returning, expecting
+         * the *caller's* DRAIN_TRAMPOLINE to continue. An indirect call IS such
+         * a caller: if the dispatched function ends in a tail call, the
+         * continuation is lost unless we drain it here too -- ppu_run only
+         * drains the top frame, so without this the CRT's init tail-calls (and
+         * the function-pointer tables they populate) silently never run. */
+        while (g_trampoline_fn) {
+            void (*tf)(void*) = g_trampoline_fn;
+            g_trampoline_fn = 0;
+            tf(ctx);
+        }
+        s_depth--;
+        return;
+    }
     /* Stuck-loop guard: a divergence (e.g. an object with a null function
      * pointer) can make the game spin on the same unresolved target forever.
      * Detect a long run of identical unresolved targets and bail so the run
@@ -270,6 +312,17 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         if (ph_off + 56 > fsz) break;   /* program header itself out of the file */
         const uint8_t* ph = file + ph_off;
         uint32_t p_type = be32(ph + 0);
+        if (p_type == 7 /*PT_TLS*/) {
+            /* The thread-local template: its initialised bytes live in vm_base
+             * at p_vaddr (covered by a PT_LOAD too). ppu_run copies it into the
+             * main thread's TLS image and points r13 at it. */
+            g_tls_vaddr  = (uint32_t)be64(ph + 16);
+            g_tls_filesz = (uint32_t)be64(ph + 32);
+            g_tls_memsz  = (uint32_t)be64(ph + 40);
+            fprintf(stderr, "[ppu] PT_TLS template vaddr=0x%08X filesz=0x%X memsz=0x%X\n",
+                    g_tls_vaddr, g_tls_filesz, g_tls_memsz);
+            continue;
+        }
         if (p_type != 1 /*PT_LOAD*/) continue;
         uint64_t p_offset = be64(ph + 8);
         uint64_t p_vaddr  = be64(ph + 16);
@@ -324,6 +377,17 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     memset(&ctx, 0, sizeof(ctx));
     ctx.gpr[1] = stack_top;   /* stack pointer */
     ctx.gpr[2] = toc;         /* TOC base (r2) */
+
+    /* Main-thread TLS: copy the PT_TLS template into the TLS image (zeroing the
+     * BSS tail) and point r13 at TP. The CRT accesses thread-locals relative to
+     * r13; without this they hit address ~0 and corrupt the boot. */
+    if (g_tls_memsz && (PPU_TLS_IMG + g_tls_memsz < (ppu_vm_size ? ppu_vm_size : 0x11000000u))) {
+        memcpy(vm_base + PPU_TLS_IMG, vm_base + g_tls_vaddr, g_tls_filesz);
+        if (g_tls_memsz > g_tls_filesz)
+            memset(vm_base + PPU_TLS_IMG + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
+        ctx.gpr[13] = PPU_TLS_TP;
+        fprintf(stderr, "[ppu] TLS image 0x%08X (r13/TP=0x%08X)\n", PPU_TLS_IMG, PPU_TLS_TP);
+    }
     fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, stack_top);
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
