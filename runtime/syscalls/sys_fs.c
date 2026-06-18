@@ -65,6 +65,14 @@ static void write_be64(uint32_t addr, uint64_t val)
  *   /dev_usb000/.. -> <root>/dev_usb000/...
  *   Others         -> <root>/<path>
  * -----------------------------------------------------------------------*/
+static void fs_normalize_sep(char* p) {
+#ifdef _WIN32
+    for (char* c = p; *c; c++) if (*c == '/') *c = '\\';
+#else
+    (void)p;
+#endif
+}
+
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
     /* Strip leading slash for concatenation */
@@ -72,13 +80,24 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
     if (rel[0] == '/') rel++;
 
     snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
+    fs_normalize_sep(host_path);
 
-    /* Normalize separators for Windows */
-#ifdef _WIN32
-    for (char* c = host_path; *c; c++) {
-        if (*c == '/') *c = '\\';
+    /* Extracted-dump fallback: our test setups often hold a title's data at
+     * <root>/extracted/USRDIR/... rather than the full /dev_hdd0/game/<ID>/USRDIR
+     * install tree the guest opens. If the primary path doesn't exist but a
+     * USRDIR-relative path under <root>/extracted does, use that. Additive: only
+     * affects paths unresolved at the primary location. */
+    struct stat st;
+    if (stat(host_path, &st) != 0) {
+        const char* usr = strstr(ps3_path, "/USRDIR/");
+        if (usr) {
+            char alt[1024];
+            snprintf(alt, sizeof(alt), "%s/extracted/USRDIR/%s", g_sys_fs_root, usr + 8);
+            fs_normalize_sep(alt);
+            if (stat(alt, &st) == 0)
+                snprintf(host_path, (size_t)host_path_size, "%s", alt);
+        }
     }
-#endif
 }
 
 /* ---------------------------------------------------------------------------
