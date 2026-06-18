@@ -38,8 +38,14 @@ for gen in "$HERE"/gen_test_*.py; do
     python "$TOOLS/spu_lifter.py" --auto-functions "$elf" \
         --output "$gen_out" > /dev/null
 
+    # Optional per-test extra build args (extra sources / -I dirs). A
+    # test_<name>.deps file is sourced with $REPO/$RUNTIME_SPU in scope and may
+    # set EXTRA="..." (e.g. to link a libs/ HLE module like cellSync.c).
+    EXTRA=""
+    [ -f "$HERE/test_${name}.deps" ] && . "$HERE/test_${name}.deps"
+
     if "$GCC" -std=c11 -O2 -I "$gen_out" -I "$RUNTIME_SPU" \
-        "$gen_out/spu_recomp.c" "$main" -o "$exe" \
+        "$gen_out/spu_recomp.c" "$main" $EXTRA -o "$exe" \
         2> "$HERE/build_${name}.log"; then
         out=$("$exe" 2>&1) && rc=$? || rc=$?
         if [ "$rc" -eq 0 ]; then
