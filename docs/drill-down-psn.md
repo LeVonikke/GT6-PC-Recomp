@@ -114,6 +114,32 @@ These were near-free to bring up: at 88–95% import overlap they reused the
 Simpsons/Tokyo-Jungle stubs and toolkit fixes verbatim — exactly the payoff the
 clustering predicted.
 
+## Does a "driver" exist for Tokyo Jungle? (SCE first-party doesn't cluster)
+
+The arcade hubs cluster because they're literally the same program (88–95%). The
+question was whether SCE Japan Studio's 3D titles cluster the same way, so one
+bring-up could *drive* Tokyo Jungle. They don't:
+
+| pair | overlap |
+|---|---:|
+| Echochrome vs **Echochrome ii** (same series, same studio) | **54%** |
+| Echochrome vs Tokyo Jungle | 39% |
+| Echochrome ii vs Tokyo Jungle | 35% |
+| Super Stardust HD vs Tokyo Jungle | 39% |
+
+Even a direct sequel by the same studio is only 54% — and Echochrome ii drifts
+*further* from TJ than the original, because it's a **PlayStation Move** title
+(`libgem(17)` + `cellCamera(13)` + `sceNpTus(22)` that the first game lacks).
+
+**Conclusion:** Tokyo Jungle has no engine-twin. SCE first-party games are
+bespoke engines over a shared middleware *base* (~35–40%: `cellGcmSys`,
+`cellSpurs`, `cellResc`, `sceNp`, `cellSysutil`, `sysPrxForUser`). So nothing
+"drives" TJ the way Sonic rode on Simpsons — the leverage is instead (a) the
+**generic CRT/OPD function-pointer fix** (which every title needs, see the boot
+follow-up above) and (b) hardening those **shared middleware HLE modules**. Both
+advance the whole SCE 3D class — Tokyo Jungle, Echochrome, Super Stardust —
+together, just not via a single sibling.
+
 ## Caveats
 - Function counts are `.opd`-hardened `find_functions` (pre-`--seed-json`); the
   Ghidra/IDA cross-check would refine them per title.
