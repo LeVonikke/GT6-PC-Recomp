@@ -331,7 +331,7 @@ class SPULifter:
             "clz": "spu_clz", "cntb": "spu_cntb",
             "fscrrd": "spu_fscrrd",
             "gb": "spu_gb", "gbh": "spu_gbh",
-            "frsqest": "spu_frsqest",
+            "frsqest": "spu_frsqest", "frest": "spu_frest",
             # Phase 3
             "xsbh": "spu_xsbh", "xshw": "spu_xshw", "xswd": "spu_xswd",
             "orx": "spu_orx",
