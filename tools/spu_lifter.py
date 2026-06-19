@@ -180,17 +180,21 @@ _NO_RT_WRITE = {
 
 
 class SPULifter:
-    def __init__(self, trace: bool = False):
+    def __init__(self, trace: bool = False, prefix: str = ""):
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
         self.unsupported: dict[str, int] = {}
         self.trace = trace
+        # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
+        # Lets multiple lifted SPU images link into one binary without collisions
+        # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
+        self.prefix = prefix
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
                       start: int, end: int) -> LiftedFunction:
-        func = LiftedFunction(name=f"spu_func_{start:08X}",
+        func = LiftedFunction(name=f"{self.prefix}spu_func_{start:08X}",
                               start_addr=start, end_addr=end)
 
         internal: set[int] = set()
@@ -226,7 +230,7 @@ class SPULifter:
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; spu_func_{end:08X}(ctx); return; }}")
+                f"    {{ ctx->pc = 0x{end:X}; {self.prefix}spu_func_{end:08X}(ctx); return; }}")
 
         self.functions.append(func)
         return func
@@ -443,7 +447,7 @@ class SPULifter:
             link = f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X});"
             if tgt is not None:
                 self.call_targets.add(tgt)
-                return f"{link} spu_func_{tgt:08X}(ctx);"
+                return f"{link} {self.prefix}spu_func_{tgt:08X}(ctx);"
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -454,7 +458,7 @@ class SPULifter:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
             return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"spu_func_{tgt:08X}(ctx); return; }}")
+                    f"{self.prefix}spu_func_{tgt:08X}(ctx); return; }}")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
             tgt_reg = _reg(ops[0])
@@ -504,7 +508,7 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        return f"{{ ctx->pc = 0x{tgt:X}; spu_func_{tgt:08X}(ctx); return; }}"
+        return f"{{ ctx->pc = 0x{tgt:X}; {self.prefix}spu_func_{tgt:08X}(ctx); return; }}"
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -514,13 +518,13 @@ class SPULifter:
         defined = {f.start_addr for f in self.functions}
         for t in sorted(self.call_targets | self.branch_targets):
             if t not in defined:
-                lines.append(f"void spu_func_{t:08X}(spu_context* ctx); /* external */")
+                lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx); /* external */")
         lines.append("")
         lines.append("/* Runtime glue (runtime/spu/spu_channels.c) */")
         lines.append("void spu_register_function(uint32_t addr, void (*fn)(spu_context*));")
         lines.append("/* Call once at init to register this image's functions for")
         lines.append(" * indirect-branch dispatch (spu_indirect_branch). */")
-        lines.append("void spu_recomp_register(void);")
+        lines.append(f"void {self.prefix}spu_recomp_register(void);")
         lines.append("")
         return "\n".join(lines)
 
@@ -546,7 +550,7 @@ class SPULifter:
             lines.append(" * function detector did not seed (typically conditional")
             lines.append(" * branches that escape a function's range). */")
             for t in externs:
-                lines.append(f"void spu_func_{t:08X}(spu_context* ctx) {{")
+                lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
                 lines.append(f"    ctx->pc = 0x{t:X}u; spu_indirect_branch(ctx);")
                 lines.append("}")
             lines.append("")
@@ -559,7 +563,7 @@ class SPULifter:
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
         lines.append("")
-        lines.append("void spu_recomp_register(void) {")
+        lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
         lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
         lines.append("        spu_register_function(e->addr, e->func);")
         lines.append("}")
@@ -594,6 +598,10 @@ def main() -> None:
                    help="Emit spu_trace_pc/spu_trace_rt around each instruction "
                         "for §3 diff-vs-RPCS3 validation. Output goes to stderr "
                         "unless spu_trace_init(path) is called by the harness.")
+    p.add_argument("--symbol-prefix", default="",
+                   help="Prefix for all emitted spu_func_* / spu_recomp_register "
+                        "symbols, so multiple lifted SPU images can link into one "
+                        "binary without colliding (e.g. flow_spu_00_). Default: none.")
     args = p.parse_args()
 
     if args.auto_functions:
@@ -624,7 +632,7 @@ def main() -> None:
 
     insns = disassemble_spu(data, base)
 
-    lifter = SPULifter(trace=args.trace)
+    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:
         lifter.lift_function(insns, s, e)
