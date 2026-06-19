@@ -10,6 +10,7 @@
  */
 
 #include "cellSpurs.h"
+#include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include <stdio.h>
 #include <string.h>
 
@@ -422,6 +423,25 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
 
             printf("[cellSpurs] CreateTask(id=%u, entry=%p) - task logged\n",
                    s_tasks[i].id, elf);
+
+            /* Run the task's SPU program if a lifted build is registered for it.
+             * The registry maps the task ELF (by content fingerprint) to its
+             * pre-lifted native entry; dispatch loads the ELF into a local store
+             * and runs it with the task arg in r3. INERT until the title
+             * registers its lifted SPU set: an unregistered image MISSes and
+             * returns 0, preserving the prior "track only" behaviour.
+             *
+             * NOTE: dispatch is synchronous (runs to completion inline). That
+             * suits create+join task patterns; a workload/taskset whose SPU job
+             * waits on concurrent PPU-side signals will want the async lv2
+             * SPU-thread path instead — wired when a title exercises it. */
+            if (elf) {
+                size_t sz = spu_elf_image_size((const uint8_t*)elf,
+                                               2u * 1024 * 1024);
+                if (sz)
+                    spu_workload_dispatch((const uint8_t*)elf, (uint32_t)sz,
+                                          (uint32_t)(uintptr_t)context);
+            }
             return CELL_OK;
         }
     }
