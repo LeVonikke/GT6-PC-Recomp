@@ -235,19 +235,25 @@ class LiftedFunction:
 class PPULifter:
     """Translates PPU instructions into C source."""
 
-    def __init__(self):
+    def __init__(self, prefix: str = ""):
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
+        # Symbol prefix for every emitted func_* / function_table[] symbol, so
+        # a relocated PRX image (e.g. libsre_) can link alongside the main
+        # title without func_XXXXXXXX / function_table collisions. Shared types
+        # (ppu_context, func_entry) stay unprefixed — integration TUs declare
+        # the prefixed table extern manually rather than including two headers.
+        self.prefix = prefix
 
     def lift_function(self, instructions: list[Instruction],
                       start: int, end: int) -> LiftedFunction:
         """Lift a range of instructions into a C function."""
         func = LiftedFunction(
-            name=f"func_{start:08X}",
+            name=f"{self.prefix}func_{start:08X}",
             start_addr=start,
             end_addr=end,
         )
@@ -716,7 +722,7 @@ class PPULifter:
                     # stack-growing recursion when backward branches re-enter
                     # a fragment's prologue (stack allocation).
                     self.branch_targets.add(tgt)
-                    return f"{{ g_trampoline_fn = (void(*)(void*))func_{tgt:08X}; return; }}"
+                    return f"{{ g_trampoline_fn = (void(*)(void*)){self.prefix}func_{tgt:08X}; return; }}"
             except ValueError:
                 return f"goto {target}; /* branch */"
 
@@ -726,7 +732,7 @@ class PPULifter:
                 tgt = int(target, 16)
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
-                return f"func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
+                return f"{self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
             except ValueError:
                 return f"/* bl {target} */;"
 
@@ -763,7 +769,7 @@ class PPULifter:
                     cond = self._branch_condition(mn, ops)
                     # Use trampoline for cross-fragment conditional branches
                     self.branch_targets.add(tgt)
-                    return f"if ({cond}) {{ g_trampoline_fn = (void(*)(void*))func_{tgt:08X}; return; }}"
+                    return f"if ({cond}) {{ g_trampoline_fn = (void(*)(void*)){self.prefix}func_{tgt:08X}; return; }}"
             except ValueError:
                 return f"/* {mn} {insn.operands} */;"
 
@@ -1887,14 +1893,21 @@ class PPULifter:
 
     def emit_header(self) -> str:
         """Generate the C header file content."""
-        lines = [HEADER_PREAMBLE]
+        # function_table / function_table_count are per-image; prefix their
+        # extern declarations (and the matching comment) to match the source.
+        # 'function_table_count' starts with 'function_table', so a single
+        # replace covers both uniformly.
+        preamble = (HEADER_PREAMBLE.replace("function_table",
+                                            self.prefix + "function_table")
+                    if self.prefix else HEADER_PREAMBLE)
+        lines = [preamble]
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
         # Also declare any call targets that aren't defined
         defined = {f.start_addr for f in self.functions}
         for target in sorted((self.call_targets | self.branch_targets) - defined):
-            lines.append(f"void func_{target:08X}(ppu_context* ctx); /* external */")
+            lines.append(f"void {self.prefix}func_{target:08X}(ppu_context* ctx); /* external */")
         lines.append("")
         return "\n".join(lines)
 
@@ -2003,12 +2016,12 @@ class PPULifter:
         the header). Emitted once, into the final chunk file."""
         lines: list[str] = []
         lines.append("/* Function table */")
-        lines.append("const func_entry function_table[] = {")
+        lines.append(f"const func_entry {self.prefix}function_table[] = {{")
         for func in self.functions:
             lines.append(f'    {{ 0x{func.start_addr:08X}ULL, {func.name}, "{func.name}" }},')
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
-        lines.append(f"const uint64_t function_table_count = {len(self.functions)};")
+        lines.append(f"const uint64_t {self.prefix}function_table_count = {len(self.functions)};")
         lines.append("")
         return lines
 
@@ -2175,15 +2188,16 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
 _WORKER_STATE: dict = {}
 
 
-def _worker_init(segs, big_endian, name_map):
+def _worker_init(segs, big_endian, name_map, prefix):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
+    _WORKER_STATE["prefix"] = prefix
 
 
 def _worker_lift(task):
     idx0, bounds = task
-    lifter = PPULifter()
+    lifter = PPULifter(prefix=_WORKER_STATE.get("prefix", ""))
     lifter.name_map = _WORKER_STATE["names"]
     results = []
     for start, end in bounds:
@@ -2210,7 +2224,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
     done = 0
     t0 = time.time()
     with mp.Pool(processes=jobs, initializer=_worker_init,
-                 initargs=(segs, big_endian, lifter.name_map)) as pool:
+                 initargs=(segs, big_endian, lifter.name_map, lifter.prefix)) as pool:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
             lifter.call_targets |= ct
@@ -2250,6 +2264,10 @@ def main() -> None:
                         default=max(1, os.cpu_count() or 1),
                         help="Worker processes for the main lift "
                              "(default: CPU count; 1 = serial)")
+    parser.add_argument("--symbol-prefix", default="",
+                        help="Prefix for every emitted func_*/function_table "
+                             "symbol (e.g. 'libsre_') so a relocated PRX image "
+                             "links alongside the main title without collisions")
     args = parser.parse_args()
 
     with open(args.input, "rb") as f:
@@ -2347,7 +2365,7 @@ def main() -> None:
 
     print(f"Lifting {len(func_bounds)} functions...")
 
-    lifter = PPULifter()
+    lifter = PPULifter(prefix=args.symbol_prefix)
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.

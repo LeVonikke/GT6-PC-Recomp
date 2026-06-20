@@ -489,11 +489,13 @@ class PRXModuleInfo:
         m.attributes = rd.u16(offset)
         m.version = (rd.u8(offset + 2), rd.u8(offset + 3))
         m.name = rd.cstring(offset + 4, 28)
+        # PS3 user PRX module_info uses 32-bit pointers (PPU32 prx_module_info_t):
+        #   off 0x20 gp(toc), 0x24 ent_top, 0x28 ent_end, 0x2C stub_top, 0x30 stub_end.
         m.toc = rd.u32(offset + 32)
-        m.exports_start = rd.u64(offset + 36)
-        m.exports_end = rd.u64(offset + 44)
-        m.imports_start = rd.u64(offset + 52)
-        m.imports_end = rd.u64(offset + 60)
+        m.exports_start = rd.u32(offset + 36)
+        m.exports_end = rd.u32(offset + 40)
+        m.imports_start = rd.u32(offset + 44)
+        m.imports_end = rd.u32(offset + 48)
         return m
 
     def to_dict(self) -> dict:
@@ -529,6 +531,7 @@ class PRXExportEntry:
         self.stub_table_ptr = 0
         self.name_str = ""
         self.nids: list[int] = []
+        self.addrs: list[int] = []   # stub-table entry per NID (OPD vaddr for funcs)
 
     @classmethod
     def parse(cls, data: bytes, offset: int, big_endian: bool = True) -> "PRXExportEntry":
@@ -574,6 +577,7 @@ class PRXImportEntry:
         self.stub_table_ptr = 0
         self.name_str = ""
         self.nids: list[int] = []
+        self.addrs: list[int] = []   # stub-table entry per NID (OPD vaddr for funcs)
 
     @classmethod
     def parse(cls, data: bytes, offset: int, big_endian: bool = True) -> "PRXImportEntry":
@@ -699,8 +703,10 @@ class ELFFile:
         """Extract module info from the first PT_LOAD segment of a PRX."""
         for ph in self.program_headers:
             if ph.p_type == PT_LOAD and ph.p_filesz > 0:
-                # module info is at paddr offset within the segment for PRX
-                info_off = int(ph.p_offset + (ph.p_paddr & 0xFFFFFFFF))
+                # For SCE PRX, the first PT_LOAD's p_paddr holds the module_info
+                # as an absolute FILE offset (== module_info vaddr + p_offset),
+                # not a segment-relative vaddr. Use it directly.
+                info_off = int(ph.p_paddr & 0xFFFFFFFF)
                 if info_off + PRXModuleInfo.SIZE <= len(self.raw_data):
                     try:
                         self.module_info = PRXModuleInfo.parse(
@@ -733,10 +739,13 @@ class ELFFile:
                     total = entry.num_funcs + entry.num_vars + entry.num_tlsvars
                     if entry.nid_table_ptr and total > 0:
                         nid_off = vaddr_to_offset(self.program_headers, entry.nid_table_ptr)
+                        stub_off = vaddr_to_offset(self.program_headers, entry.stub_table_ptr)
                         if nid_off is not None:
                             for j in range(total):
                                 if nid_off + j * 4 + 4 <= len(self.raw_data):
                                     entry.nids.append(rd.u32(nid_off + j * 4))
+                                if stub_off is not None and stub_off + j * 4 + 4 <= len(self.raw_data):
+                                    entry.addrs.append(rd.u32(stub_off + j * 4))
                     self.exports.append(entry)
                     off += entry.size
 
@@ -756,10 +765,13 @@ class ELFFile:
                     total = entry.num_funcs + entry.num_vars + entry.num_tlsvars
                     if entry.nid_table_ptr and total > 0:
                         nid_off = vaddr_to_offset(self.program_headers, entry.nid_table_ptr)
+                        stub_off = vaddr_to_offset(self.program_headers, entry.stub_table_ptr)
                         if nid_off is not None:
                             for j in range(total):
                                 if nid_off + j * 4 + 4 <= len(self.raw_data):
                                     entry.nids.append(rd.u32(nid_off + j * 4))
+                                if stub_off is not None and stub_off + j * 4 + 4 <= len(self.raw_data):
+                                    entry.addrs.append(rd.u32(stub_off + j * 4))
                     self.imports.append(entry)
                     off += entry.size
 
