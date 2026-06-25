@@ -121,3 +121,13 @@ s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
     s_gamma = gamma;
     return CELL_OK;
 }
+
+/* cellAudioOutConfigure(audioOut, config, option, waitForEvent) -- set the
+ * audio output mode. We accept any config and report success (request id 0);
+ * the title queries availability separately. NID 0x4692AB35. */
+s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
+{
+    (void)config; (void)option; (void)waitForEvent;
+    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
+    return 0;
+}

@@ -395,8 +395,11 @@ static void audio_mix_one_block(void)
             s_mix_buffer[s * 2 + 1] += right;
         }
 
-        /* Advance read index */
+        /* Advance read index and publish it to the guest-visible counter so the
+         * game (FMOD) can tell how far playback has consumed. */
         port->read_index++;
+        if (port->read_idx_addr)
+            vm_write32((u32)port->read_idx_addr, (u32)port->read_index);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -609,21 +612,26 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->read_index  = 0;
     port->write_index = 0;
 
-    /* Allocate audio buffer */
+    /* Allocate the audio buffer in GUEST memory so portAddr/readIndexAddr are
+     * real guest addresses (the game's mixer -- FMOD here -- writes PCM there
+     * and validates them as 1 MB-aligned guest pointers; a host pointer trips
+     * its "invalid parameter" check). Bump from a free main-memory window; the
+     * host-side `buffer` is just the vm_base view of the same bytes. */
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
     port->buf_size = buf_samples * (u32)sizeof(float);
-    port->buffer = (float*)calloc(buf_samples, sizeof(float));
 
-    if (!port->buffer) {
-        port->in_use = 0;
-        mutex_unlock(&s_audio_mutex);
-        return CELL_ENOMEM;
-    }
+    static u32 s_audio_guest = 0x01000000u;          /* 1 MB-aligned, free window */
+    u32 guest_buf  = s_audio_guest;
+    s_audio_guest += (port->buf_size + 0xFFFFFu) & ~0xFFFFFu;
+    u32 guest_ridx = s_audio_guest;
+    s_audio_guest += 0x100000u;
 
-    /* Set guest-visible addresses (using host pointers as placeholder).
-     * In a full emulator these would be allocated from guest VM memory. */
-    port->port_addr    = (u64)(uintptr_t)port->buffer;
-    port->read_idx_addr = (u64)(uintptr_t)&port->read_index;
+    port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
+    memset(port->buffer, 0, port->buf_size);
+    vm_write32(guest_ridx, 0);                        /* read index counter */
+
+    port->port_addr     = guest_buf;
+    port->read_idx_addr = guest_ridx;
 
     vm_write32(portNum_ea, (u32)found);   /* guest out-param */
 

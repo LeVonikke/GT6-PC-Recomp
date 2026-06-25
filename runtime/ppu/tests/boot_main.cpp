@@ -146,6 +146,7 @@ int main(int argc, char** argv)
 
 #ifdef _WIN32
     SetUnhandledExceptionFilter(ydkj_crash_filter);
+    setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: don't lose prints on kill */
 #endif
 
     /* Flat VM: one host buffer, guest addr -> vm_base + addr. This maps the
