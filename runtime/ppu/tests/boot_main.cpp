@@ -98,10 +98,37 @@ static void derive_vfs_root(const char* eboot)
 extern "C" uint8_t* vm_base = nullptr;
 extern "C" uint32_t ppu_vm_size;   /* defined in ppu_loader.cpp (OOB guard) */
 extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
-/* g_ps3_guest_caller is defined (default NULL) by libs/system/cellSysutil.c in
- * the runtime library; the boot harness installs no guest callbacks, so we just
- * leave it at its default rather than re-defining it (would be a duplicate
- * symbol at link). */
+
+/* Guest-callback dispatch + RSX vblank/flip driver.
+ *
+ * g_ps3_guest_caller (defined NULL by libs/system/cellSysutil.c) is the hook the
+ * HLE runtime uses to call back into recompiled code -- cellSysutil events and
+ * the GCM vblank/flip handlers. ppu_guest_call (ppu_loader.cpp) does the OPD ->
+ * dispatch. On real hardware the RSX fires a vblank interrupt ~60x/s that drives
+ * the game's frame loop; with no RSX we synthesize it from a host timer thread
+ * calling cellGcmTickVBlank()/TickFlip(), which invoke the registered handlers.
+ * Without this the game inits, registers its handlers, and then waits forever
+ * for a vblank that never comes. */
+typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSysutil.c */
+extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+extern "C" void cellGcmTickVBlank(void);
+extern "C" void cellGcmTickFlip(void);
+
+static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+{ ppu_guest_call(opd, a0, a1, a2, a3); }
+
+#ifdef _WIN32
+static DWORD WINAPI vblank_ticker(LPVOID)
+{
+    for (;;) {
+        Sleep(16);            /* ~60 Hz */
+        cellGcmTickVBlank();
+        cellGcmTickFlip();
+    }
+    return 0;
+}
+#endif
 
 /* The flat VM treats every address as valid RAM, so it must span every region
  * the PS3 memory map uses. The game's heap maps at 0x20000000+ and reaches
@@ -145,6 +172,14 @@ int main(int argc, char** argv)
     ppu_sysprx_register();   /* boot-critical CRT (sys_initialize_tls, ...) */
     ppu_fs_register();       /* cellFs VFS over the real game directory */
     lv2_init_syscalls();     /* real lv2 syscall table (semaphore/memory/fs/...) */
+
+    /* Install the guest-callback hook and start the synthetic RSX vblank driver
+     * so the game's frame loop advances (it no-ops until the game registers its
+     * vblank/flip handlers during init). */
+    g_ps3_guest_caller = harness_guest_caller;
+#ifdef _WIN32
+    CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
+#endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
     int rc = ppu_run(entry, STACK_TOP);

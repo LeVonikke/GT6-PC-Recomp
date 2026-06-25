@@ -390,6 +390,37 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(ctx); }
 }
 
+/* Call a guest function by OPD with up to 4 integer args, on a private scratch
+ * stack, and return r3. Used by the HLE runtime to deliver callbacks into
+ * recompiled code (cellSysutil events, GCM vblank/flip handlers, ...) -- the
+ * mechanism behind g_ps3_guest_caller (ps3emu/guest_call.h). */
+extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+                                   uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+    if (!opd_addr) return 0;
+    uint32_t code = 0, toc = 0;
+    ppu_opd_resolve(opd_addr, &code, &toc);
+    ppu_fn fn = ppu_lookup(code);
+    if (!fn) { fprintf(stderr, "[ppu] guest_call: OPD 0x%08X -> code 0x%08X not registered\n",
+                       opd_addr, code); return 0; }
+
+    /* Private scratch stack high in the guest stack region, distinct from the
+     * main + ppu_thread stacks. One callback at a time per caller thread. */
+    static __declspec(thread) uint32_t s_cb_sp = 0;
+    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+
+    ppu_context ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[2]  = toc;
+    ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
+    ctx.gpr[13] = PPU_TLS_TP;
+    ctx.cia     = code;
+    fn(&ctx);
+    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    return ctx.gpr[3];
+}
+
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
