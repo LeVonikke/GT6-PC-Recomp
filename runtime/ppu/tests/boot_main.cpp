@@ -128,6 +128,16 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     }
     return 0;
 }
+
+extern "C" uint32_t    g_last_hle_nid;
+extern "C" const char* g_last_hle_name;
+static DWORD WINAPI hang_watchdog(LPVOID)
+{
+    Sleep(8000);
+    fprintf(stderr, "[WATCHDOG] 8s elapsed; last HLE call = 0x%08X (%s)\n",
+            g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+    return 0;
+}
 #endif
 
 /* The flat VM treats every address as valid RAM, so it must span every region
@@ -180,6 +190,7 @@ int main(int argc, char** argv)
     g_ps3_guest_caller = harness_guest_caller;
 #ifdef _WIN32
     CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
+    CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);
 #endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);

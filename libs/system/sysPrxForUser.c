@@ -324,7 +324,12 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
     }
 
 #ifdef _WIN32
-    EnterCriticalSection(&s_lwmutex[slot].cs);
+    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
+        fprintf(stderr, "[LWMTX] tid %lu BLOCKING on lwmutex slot %u (guest 0x%08X)\n",
+                GetCurrentThreadId(), slot, YZ_GUEST_ADDR(lwmutex));
+        EnterCriticalSection(&s_lwmutex[slot].cs);
+        fprintf(stderr, "[LWMTX] tid %lu acquired slot %u\n", GetCurrentThreadId(), slot);
+    }
 #else
     pthread_mutex_lock(&s_lwmutex[slot].mtx);
 #endif

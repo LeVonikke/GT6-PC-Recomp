@@ -80,6 +80,9 @@ static void* ppu_host_thread_proc(void* param)
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
         g_ppu_thread_entry_trampoline(&info->ctx);
+        fprintf(stderr, "[THREAD %llu] entry RETURNED (r3=0x%llX) -- thread finished\n",
+                (unsigned long long)info->ctx.thread_id,
+                (unsigned long long)info->ctx.gpr[3]);
     } else {
         fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL — thread is a no-op!\n",
                 (unsigned long long)info->ctx.thread_id);
@@ -245,6 +248,8 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
 {
     uint64_t status = LV2_ARG_U64(ctx, 0);
     uint64_t tid = ctx->thread_id;
+    fprintf(stderr, "[SYS] sys_ppu_thread_exit(tid=%llu status=%llu)\n",
+            (unsigned long long)tid, (unsigned long long)status);
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);

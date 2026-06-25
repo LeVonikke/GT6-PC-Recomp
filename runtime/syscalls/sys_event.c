@@ -111,6 +111,8 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     q->tail     = 0;
     q->count    = 0;
     q->type     = SYS_PPU_QUEUE;
+    fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
+            slot + 1, (unsigned long long)key, size);
 
     if (attr_addr != 0) {
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
@@ -528,6 +530,8 @@ int64_t sys_event_port_send(ppu_context* ctx)
     uint64_t data1   = LV2_ARG_U64(ctx, 1);
     uint64_t data2   = LV2_ARG_U64(ctx, 2);
     uint64_t data3   = LV2_ARG_U64(ctx, 3);
+    fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
+            port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
