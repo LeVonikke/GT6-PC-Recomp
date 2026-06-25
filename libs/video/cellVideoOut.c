@@ -240,3 +240,15 @@ s32 cellVideoOutGetNumberOfDevice(u32 videoOut)
 
     return 0;
 }
+
+/* Is (resolutionId, aspect) available on this output? Return 1 (available) for
+ * the primary output. A 0 here makes the game skip its display-buffer/tile
+ * setup, leaving a null render object it later dereferences. */
+s32 cellVideoOutGetResolutionAvailability(u32 videoOut, u32 resolutionId,
+                                          u32 aspect, u32 option)
+{
+    (void)aspect; (void)option;
+    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> 1\n",
+           videoOut, resolutionId);
+    return (videoOut == CELL_VIDEO_OUT_PRIMARY) ? 1 : 0;
+}

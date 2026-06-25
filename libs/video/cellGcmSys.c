@@ -9,9 +9,11 @@
  */
 
 #include "cellGcmSys.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -847,22 +849,21 @@ s32 cellGcmUnbindZcull(u8 index)
 /* NID: 0x107BF789 */
 s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch)
 {
-    if (!pitch)
+    /* `pitch` is a GUEST address (the generic HLE adapter passes r4 raw). Write
+     * through vm_write32 so it's byte-swapped to BE and bounds-checked -- a raw
+     * *pitch faults when the game hands us a null-object-derived low pointer. */
+    uint32_t pitch_ea = (uint32_t)(uintptr_t)pitch;
+    if (!pitch_ea)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    /*
-     * Find the smallest valid tiled pitch that is >= size.
-     * RSX only supports specific pitch values for tiled regions.
-     */
+    /* Smallest valid tiled pitch >= size (RSX supports only specific pitches). */
     for (int i = 0; i < s_valid_pitch_count; i++) {
         if (s_valid_pitches[i] >= size) {
-            *pitch = s_valid_pitches[i];
+            vm_write32(pitch_ea, s_valid_pitches[i]);
             return CELL_OK;
         }
     }
-
-    /* If size exceeds all valid pitches, return the largest */
-    *pitch = s_valid_pitches[s_valid_pitch_count - 1];
+    vm_write32(pitch_ea, s_valid_pitches[s_valid_pitch_count - 1]);
     return CELL_OK;
 }
 
