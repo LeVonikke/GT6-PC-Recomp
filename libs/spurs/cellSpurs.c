@@ -11,8 +11,15 @@
 
 #include "cellSpurs.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+
+/* Generic HLE adapter passes GUEST addresses; translate pointer args. CellSpurs
+ * is treated opaquely by the game (passed back as a handle), so translating the
+ * pointer is enough here. */
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
 #ifdef _WIN32
 #include <windows.h>
@@ -181,8 +188,9 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     if (!spurs || !attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
 
-    printf("[cellSpurs] InitializeWithAttribute(nSpus=%u, prefix=\"%.15s\")\n",
-           attr->nSpus, attr->prefix);
+    spurs = GUEST_PTR(spurs, CellSpurs*);
+    attr  = GUEST_PTR(attr, const CellSpursAttribute*);
+    printf("[cellSpurs] InitializeWithAttribute(prefix=\"%.15s\")\n", attr->prefix);
 
     memset(spurs, 0, sizeof(CellSpurs));
     spurs->initialized = 1;

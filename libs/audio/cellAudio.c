@@ -602,7 +602,10 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     AudioPortSlot* port = &s_ports[found];
     port->in_use  = 1;
     port->running = 0;
-    memcpy(&port->param, vm_base + param_ea, sizeof(port->param));  /* guest struct */
+    /* Store the decoded (host-endian) param values, not the raw BE guest bytes. */
+    memset(&port->param, 0, sizeof(port->param));
+    port->param.nChannel = nch;
+    port->param.nBlock   = nblk;
     port->read_index  = 0;
     port->write_index = 0;
 
@@ -753,24 +756,24 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     if (!config)
         return CELL_AUDIO_ERROR_PARAM;
 
-    mutex_lock(&s_audio_mutex);
+    /* `config` is a GUEST address; write the BE struct field-by-field at its
+     * guest offsets (8-byte aligned u64s). */
+    uint32_t cfg = (uint32_t)(uintptr_t)config;
+    if (!cfg)
+        return CELL_AUDIO_ERROR_PARAM;
 
+    mutex_lock(&s_audio_mutex);
     AudioPortSlot* port = &s_ports[portNum];
 
-    memset(config, 0, sizeof(CellAudioPortConfig));
-    config->nChannel      = port->param.nChannel;
-    config->nBlock        = port->param.nBlock;
-    config->portSize      = port->buf_size;
-    config->portAddr      = port->port_addr;
-    config->readIndexAddr = port->read_idx_addr;
-
-    if (port->running)
-        config->status = CELL_AUDIO_STATUS_RUN;
-    else
-        config->status = CELL_AUDIO_STATUS_READY;
+    vm_write64(cfg +  0, port->read_idx_addr);                               /* readIndexAddr */
+    vm_write32(cfg +  8, port->running ? CELL_AUDIO_STATUS_RUN
+                                       : CELL_AUDIO_STATUS_READY);           /* status */
+    vm_write64(cfg + 16, port->param.nChannel);                             /* nChannel */
+    vm_write64(cfg + 24, port->param.nBlock);                               /* nBlock */
+    vm_write32(cfg + 32, port->buf_size);                                   /* portSize */
+    vm_write64(cfg + 40, port->port_addr);                                  /* portAddr */
 
     mutex_unlock(&s_audio_mutex);
-
     return CELL_OK;
 }
 
