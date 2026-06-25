@@ -159,11 +159,46 @@ static DWORD WINAPI vblank_ticker(LPVOID)
 
 extern "C" uint32_t    g_last_hle_nid;
 extern "C" const char* g_last_hle_name;
+#include <tlhelp32.h>
+/* When the boot wedges, snapshot every other thread's instruction pointer as a
+ * module RVA (symbolize with llvm-symbolizer) so a guest spin/wait is pinned to
+ * an exact lifted function -- the HLE breadcrumb only covers HLE calls. */
 static DWORD WINAPI hang_watchdog(LPVOID)
 {
     Sleep(8000);
     fprintf(stderr, "[WATCHDOG] 8s elapsed; last HLE call = 0x%08X (%s)\n",
             g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+    HMODULE self = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&hang_watchdog, &self);
+    DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te; te.dwSize = sizeof te;
+    if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+            HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                   FALSE, te.th32ThreadID);
+            if (!th) continue;
+            SuspendThread(th);
+            CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(th, &ctx)) {
+                HMODULE m = NULL;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)ctx.Rip, &m);
+                fprintf(stderr, "[WATCHDOG]   tid %5lu rip rva=0x%llX %s\n",
+                        (unsigned long)te.th32ThreadID,
+                        (unsigned long long)((char*)ctx.Rip - (char*)(m ? m : self)),
+                        m == self ? "(boot)" : "(other module)");
+            }
+            ResumeThread(th);
+            CloseHandle(th);
+        } while (Thread32Next(snap, &te));
+    }
+    if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+    fflush(stderr);
     return 0;
 }
 #endif

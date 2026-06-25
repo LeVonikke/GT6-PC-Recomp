@@ -197,6 +197,14 @@ def _reg_idx(token: str) -> str:
     return m.group(1) if m else token
 
 
+def _xea(ra, rb):
+    """X-form (indexed) effective-address base: in PPC indexed addressing an rA
+    field of 0 denotes the literal value 0, NOT the contents of GPR r0. Returns
+    the EA sum expression with that rule applied. Update forms (rA<-EA) are
+    excluded by the architecture (rA=0 illegal there) so they don't use this."""
+    return f"ctx->gpr[{rb}]" if str(ra) == "0" else f"(ctx->gpr[{ra}] + ctx->gpr[{rb}])"
+
+
 def _disp_base(token: str):
     """Parse 'disp(rN)' -> (disp_str, N)."""
     m = re.match(r"(-?0x[0-9A-Fa-f]+|[0-9-]+)\(r(\d+)\)", token)
@@ -451,13 +459,19 @@ class PPULifter:
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[{ra}] * (uint64_t)(uint32_t)ctx->gpr[{rb}] >> 32));"
 
+        # PPC integer divide does NOT trap on a zero divisor (or signed
+        # INT_MIN/-1 overflow) -- it leaves an undefined result and continues.
+        # The host C division WOULD trap (SIGFPE / 0xC0000094), so guard it and
+        # yield 0, matching hardware's "garbage but no fault" behaviour.
         if mn in ("divw", "divw."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] / (int32_t)ctx->gpr[{rb}]);"
+            return (f"{{ int32_t _a=(int32_t)ctx->gpr[{ra}], _b=(int32_t)ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = (int64_t)(int32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }}")
 
         if mn in ("divwu", "divwu."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((uint32_t)ctx->gpr[{ra}] / (uint32_t)ctx->gpr[{rb}]);"
+            return (f"{{ uint32_t _b=(uint32_t)ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[{ra}]/_b); }}")
 
         # ------- Logical -------
         if mn == "ori":
@@ -1050,8 +1064,8 @@ class PPULifter:
 
         if mn == "divd":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"ctx->gpr[{rd}] = (ctx->gpr[{rb}] != 0) ? "
-                    f"(int64_t)ctx->gpr[{ra}] / (int64_t)ctx->gpr[{rb}] : 0;")
+            return (f"{{ int64_t _a=(int64_t)ctx->gpr[{ra}], _b=(int64_t)ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = (_b==0||(_a==(int64_t)0x8000000000000000LL&&_b==-1))?0:_a/_b; }}")
 
         if mn == "divdu":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -1202,15 +1216,22 @@ class PPULifter:
                     f"ctx->gpr[{rd}] = vm_read32(ea); ctx->gpr[{ra}] = ea; }}")
 
         # ------- Atomic load/store with reservation -------
+        # PPC rule: in indexed/reservation addressing, an rA field of 0 means the
+        # literal value 0, NOT the contents of GPR r0. The canonical atomic loop
+        # (lwarx rD,0,rB; ...; stwcx. rS,0,rB) reuses r0 as scratch between the
+        # lwarx and stwcx; emitting ctx->gpr[0] makes the two EAs diverge so the
+        # reservation never matches and the loop spins forever.
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
+            return (f"{{ uint64_t ea = {ea}; "
                     f"ctx->gpr[{rd}] = vm_read32(ea); "
                     f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
+            return (f"{{ uint64_t ea = {ea}; "
                     f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
                     f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "  # CR0 = EQ
@@ -1220,13 +1241,15 @@ class PPULifter:
 
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
+            return (f"{{ uint64_t ea = {ea}; "
                     f"ctx->gpr[{rd}] = vm_read64(ea); "
                     f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
+            return (f"{{ uint64_t ea = {ea}; "
                     f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
                     f"vm_write64(ea, ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "
@@ -1241,19 +1264,19 @@ class PPULifter:
         # ------- Byte-reverse loads/stores -------
         if mn == "lwbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint32_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 4); "
                     f"ctx->gpr[{rd}] = raw; }}") # NOTE: no bswap — reads in host (LE) order
 
         if mn == "stwbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
                     f"memcpy(vm_base + (uint32_t)ea, &raw, 4); }}")
 
         if mn == "lhbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint16_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 2); "
                     f"ctx->gpr[{rd}] = raw; }}")
 
@@ -1262,20 +1285,20 @@ class PPULifter:
             # byte-reversed (little-endian) value on the LE host, same convention
             # as lhbrx above.
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint64_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 8); "
                     f"ctx->gpr[{rd}] = raw; }}")
 
         if mn == "sthbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
                     f"memcpy(vm_base + (uint32_t)ea, &raw, 2); }}")
 
         # ------- Load algebraic -------
         if mn == "lwax":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ctx->gpr[{rd}] = (int64_t)(int32_t)vm_read32(ea); }}")
 
         if mn == "lhaux":
@@ -1301,7 +1324,7 @@ class PPULifter:
         if mn == "dcbz":
             ra = _reg_idx(ops[0])
             rb = _reg_idx(ops[1])
-            return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0x7FULL; "
+            return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
                     f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
 
         if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi",
@@ -1349,14 +1372,14 @@ class PPULifter:
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0xFULL; "
+            return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
                     f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, 16); }}")
 
         if mn == "stvx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0xFULL; "
+            return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
                     f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], 16); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
@@ -1368,7 +1391,7 @@ class PPULifter:
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint32_t sh = (uint32_t)(ea & 0xF); "
                     f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
                     f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
@@ -1378,7 +1401,7 @@ class PPULifter:
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint32_t sh = (uint32_t)(ea & 0xF); "
                     f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
                     f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
@@ -1391,7 +1414,7 @@ class PPULifter:
             # These load a single element into the vector register.
             # For simplicity, zero the register and load at the element position.
             size = {"lvebx": 1, "lvehx": 2, "lvewx": 4}[mn]
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"memset(&ctx->vr[{vd}], 0, 16); "
                     f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, {size}); }}")
 
@@ -1400,7 +1423,7 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], {size}); }}")
 
         if mn == "lvsl" or mn == "lvsr":
@@ -1411,10 +1434,10 @@ class PPULifter:
             # lvsl: for byte offset b, generates {b, b+1, b+2, ..., b+15}
             # lvsr: generates {16-b, 17-b, ..., 31-b}
             if mn == "lvsl":
-                return (f"{{ uint8_t b = (uint8_t)((ctx->gpr[{ra}] + ctx->gpr[{rb}]) & 0xF); "
+                return (f"{{ uint8_t b = (uint8_t)(({_xea(ra,rb)}) & 0xF); "
                         f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
             else:
-                return (f"{{ uint8_t b = (uint8_t)(16 - ((ctx->gpr[{ra}] + ctx->gpr[{rb}]) & 0xF)); "
+                return (f"{{ uint8_t b = (uint8_t)(16 - (({_xea(ra,rb)}) & 0xF)); "
                         f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
 
         # VMX permute (vperm) — critical for unaligned loads
