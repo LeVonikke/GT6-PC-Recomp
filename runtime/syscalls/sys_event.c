@@ -189,6 +189,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
+    fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu)\n", queue_id, (unsigned long long)timeout_us);
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -672,6 +673,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     uint32_t mode       = LV2_ARG_U32(ctx, 2);
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
+    fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us);
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;

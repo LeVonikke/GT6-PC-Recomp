@@ -488,6 +488,7 @@ s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond)
 
 s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
 {
+    fprintf(stderr, "[WAIT] lwcond_wait(timeout=%llu)\n", (unsigned long long)timeout);
     if (!lwcond) return CELL_EFAULT;
 
     u32 cslot = lwcond->lwcond_queue - 1;

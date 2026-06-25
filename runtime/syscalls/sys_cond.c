@@ -147,6 +147,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
 {
     uint32_t cond_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu)\n", cond_id, (unsigned long long)timeout_us);
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
