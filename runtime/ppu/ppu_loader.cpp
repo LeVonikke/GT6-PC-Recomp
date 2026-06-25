@@ -238,6 +238,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         ctx->gpr[3] = 0;
         return;
     }
+    case 988:     /* sys_tty_write — canonical LV2 number (psdevwiki); some CRTs
+                   * use this instead of 403. Same ABI. */
     case 403: {   /* sys_tty_write(s32 ch, cptr buf, u32 len, ptr pwritelen) */
         uint32_t ch   = (uint32_t)ctx->gpr[3];
         uint32_t buf  = (uint32_t)ctx->gpr[4];
