@@ -230,6 +230,23 @@ class LiftedFunction:
     end_addr: int = 0
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)  # addresses of bl targets
+    fallthrough_to: int = 0  # if it falls off the end, the continuation address
+
+
+def _last_line_is_terminator(body_lines: list[str]) -> bool:
+    """True if the function's last instruction is an unconditional terminator
+    (return / internal goto / direct call / syscall / unconditional tail-call)."""
+    for line in reversed(body_lines):
+        s = line.strip()
+        if not s or s.endswith(":") or s.startswith("loc_") and s.endswith(": ;"):
+            continue
+        if s.endswith(":"):
+            continue
+        t = s.rstrip(";")
+        return (t.startswith("return") or "goto " in t or
+                t.startswith("func_") or t.startswith("lv2_syscall") or
+                "{ func_" in t or t.startswith("{ g_trampoline_fn"))
+    return False
 
 
 class PPULifter:
@@ -239,6 +256,16 @@ class PPULifter:
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
+        # Optional executable-code window [code_lo, code_hi). When set, branch /
+        # call targets that fall outside it are NOT promoted to func_X (they are
+        # data the boundary detector mis-read as code -- e.g. .rodata living in
+        # the same R-X PT_LOAD as .text). Without this, a single bc-form word in
+        # a data region whose immediate happens to point deep into .rodata seeds
+        # a bogus function there, and the mid-function tail-entry pass re-emits
+        # it to the next boundary -- a multi-GB source explosion. Default None =
+        # legacy behaviour (no bound).
+        self.code_lo: int = 0
+        self.code_hi: int | None = None
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -275,6 +302,7 @@ class PPULifter:
                         except ValueError:
                             pass
 
+        emitted_labels: set[int] = set()
         for insn in instructions:
             if insn.addr < start or insn.addr >= end:
                 continue
@@ -282,10 +310,34 @@ class PPULifter:
             # Label
             if insn.addr in internal_targets:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
+                emitted_labels.add(insn.addr)
 
             c_line = self._translate(insn, func)
             if c_line:
                 func.body_lines.append(f"    {c_line}")
+
+        # An in-range branch target with no decoded instruction at its address
+        # (a branch into a data / undecoded region inside a too-large function
+        # boundary from find_functions) still produced a `goto loc_X;` but no
+        # label, which is a C2094 undefined-label compile error. Emit the
+        # missing labels at the function tail so the goto lands on the implicit
+        # return — these paths are misidentified data and never legitimately
+        # execute. Keeps the chunk compilable without a post-process pass.
+        for tgt in sorted(internal_targets - emitted_labels):
+            func.body_lines.append(
+                f"    loc_{tgt:08X}: ; /* branch into undecoded region */")
+
+        # If the function's last instruction is not an unconditional terminator,
+        # PPC falls through to end_addr. The compiler frequently places "outlined"
+        # cold blocks just past a function that branch back into it; if the
+        # boundary cut the function mid-block, the real continuation lives at
+        # end_addr. Record it and register it for lifting so the fall-through
+        # trampoline targets the TRUE next instruction (which restores the shared
+        # frame), not the next function in address order (which may own its own
+        # frame -> a stack-imbalance leak).
+        if not _last_line_is_terminator(func.body_lines):
+            func.fallthrough_to = end
+            self.branch_targets.add(end)
 
         self.functions.append(func)
         return func
@@ -469,16 +521,22 @@ class PPULifter:
                     f"ppc_rlwimi((uint32_t)ctx->gpr[{ra}], (uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
 
         if mn in ("slw", "slw."):
+            # PPC slw: shift amount is rB[58:63]; if bit 0x20 is set (>= 32) the
+            # result is 0. Plain C `<< (n & 0x3F)` is UB for n>=32 and x86 masks
+            # the count to 5 bits, yielding a wrong nonzero value (breaks code
+            # that shifts a mask to zero, e.g. binned allocators). Mirror sld.
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x3F));"
+            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x1F)));"
 
         if mn in ("srw", "srw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x3F));"
+            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x1F)));"
 
         if mn in ("sraw", "sraw."):
+            # PPC sraw: for shift >= 32 the result is the sign bit replicated
+            # (equivalent to an arithmetic shift by 31).
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x3F));"
+            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{rs}] >> ((ctx->gpr[{rb}] & 0x20) ? 31 : (int)(ctx->gpr[{rb}] & 0x1F)));"
 
         if mn in ("srawi", "srawi."):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
@@ -717,6 +775,10 @@ class PPULifter:
                 tgt = int(target, 16)
                 if func.start_addr <= tgt < func.end_addr:
                     return f"goto loc_{tgt:08X};"
+                elif self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
+                    # Target is outside the executable window -> data misread as
+                    # a branch. Don't seed a bogus func_X; just leave the fragment.
+                    return f"return; /* b -> non-code 0x{tgt:08X} */"
                 else:
                     # Use trampoline for cross-fragment branches to avoid
                     # stack-growing recursion when backward branches re-enter
@@ -730,6 +792,8 @@ class PPULifter:
             target = ops[0]
             try:
                 tgt = int(target, 16)
+                if self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
+                    return f"/* bl -> non-code 0x{tgt:08X} */;"
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
                 return f"{self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
@@ -765,6 +829,10 @@ class PPULifter:
                 if func.start_addr <= tgt < func.end_addr:
                     cond = self._branch_condition(mn, ops)
                     return f"if ({cond}) goto loc_{tgt:08X};"
+                elif self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
+                    # Conditional branch to non-code: data misread as code.
+                    cond = self._branch_condition(mn, ops)
+                    return f"if ({cond}) return; /* bc -> non-code 0x{tgt:08X} */"
                 else:
                     cond = self._branch_condition(mn, ops)
                     # Use trampoline for cross-fragment conditional branches
@@ -1991,21 +2059,21 @@ class PPULifter:
         # branch), PPC execution falls through to the next address. The lifter
         # may split one logical function into pieces at boundary points, so
         # chain them via the trampoline to avoid deep host call stacks.
-        needs_fallthrough = True
-        if func.body_lines:
-            last_line = func.body_lines[-1].strip().rstrip(';')
-            if (last_line.startswith('return') or
-                'goto ' in last_line or
-                last_line.startswith('func_') or
-                last_line.startswith('lv2_syscall') or
-                '{ func_' in last_line):
-                needs_fallthrough = False
-
-        if needs_fallthrough:
-            addr_idx = addr_index.get(func.start_addr)
-            if addr_idx is not None and addr_idx + 1 < len(sorted_addrs):
-                next_func = func_by_addr[sorted_addrs[addr_idx + 1]]
-                lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){next_func.name}; return; }}")
+        # func.fallthrough_to was set during lift_function iff the last instruction
+        # is not a terminator. Chain to the TRUE continuation (end_addr) which was
+        # registered for lifting, so the shared frame is restored correctly. Fall
+        # back to the next function in address order only if the continuation
+        # wasn't emitted (e.g. it was outside the code window).
+        if func.fallthrough_to:
+            target = None
+            if func.fallthrough_to in func_by_addr:
+                target = func_by_addr[func.fallthrough_to].name
+            else:
+                addr_idx = addr_index.get(func.start_addr)
+                if addr_idx is not None and addr_idx + 1 < len(sorted_addrs):
+                    target = func_by_addr[sorted_addrs[addr_idx + 1]].name
+            if target:
+                lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}")
 
         lines.append("}")
         lines.append("")
@@ -2208,7 +2276,8 @@ def _worker_lift(task):
                 break
         insns = disassemble_bytes(blob, start, _WORKER_STATE["be"]) if blob else []
         f = lifter.lift_function(insns, start, end)
-        results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls))
+        results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
+                        f.fallthrough_to))
     return idx0, results, lifter.call_targets, lifter.branch_targets
 
 
@@ -2236,10 +2305,10 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                   f"elapsed {elapsed / 60:.1f}m eta {eta / 60:.1f}m", flush=True)
 
     for idx0 in sorted(results_by_idx):
-        for name, s, e, body, calls in results_by_idx[idx0]:
+        for name, s, e, body, calls, ft in results_by_idx[idx0]:
             lifter.functions.append(LiftedFunction(
                 name=name, start_addr=s, end_addr=e,
-                body_lines=body, calls=calls))
+                body_lines=body, calls=calls, fallthrough_to=ft))
 
 
 def main() -> None:
@@ -2264,6 +2333,12 @@ def main() -> None:
                         default=max(1, os.cpu_count() or 1),
                         help="Worker processes for the main lift "
                              "(default: CPU count; 1 = serial)")
+    parser.add_argument("--code-end", type=lambda x: int(x, 0), default=None,
+                        help="Highest valid executable address (exclusive). "
+                             "Branch/call/jump-table targets at or above this are "
+                             "treated as data, not promoted to functions. Use the "
+                             "end of the last .text section to stop .rodata in the "
+                             "R-X segment from exploding into bogus functions.")
     parser.add_argument("--symbol-prefix", default="",
                         help="Prefix for every emitted func_*/function_table "
                              "symbol (e.g. 'libsre_') so a relocated PRX image "
@@ -2343,6 +2418,8 @@ def main() -> None:
                 return None
             text_lo = min(s for s, _ in func_bounds)
             text_hi = max(e for _, e in func_bounds)
+            if args.code_end is not None:
+                text_hi = min(text_hi, args.code_end)
             toc = _read_u32((elf.elf_header.e_entry + 4) & 0xFFFFFFFF) or 0
             tables = discover_jump_tables(all_insns, _read_u32, toc, text_lo, text_hi)
             for ts in tables.values():
@@ -2363,9 +2440,18 @@ def main() -> None:
         except Exception as exc:
             print(f"  jump-table discovery skipped: {exc}", file=sys.stderr)
 
+    if args.code_end is not None:
+        before = len(func_bounds)
+        func_bounds = [(s, min(e, args.code_end)) for s, e in func_bounds
+                       if s < args.code_end]
+        if before != len(func_bounds):
+            print(f"  code-end 0x{args.code_end:08X}: dropped "
+                  f"{before - len(func_bounds)} out-of-text functions")
+
     print(f"Lifting {len(func_bounds)} functions...")
 
     lifter = PPULifter(prefix=args.symbol_prefix)
+    lifter.code_hi = args.code_end
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
