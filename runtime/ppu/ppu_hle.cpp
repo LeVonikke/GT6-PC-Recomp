@@ -54,8 +54,19 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
 typedef uint64_t (*hle_generic)(uint64_t, uint64_t, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t, uint64_t);
 
+/* Host VM store (defined in ppu_loader.cpp) — used for the TOC save below. */
+void vm_write64(uint64_t addr, uint64_t val);
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    /* PPC64 ELFv1 cross-module ABI: the caller restores its TOC right after the
+     * call with `ld r2, 0x28(r1)`, expecting the import stub to have saved the
+     * caller's r2 into that slot. The real .lib.stub trampoline did this; the
+     * lifted --hle-stubs body (ps3_hle_call) doesn't, so without this every
+     * import call leaves the caller with a garbage r2 -> all later TOC-relative
+     * loads (the C++ ctor list, globals, ...) read garbage -> boot corruption. */
+    vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
+
     for (uint32_t i = 0; i < g_ctx_count; i++)
         if (g_ctx[i].nid == nid) { g_ctx[i].fn(ctx); return; }
 
