@@ -148,8 +148,45 @@ extern "C" int64_t sys_ppu_thread_exit(ppu_context* ctx);
 static void hle_ppu_thread_create(ppu_context* ctx) { sys_ppu_thread_create(ctx); }
 static void hle_ppu_thread_exit(ppu_context* ctx)   { sys_ppu_thread_exit(ctx); }
 
+/* _cellGcmInitBody (NID 0x15BAE46B) -- the GCM init every PS3 game calls via the
+ * cellGcmInit() SDK macro. cellGcmSys.c provides the layout-correct core
+ * (cellGcmSetupContext) but needs the owning vm to allocate the guest
+ * CellGcmContextData and write the game's context-out pointer; supply those as
+ * callbacks. Without this the game's GCM context stays null -> null deref. */
+typedef unsigned int (*CellGcmGuestAlloc)(unsigned int, unsigned int);
+typedef void (*CellGcmGuestWrite32)(unsigned int, unsigned int);
+extern "C" unsigned int cellGcmSetupContext(unsigned int ctx_out_addr,
+    unsigned int cmdSize, unsigned int ioSize, unsigned int ioAddress,
+    CellGcmGuestAlloc galloc, CellGcmGuestWrite32 gwrite32);
+
+static unsigned int gcm_guest_alloc(unsigned int size, unsigned int align)
+{
+    /* Bump from a small scratch region below the main stack (0x0FF00000) and
+     * above the TLS image -- a few control structs, never freed. */
+    static unsigned int bump = 0x0F800000u;
+    if (align < 16) align = 16;
+    bump = (bump + align - 1) & ~(align - 1);
+    unsigned int a = bump;
+    bump += (size + 15u) & ~15u;
+    return a;
+}
+static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(addr, val); }
+
+static void hle_cellGcmInitBody(ppu_context* ctx)
+{
+    uint32_t ctx_out = (uint32_t)ctx->gpr[3];
+    uint32_t cmdSize = (uint32_t)ctx->gpr[4];
+    uint32_t ioSize  = (uint32_t)ctx->gpr[5];
+    uint32_t ioAddr  = (uint32_t)ctx->gpr[6];
+    fprintf(stderr, "[HLE] _cellGcmInitBody(ctx_out=0x%08X, cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%X)\n",
+            ctx_out, cmdSize, ioSize, ioAddr);
+    cellGcmSetupContext(ctx_out, cmdSize, ioSize, ioAddr, gcm_guest_alloc, gcm_guest_write32);
+    ctx->gpr[3] = 0;   /* CELL_OK */
+}
+
 extern "C" void ppu_sysprx_register(void)
 {
+    ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
     ps3_hle_register_ctx(ps3_compute_nid("sys_initialize_tls"),       "sys_initialize_tls",       sys_initialize_tls);
     ps3_hle_register_ctx(ps3_compute_nid("sys_time_get_system_time"), "sys_time_get_system_time", sys_time_get_system_time);
     ps3_hle_register_ctx(ps3_compute_nid("sys_process_is_stack"),     "sys_process_is_stack",     sys_process_is_stack);
