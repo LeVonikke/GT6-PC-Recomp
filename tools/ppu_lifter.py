@@ -160,6 +160,12 @@ extern "C" uint8_t* vm_base;
  * corresponding host function. Handles OPD resolution. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);
 
+/* Firmware-import HLE dispatch: a lifted import stub (a .lib.stub trampoline)
+ * is replaced with a direct call to the registered HLE handler for its NID
+ * instead of running the literal `load OPD ptr; bctrl` trampoline (whose import
+ * pointer table the recomp never fills). See --hle-stubs. */
+extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
+
 /* Trampoline function pointer for cross-fragment branches (TLS).
  * Must match the __declspec(thread) definition in indirect_dispatch. */
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
@@ -266,6 +272,11 @@ class PPULifter:
         # legacy behaviour (no bound).
         self.code_lo: int = 0
         self.code_hi: int | None = None
+        # Firmware-import stubs: {stub_addr -> NID}. A function lifted at a stub
+        # address is emitted as `ps3_hle_call(nid, ctx)` instead of the literal
+        # `.lib.stub` trampoline (which derefs an import pointer table the recomp
+        # never populates -> bctrl to garbage). Populated from --hle-stubs.
+        self.hle_stub_nids: dict[int, int] = {}
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -284,6 +295,14 @@ class PPULifter:
             start_addr=start,
             end_addr=end,
         )
+
+        # Firmware-import stub: replace the whole body with an HLE dispatch.
+        nid = self.hle_stub_nids.get(start)
+        if nid is not None:
+            func.body_lines.append(
+                f"    ps3_hle_call(0x{nid:08X}u, ctx); return;  /* import stub */")
+            self.functions.append(func)
+            return func
 
         # Collect branch targets within the function for labels
         internal_targets: set[int] = set()
@@ -2343,7 +2362,21 @@ def main() -> None:
                         help="Prefix for every emitted func_*/function_table "
                              "symbol (e.g. 'libsre_') so a relocated PRX image "
                              "links alongside the main title without collisions")
+    parser.add_argument("--hle-stubs", metavar="FILE", default=None,
+                        help="EBOOT.imports.json ([{library,nid,stub}]). Each "
+                             "import stub address is lifted as ps3_hle_call(nid) "
+                             "instead of its literal .lib.stub trampoline, and "
+                             "split out as its own 0x20-byte function so direct "
+                             "calls to it dispatch to the HLE handler.")
     args = parser.parse_args()
+
+    # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
+    # and the lifter below.
+    hle_stubs: dict[int, int] = {}
+    if args.hle_stubs:
+        with open(args.hle_stubs) as _hf:
+            for _e in json.load(_hf):
+                hle_stubs[int(str(_e["stub"]), 0)] = int(str(_e["nid"]), 0) & 0xFFFFFFFF
 
     with open(args.input, "rb") as f:
         file_data = f.read()
@@ -2448,10 +2481,27 @@ def main() -> None:
             print(f"  code-end 0x{args.code_end:08X}: dropped "
                   f"{before - len(func_bounds)} out-of-text functions")
 
+    # Firmware-import stub split: the .lib.stub trampolines are usually lumped
+    # into one big function by boundary detection. Carve each 0x20-byte stub out
+    # as its own function so direct calls land on it and it can be emitted as a
+    # single ps3_hle_call(nid). Drop any original function that overlaps the stub
+    # span (it's just the concatenated literal trampolines).
+    if hle_stubs:
+        smin = min(hle_stubs); smax = max(hle_stubs)
+        STUB = 0x20
+        kept = [(s, e) for (s, e) in func_bounds
+                if e <= smin or s >= smax + STUB]
+        dropped = len(func_bounds) - len(kept)
+        kept.extend((a, a + STUB) for a in hle_stubs)
+        func_bounds = sorted(set(kept))
+        print(f"  hle-stubs: {len(hle_stubs)} import stubs -> ps3_hle_call "
+              f"(dropped {dropped} overlapping function(s))")
+
     print(f"Lifting {len(func_bounds)} functions...")
 
     lifter = PPULifter(prefix=args.symbol_prefix)
     lifter.code_hi = args.code_end
+    lifter.hle_stub_nids = hle_stubs
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
