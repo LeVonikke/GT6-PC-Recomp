@@ -272,6 +272,7 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     uint32_t out_ea   = (uint32_t)ctx->gpr[3];
     uint32_t num      = (uint32_t)ctx->gpr[4];
     uint32_t name_ea  = (uint32_t)ctx->gpr[5];
+    fprintf(stderr, "[SPU] thread_group_create(num=%u)\n", num);
     uint32_t attr_ea  = (uint32_t)ctx->gpr[6];
 
     spu_group_t* g = spu_alloc_group();

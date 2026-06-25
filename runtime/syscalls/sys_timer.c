@@ -59,6 +59,7 @@ static void write_be64(uint32_t addr, uint64_t val)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    { static int n=0; if (n++ < 30) fprintf(stderr, "[WAIT] timer_usleep(%llu us)\n", (unsigned long long)usec); }
 
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */

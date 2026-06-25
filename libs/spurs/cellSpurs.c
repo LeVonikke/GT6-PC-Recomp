@@ -141,12 +141,16 @@ static inline void ef_unlock(EventFlagSync* s)
 #endif
 }
 
-static inline void ef_wait(EventFlagSync* s)
+/* Returns 1 if signaled, 0 if it timed out after `ms`. */
+static inline int ef_wait_timed(EventFlagSync* s, unsigned ms)
 {
 #ifdef _WIN32
-    SleepConditionVariableCS(&s->cv, &s->cs, INFINITE);
+    return SleepConditionVariableCS(&s->cv, &s->cs, ms) ? 1 : 0;
 #else
-    pthread_cond_wait(&s->cond, &s->mtx);
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += ms / 1000; ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    return pthread_cond_timedwait(&s->cond, &s->mtx, &ts) == 0 ? 1 : 0;
 #endif
 }
 
@@ -732,6 +736,11 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     ef_lock(sync);
 
     /* Block until the requested bit pattern is satisfied */
+    /* SPU-completion shim: the bits this wait expects are normally set by an SPU
+     * workload via cellSpursEventFlagSet. We don't execute SPU code, so after a
+     * short grace period with no signal we force-satisfy the pattern (as if the
+     * SPU finished) so the title's boot proceeds. Correct fix is SPU execution. */
+    unsigned timeouts = 0;
     for (;;) {
         u16 current = eventFlag->bits;
 
@@ -744,7 +753,11 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                 break;
         }
 
-        ef_wait(sync);
+        if (!ef_wait_timed(sync, 50) && ++timeouts >= 4) {
+            fprintf(stderr, "[cellSpurs] EventFlagWait: no SPU signal for pattern "
+                            "0x%04X -- force-satisfying (SPU not executed)\n", pattern);
+            eventFlag->bits |= pattern;
+        }
     }
 
     *bits = eventFlag->bits;
