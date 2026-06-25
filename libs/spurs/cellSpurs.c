@@ -221,11 +221,13 @@ s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
                                  s32 spuPriority, s32 ppuPriority,
                                  u8 exitIfNoWork)
 {
-    (void)spuPriority; (void)ppuPriority; (void)exitIfNoWork;
+    (void)ppuPriority; (void)exitIfNoWork;
 
     if (!attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
 
+    /* `attr` is a GUEST address (generic HLE adapter passes r3 raw). */
+    attr = GUEST_PTR(attr, CellSpursAttribute*);
     memset(attr, 0, sizeof(CellSpursAttribute));
     attr->nSpus = (nSpus > 0 && nSpus <= CELL_SPURS_MAX_SPU)
                   ? (u32)nSpus : 1;
@@ -235,6 +237,16 @@ s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
 
     printf("[cellSpurs] AttributeInitialize(nSpus=%d)\n", nSpus);
     return CELL_OK;
+}
+
+/* The SDK's cellSpursAttributeInitialize() macro imports this internal name
+ * (NID 0x95180230). Forward to the implementation above. */
+s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
+                                  s32 spuPriority, s32 ppuPriority,
+                                  u8 exitIfNoWork)
+{
+    return cellSpursAttributeInitialize(attr, nSpus, spuPriority,
+                                        ppuPriority, exitIfNoWork);
 }
 
 s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
@@ -672,6 +684,13 @@ s32 cellSpursEventFlagAttachLv2EventQueue(CellSpursEventFlag* eventFlag)
 {
     if (!eventFlag) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     printf("[cellSpurs] EventFlagAttachLv2EventQueue()\n");
+    return CELL_OK;
+}
+
+s32 cellSpursEventFlagDetachLv2EventQueue(CellSpursEventFlag* eventFlag)
+{
+    if (!eventFlag) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    printf("[cellSpurs] EventFlagDetachLv2EventQueue()\n");
     return CELL_OK;
 }
 
