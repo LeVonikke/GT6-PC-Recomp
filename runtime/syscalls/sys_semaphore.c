@@ -163,6 +163,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 {
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us);
 
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
