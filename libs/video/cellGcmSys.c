@@ -823,16 +823,6 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
 
     printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u)\n",
            index, location, offset, size, pitch);
-    { static int _src=0; if (_src++ < 3) {
-        extern unsigned short vm_read16(unsigned long long);
-        /* func_00062598/A4 read display w/h from guest 0x546D50/0x546D52 -- the
-         * config source for the tile/displaybuffer setup. Dump the region. */
-        fprintf(stderr, "[GCM-src] 0x546D50=%04X 0x546D52=%04X 0x546D54=%04X  d[0x546D40..70]:",
-                vm_read16(0x546D50), vm_read16(0x546D52), vm_read16(0x546D54));
-        for (unsigned a = 0x546D40; a < 0x546D70; a += 4)
-            fprintf(stderr, " %08X", vm_read32(a));
-        fprintf(stderr, "\n");
-    } }
 
     s_tiles[index].offset = offset;
     s_tiles[index].size   = size;
@@ -926,24 +916,20 @@ s32 cellGcmUnbindZcull(u8 index)
  * -----------------------------------------------------------------------*/
 
 /* NID: 0x107BF789 */
-s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch)
+/* Real ABI: uint32_t cellGcmGetTiledPitchSize(uint32_t size) -- ONE arg, the
+ * aligned tiled pitch is the RETURN VALUE (r3). The previous 2-arg form treated
+ * r4 as an out-pointer and wrote the pitch through it; at the title's call site
+ * r4 still held the caller's CellVideoOutResolution* (from the preceding
+ * cellVideoOutGetResolution), so it overwrote width/height with the pitch ->
+ * width became 0 -> every downstream tile/display-buffer setup went garbage. */
+u32 cellGcmGetTiledPitchSize(u32 size)
 {
-    /* `pitch` is a GUEST address (the generic HLE adapter passes r4 raw). Write
-     * through vm_write32 so it's byte-swapped to BE and bounds-checked -- a raw
-     * *pitch faults when the game hands us a null-object-derived low pointer. */
-    uint32_t pitch_ea = (uint32_t)(uintptr_t)pitch;
-    if (!pitch_ea)
-        return CELL_GCM_ERROR_INVALID_VALUE;
-
     /* Smallest valid tiled pitch >= size (RSX supports only specific pitches). */
     for (int i = 0; i < s_valid_pitch_count; i++) {
-        if (s_valid_pitches[i] >= size) {
-            vm_write32(pitch_ea, s_valid_pitches[i]);
-            return CELL_OK;
-        }
+        if (s_valid_pitches[i] >= size)
+            return s_valid_pitches[i];
     }
-    vm_write32(pitch_ea, s_valid_pitches[s_valid_pitch_count - 1]);
-    return CELL_OK;
+    return s_valid_pitches[s_valid_pitch_count - 1];
 }
 
 /* NID: 0xBC982946 */
