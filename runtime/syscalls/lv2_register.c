@@ -302,6 +302,31 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     return 0;
 }
 
+/* HLE SPURS kernel (YDKJ_SPURSKERNEL): libsre hands its 5 cellSpurs SPU threads
+ * an EMPTY image (the firmware SPU kernel can't run as static-recompiled code),
+ * so group_start would instantly complete them and the SPURS handler asserts the
+ * SPU side is dead. Instead, register THIS as the threads' PPU fallback: it runs
+ * as a host "SPU" that keeps the group genuinely RUNNING. Minimal first version
+ * idles; the full version polls the SPURS taskset (ctx = args_ea) and dispatches
+ * the title's lifted SPU task images. */
+#define YDKJ_SPURS_KERNEL_ENTRY 0x5B555253u  /* 'SURS' marker entry */
+static int32_t ydkj_hle_spurs_kernel(uint32_t tid, uint32_t args_ea,
+                                     uint32_t args_size, void* user)
+{
+    (void)args_size; (void)user;
+    fprintf(stderr, "[HLE-SPURS] kernel SPU tid=0x%X ctx=0x%08X running\n", tid, args_ea);
+    fflush(stderr);
+    /* Keep the group running so the SPURS handler sees a live SPU. */
+    for (int i = 0; i < 1200; i++) {
+#ifdef _WIN32
+        Sleep(50);
+#else
+        struct timespec ts = {0, 50*1000*1000}; nanosleep(&ts, 0);
+#endif
+    }
+    return 0;
+}
+
 /* sys_spu_thread_initialize(out_tid_ea, group_id, thread_num, img_ea, attr_ea, args_ea) */
 static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
 {
@@ -338,6 +363,16 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
+
+    /* Empty image (entry=0) on a cellSpurs SPU thread -> route to the HLE SPURS
+     * kernel (YDKJ_SPURSKERNEL) so group_start runs a live SPU instead of an
+     * instant no-op. */
+    if (t->entry_point == 0 && getenv("YDKJ_SPURSKERNEL")) {
+        t->entry_point = YDKJ_SPURS_KERNEL_ENTRY;
+        static int s_reg = 0;
+        if (!s_reg) { s_reg = 1;
+            spu_register_ppu_fallback(YDKJ_SPURS_KERNEL_ENTRY, ydkj_hle_spurs_kernel, 0); }
+    }
 
     if (getenv("YDKJ_SPUIMG") && img_ea && thread_num == 0) {
         uint32_t type  = vm_read_be32(img_ea + 0);
@@ -561,7 +596,10 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
         }
         g->in_use = 0;
     }
-    fprintf(stderr, "[SPU] group_destroy id=0x%X\n", id);
+    fprintf(stderr, "[SPU] group_destroy id=0x%X  caller_lr=0x%08X cia=0x%08X r3..r6=%08X %08X %08X %08X\n",
+            id, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
+            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+            (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;

@@ -327,6 +327,7 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         if (ctx_out_addr)
             gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
         s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
+        fprintf(stderr, "[GCM] SetupContext ctx_ea=0x%08X cmdbuf=0x%08X cmdSize=0x%X ioAddr=0x%08X\n", cdata, cmdbuf, cmdSize, ioAddress);
     }
     return cdata;
 }
@@ -449,6 +450,7 @@ void cellGcm_rsx_process_fifo(void)
     if (current < s_get) s_get = s_config.ioAddress;   /* wrapped */
     if (current <= s_get) return;                       /* nothing new */
 
+    { static int _f=0; if (_f++ < 24) fprintf(stderr, "[GCM] fifo drain ctx=0x%08X get=0x%08X current=0x%08X words=%u\n", s_gcm_context_ea, s_get, current, (current - s_get)/4); }
     u32 words = (current - s_get) / 4;
     if (words > 0x40000u) words = 0x40000u;             /* cap 1MB/frame */
 
@@ -463,11 +465,12 @@ void cellGcm_rsx_process_fifo(void)
 }
 
 /* NID: 0xDC09357E */
+extern uint32_t ppu_active_lr(void);
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height)
 {
-    printf("[cellGcmSys] SetDisplayBuffer(id=%u, offset=0x%X, pitch=%u, %ux%u)\n",
-           bufferId, offset, pitch, width, height);
+    printf("[cellGcmSys] SetDisplayBuffer(id=%u, offset=0x%X, pitch=%u, %ux%u) caller_lr=0x%08X\n",
+           bufferId, offset, pitch, width, height, ppu_active_lr());
 
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
