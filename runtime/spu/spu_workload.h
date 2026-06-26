@@ -78,6 +78,12 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail);
 int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
                           uint32_t args_ea);
 
+/* Same, but runs the SPU job on its own detached host thread so the PPU caller
+ * is not blocked. Required for persistent SPURS service/worker tasks that loop
+ * waiting on PPU-side signals (running them inline deadlocks). */
+int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+                                uint32_t args_ea);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 

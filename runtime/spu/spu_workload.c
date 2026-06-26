@@ -10,6 +10,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 /* ---- fingerprint ------------------------------------------------------- */
 
@@ -210,5 +215,75 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
     spu_run_lifted_job_img(fn, ls, args_ea, image_id);
 
     free(ls);
+    return 1;
+}
+
+/* Async dispatch: run the SPU job on its OWN host thread so the PPU caller is
+ * not blocked. SPURS service/worker tasks are persistent — they loop waiting on
+ * PPU-side signals (DMA, event flags, event queues), so running them inline (as
+ * spu_workload_dispatch does) deadlocks: the PPU can never deliver the signal
+ * the SPU is waiting for because it is stuck inside the dispatch. Real SPUs run
+ * concurrently with the PPU; a detached host thread models that. The image bytes
+ * and args live in the shared guest arena (vm_base), so they stay valid. */
+typedef struct {
+    const uint8_t*      image;
+    uint32_t            image_size;
+    uint32_t            args_ea;
+    spu_lifted_entry_fn fn;
+    int                 image_id;
+} spu_async_job;
+
+static void spu_async_run(spu_async_job* j)
+{
+    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+    if (ls) {
+        uint32_t entry = 0;
+        if (spu_elf_load_to_ls(j->image, j->image_size, ls, &entry))
+            spu_run_lifted_job_img(j->fn, ls, j->args_ea, j->image_id);
+        free(ls);
+    }
+    free(j);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI spu_async_thread(LPVOID p) { spu_async_run((spu_async_job*)p); return 0; }
+#else
+static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+#endif
+
+int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+                                uint32_t args_ea)
+{
+    if (!image || image_size == 0) return 0;
+
+    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    spu_lifted_entry_fn fn = NULL;
+    int image_id = 0;
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+    if (!fn) {
+        fprintf(stderr, "[spu_workload] async dispatch MISS fp=0x%016llX size=%u\n",
+                (unsigned long long)fp, image_size);
+        return 0;
+    }
+
+    spu_async_job* j = (spu_async_job*)malloc(sizeof(*j));
+    if (!j) return 0;
+    j->image = image; j->image_size = image_size; j->args_ea = args_ea;
+    j->fn = fn; j->image_id = image_id;
+
+    fprintf(stderr,
+        "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
+        (unsigned long long)fp, args_ea, image_id);
+
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 1u << 20, spu_async_thread, j, 0, NULL);
+    if (!th) { free(j); return 0; }
+    CloseHandle(th);   /* detached */
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, spu_async_thread, j) != 0) { free(j); return 0; }
+    pthread_detach(th);
+#endif
     return 1;
 }

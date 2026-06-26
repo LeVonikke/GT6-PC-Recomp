@@ -488,14 +488,70 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
                 if (sz)
-                    spu_workload_dispatch(host_elf, (uint32_t)sz,
-                                          (uint32_t)(uintptr_t)context);
+                    /* Async: SPURS tasks are persistent workers — running them
+                     * inline would block this PPU thread forever (deadlock). */
+                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
+                                                (uint32_t)(uintptr_t)context);
             }
             return CELL_OK;
         }
     }
 
     return CELL_SPURS_TASK_ERROR_NOMEM;
+}
+
+/* The SDK's versioned task-attribute initializer. ABI (8 GPR args):
+ *   r3=attr r4=revision r5=sdkVersion r6=eaElf r7=eaContext r8=sizeContext
+ *   r9=lsPattern r10=argument
+ * Stash the task ELF EA + context so cellSpursCreateTaskWithAttribute can
+ * dispatch the SPU job. */
+s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision,
+                                      u32 sdkVersion, u64 eaElf, u64 eaContext,
+                                      u32 sizeContext, const void* lsPattern,
+                                      const void* argument)
+{
+    (void)sdkVersion; (void)lsPattern; (void)argument;
+    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    attr = GUEST_PTR(attr, CellSpursTaskAttribute*);
+    memset(attr, 0, sizeof(CellSpursTaskAttribute));
+    attr->revision    = revision;
+    attr->sizeContext = sizeContext;
+    attr->eaContext   = eaContext;
+    attr->eaElf       = eaElf;
+    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u)\n",
+           (u32)eaElf, (u32)eaContext, sizeContext);
+    return CELL_OK;
+}
+
+/* Create a task from a pre-initialized attribute (carries ELF EA + context).
+ * Forwards to cellSpursCreateTask, which translates taskset/taskId and runs the
+ * SPU image through spu_workload_dispatch. */
+s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
+                                     CellSpursTaskId* taskId,
+                                     CellSpursTaskAttribute* attr)
+{
+    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
+    /* taskset/taskId forwarded raw (callee translates); elf/context are guest EAs. */
+    return cellSpursCreateTask(taskset, taskId,
+                               (void*)(uintptr_t)(u32)attr_h->eaElf,
+                               (void*)(uintptr_t)(u32)attr_h->eaContext,
+                               attr_h->sizeContext, attr);
+}
+
+/* The SDK's versioned taskset-attribute initializer. We forward taskset creation
+ * through CreateTaskset (which ignores the attribute), so just zero the struct. */
+s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
+                                         u32 revision, u32 sdkVersion, u64 argTaskset,
+                                         u64 priority, u32 maxContention)
+{
+    (void)sdkVersion; (void)argTaskset; (void)priority; (void)maxContention;
+    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
+    memset(attr, 0, sizeof(CellSpursTasksetAttribute));
+    attr->revision = revision ? revision : 1;
+    printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u)\n", revision);
+    return CELL_OK;
 }
 
 s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
