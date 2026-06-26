@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
