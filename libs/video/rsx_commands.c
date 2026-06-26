@@ -320,6 +320,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
+        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
             u8 stencil = state->zstencil_clear_value & 0xFF;
