@@ -143,7 +143,12 @@ static CellGcmZcullInfo s_zcull[CELL_GCM_MAX_ZCULL_COUNT];
 /* Report data area (256 slots, each 16 bytes) */
 static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
 
-/* Label area (256 labels, each u32) */
+/* Label area (256 labels, each u32). Labels live in GUEST memory so the
+ * recompiled game can poll them via vm_read32; cellGcmGetLabelAddress returns a
+ * guest address into this window (16-byte spaced as on hardware). A host array
+ * pointer would be read as a guest offset and land out of bounds. */
+#define GCM_LABEL_GUEST_BASE  0x03000000u
+#define GCM_LABEL_STRIDE      0x10u
 static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
 
 /* ---------------------------------------------------------------------------
@@ -462,8 +467,9 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
     if (labelIndex >= CELL_GCM_MAX_LABEL_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    /* Wait until the label reaches the expected value (instant in HLE) */
-    s_labels[labelIndex] = labelValue;
+    /* Wait until the label reaches the expected value (instant in HLE). Labels
+     * live in guest memory (see cellGcmGetLabelAddress) so the game can poll. */
+    vm_write32(GCM_LABEL_GUEST_BASE + labelIndex * GCM_LABEL_STRIDE, labelValue);
 
     return cellGcmSetFlipCommand(bufferId);
 }
@@ -726,7 +732,7 @@ u32* cellGcmGetLabelAddress(u8 index)
         printf("[cellGcmSys] WARNING: GetLabelAddress index %u out of range\n", index);
         return NULL;
     }
-    return &s_labels[index];
+    return (u32*)(uintptr_t)(GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE);
 }
 
 /* NID: 0x8572ADE4 */
