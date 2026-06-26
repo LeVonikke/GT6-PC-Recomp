@@ -2638,45 +2638,12 @@ def main() -> None:
                           or _by_addr[_ordered[k]].mnemonic.startswith(".")):
             k -= 1
         return _by_addr[_ordered[k]] if k >= 0 else None
-    _recovered = []
-    _ncuts = 0
-    for (_s, _e) in func_bounds:
-        _k = _idx_of.get(_s)
-        if _k is None:
-            _recovered.append((_s, _e)); continue
-        _cuts = []
-        _j = _k + 1
-        while _j < len(_ordered) and _ordered[_j] < _e:
-            _a = _ordered[_j]
-            _p = _prev_nonnop(_j)
-            # A prologue is a separate function when (a) it is a direct
-            # control-flow target -- something calls/branches to it -- or (b) it
-            # immediately follows ANY unconditional control-flow terminator
-            # (return blr/rfid, or jump b/ba/bctr; padding skipped). You never
-            # allocate a stack frame mid-function right after a jump, so a
-            # prologue after a terminator is always a new function -- this catches
-            # functions reached only indirectly AND tail-call-terminated
-            # predecessors, without ever cutting a real function's internal
-            # forward branches (those don't land on a frame-allocating prologue).
-            if _is_prologue(_by_addr[_a]) and (
-                    _a in _targets
-                    or (_p is not None and _p.mnemonic in (_RETURNS | _JUMPS))):
-                _cuts.append(_a)
-            _j += 1
-        if not _cuts:
-            _recovered.append((_s, _e)); continue
-        _pts = [_s] + _cuts + [_e]
-        for _i in range(len(_pts) - 1):
-            _recovered.append((_pts[_i], _pts[_i + 1]))
-        _ncuts += len(_cuts)
-    if _ncuts:
-        print(f"  Boundary recovery: split {_ncuts} merged function(s) via prologue scan")
-        func_bounds = _recovered
-
-    # Every function-entry prologue (stdu r1,-N, adjusted to a preceding mflr r0)
-    # -- used to route a `b` into a merged range as a tail call (see the `b`
-    # handler). Independent of whether the boundary was actually split, so it
-    # also fixes merges the prologue-scan did not cut.
+    # Every function-entry prologue: a primary frame allocation (stdu r1,-N),
+    # adjusted back to a preceding mflr r0 (the real entry of an mflr-first
+    # function). A function allocates its primary frame exactly once at its
+    # prologue, so EVERY such site is a distinct function start -- the complete
+    # set of boundaries. Used both to split merged ranges below and to route a
+    # `b`/cond-`b` to one as a tail call (see the `b` handler).
     _func_entries = set()
     for _a, _ins in _by_addr.items():
         if _ins.mnemonic == "stdu":
@@ -2687,6 +2654,34 @@ def main() -> None:
                     _func_entries.add(_a - 4)
                 else:
                     _func_entries.add(_a)
+
+    _recovered = []
+    _ncuts = 0
+    for (_s, _e) in func_bounds:
+        _k = _idx_of.get(_s)
+        if _k is None:
+            _recovered.append((_s, _e)); continue
+        # Split at EVERY interior function-entry prologue, not only ones after a
+        # terminator/target. This catches FALL-THROUGH and computed (bctr) merges
+        # too: where one function runs into the next with no branch, the second's
+        # prologue is still a distinct function and the first then tail-calls it
+        # via fallthrough_to. (A genuine second stdu inside one function -- e.g.
+        # dynamic alloca -- is rare; splitting it is harmless dead boundary.)
+        _cuts = []
+        _j = _k + 1
+        while _j < len(_ordered) and _ordered[_j] < _e:
+            if _ordered[_j] in _func_entries:
+                _cuts.append(_ordered[_j])
+            _j += 1
+        if not _cuts:
+            _recovered.append((_s, _e)); continue
+        _pts = [_s] + _cuts + [_e]
+        for _i in range(len(_pts) - 1):
+            _recovered.append((_pts[_i], _pts[_i + 1]))
+        _ncuts += len(_cuts)
+    if _ncuts:
+        print(f"  Boundary recovery: split {_ncuts} merged function(s) via prologue scan")
+        func_bounds = _recovered
 
     # ----- jump-table (computed bctr) discovery ---------------------------
     # gcc switch dispatchers reach their case blocks via `mtctr; bctr` through
