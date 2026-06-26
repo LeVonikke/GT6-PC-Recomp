@@ -41,6 +41,11 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     spu_context ctx;
     spu_context_init(&ctx, 0);
     ctx.image_id = image_id;     /* select this image's indirect-branch table */
+    /* Initialize the SPU stack pointer to the top of local store (the SPU ABI
+     * expects r1 = top-16, 16-byte aligned, with a NULL back-chain). Without
+     * this it is 0 from spu_context_init, so the first `r1 -= frame` wraps
+     * negative -> garbage stack -> null function pointers -> branch to LS 0. */
+    ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* 0x3FFF0 for a 256KB LS */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
     if (spurs_task_abi) {
         ctx.gpr[3]._u32[0] = 0x00400000u;   /* 0x40 marker (>>16==64), DMA tag 0 */
