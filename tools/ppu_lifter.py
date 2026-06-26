@@ -201,9 +201,9 @@ def _reg_idx(token: str) -> str:
 # robust ABI-preservation pass in lift_function. Group order: SAVE -> (off, reg);
 # RESTORE -> (reg, off), so a save and its restore pair on matching (off, reg).
 _CS_SAVE_RE = re.compile(
-    r'vm_write64\(ctx->gpr\[1\] \+ (0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
+    r'vm_write64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
 _CS_REST_RE = re.compile(
-    r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(ctx->gpr\[1\] \+ (0x[0-9A-Fa-f]+|-?\d+)\);')
+    r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+)\);')
 
 
 def _xea(ra, rb):
@@ -405,16 +405,21 @@ class PPULifter:
         # possibly-clobbered stack slot. The store/load stay (ABI shape); only the
         # restored *value* changes. Pair save<->restore by (offset, reg) so an
         # unrelated reload of a stack local is never rewritten.
-        # A load from the frame into a non-volatile GPR (r14-r31) is always a
-        # callee-save restore -- the compiler never spills/reloads those for
-        # temporaries (it uses volatile regs), so this also covers mid-function
-        # tail-entries whose matching prologue save sits before the entry point.
-        # The entry snapshot equals the value the restore must produce (the
-        # caller's preserved register) for both normal entries and tail-entries.
+        # Only rewrite a restore that PAIRS with a save in the same body (same
+        # offset+reg): then the entry snapshot is exactly the value the prologue
+        # stored (the caller's preserved register). A mid-function tail-entry has
+        # the restore but NOT the prologue save in its body, so its snapshot would
+        # capture the mid-function value, not the caller's -- skip those (they
+        # keep reading the shared frame slot, which is correct unless corrupted).
+        _saved_slots = set()
+        for _l in func.body_lines:
+            _m = _CS_SAVE_RE.search(_l)
+            if _m:
+                _saved_slots.add((_m.group(1), _m.group(2)))
         _snap_regs = set()
         for _i, _l in enumerate(func.body_lines):
             _m = _CS_REST_RE.search(_l)
-            if _m:
+            if _m and (_m.group(2), _m.group(1)) in _saved_slots:
                 _snap_regs.add(int(_m.group(1)))
                 func.body_lines[_i] = f"    ctx->gpr[{_m.group(1)}] = _cs_{_m.group(1)};"
         if _snap_regs:
