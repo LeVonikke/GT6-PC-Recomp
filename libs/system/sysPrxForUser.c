@@ -195,30 +195,68 @@ static inline void* yz_g2h(const void* g)
     return ea ? (void*)(vm_base + ea) : (void*)0;
 }
 
+/* Guest-aware printf core: the varargs reach us as raw 64-bit register values
+ * (the generic HLE adapter forwards gpr3..10), so a %s argument is a GUEST
+ * effective address -- passing it straight to the host vprintf derefs it as a
+ * host pointer and AVs (observed crashing the libspurs assert printer on the
+ * "handler.c" filename). Walk the (already host-translated) format and emit each
+ * conversion via the host snprintf, but translate %s args through vm_base. */
+static int yz_format(char* out, size_t cap, const char* fmt, va_list ap)
+{
+    extern u8* vm_base;
+    size_t p = 0;
+    if (!fmt) { if (cap) out[0] = 0; return 0; }
+    while (*fmt && p + 1 < cap) {
+        if (*fmt != '%') { out[p++] = *fmt++; continue; }
+        char spec[40]; int si = 0; spec[si++] = *fmt++;          /* '%' */
+        while (*fmt && strchr("-+ #0123456789.*lhLqjzt", *fmt) && si < 38) spec[si++] = *fmt++;
+        char c = *fmt ? *fmt++ : 0; spec[si++] = c; spec[si] = 0;
+        char tmp[1024]; int n = 0;
+        if (c == '%') { out[p++] = '%'; continue; }
+        else if (c == 's') {
+            u32 g = (u32)va_arg(ap, unsigned long long);
+            const char* hs = g ? (const char*)(vm_base + g) : "(null)";
+            n = snprintf(tmp, sizeof tmp, spec, hs);
+        } else if (c == 'c') {
+            int v = (int)va_arg(ap, unsigned long long); n = snprintf(tmp, sizeof tmp, spec, v);
+        } else if (c == 'p') {
+            u32 v = (u32)va_arg(ap, unsigned long long); n = snprintf(tmp, sizeof tmp, "0x%08X", v);
+        } else if (c == 'f' || c == 'F' || c == 'g' || c == 'G' || c == 'e' || c == 'E') {
+            union { unsigned long long u; double d; } u; u.u = va_arg(ap, unsigned long long);
+            n = snprintf(tmp, sizeof tmp, spec, u.d);
+        } else if (c) {
+            unsigned long long v = va_arg(ap, unsigned long long);
+            if (strstr(spec, "ll") || strstr(spec, "q")) n = snprintf(tmp, sizeof tmp, spec, (long long)v);
+            else n = snprintf(tmp, sizeof tmp, spec, (int)v);
+        }
+        for (int k = 0; k < n && p + 1 < cap; k++) out[p++] = tmp[k];
+    }
+    out[p] = 0;
+    return (int)p;
+}
+
 s32 _sys_printf(const char* fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    printf("[PS3] ");
-    int ret = vprintf((const char*)yz_g2h(fmt), ap);
+    va_list ap; va_start(ap, fmt);
+    char buf[2048];
+    int ret = yz_format(buf, sizeof buf, (const char*)yz_g2h(fmt), ap);
     va_end(ap);
+    printf("[PS3] %s", buf);
     return ret;
 }
 
 s32 _sys_sprintf(char* buf, const char* fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    int ret = vsprintf((char*)yz_g2h(buf), (const char*)yz_g2h(fmt), ap);
+    va_list ap; va_start(ap, fmt);
+    int ret = yz_format((char*)yz_g2h(buf), 0x10000, (const char*)yz_g2h(fmt), ap);
     va_end(ap);
     return ret;
 }
 
 s32 _sys_snprintf(char* buf, u32 size, const char* fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    int ret = vsnprintf((char*)yz_g2h(buf), size, (const char*)yz_g2h(fmt), ap);
+    va_list ap; va_start(ap, fmt);
+    int ret = yz_format((char*)yz_g2h(buf), size ? size : 1, (const char*)yz_g2h(fmt), ap);
     va_end(ap);
     return ret;
 }
