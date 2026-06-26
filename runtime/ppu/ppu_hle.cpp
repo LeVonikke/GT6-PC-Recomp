@@ -106,6 +106,13 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     g_last_hle_name = e->name;
+    if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
+        static int _g=0; if (_g++ < 8)
+            fprintf(stderr, "[hle-trace] %s lr=0x%08X cia=0x%08X r3..r8=%08X %08X %08X %08X %08X %08X\n",
+                    e->name, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
+                    (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
+                    (uint32_t)ctx->gpr[6],(uint32_t)ctx->gpr[7],(uint32_t)ctx->gpr[8]);
+    }
     hle_generic fn = (hle_generic)e->handler;
     uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
                     ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
