@@ -53,6 +53,68 @@ static mfc_engine* mfc_for(spu_context* ctx)
     return &fallback;
 }
 
+/* ===========================================================================
+ * Atomic reservation (GETLLAR / PUTLLC / PUTLLUC) -- real lock-line semantics
+ *
+ * Multiple SPU kernel threads (the SPURS workload runtime runs several SPUs on
+ * one shared lock-free queue) issue GETLLAR/PUTLLC on the SAME 128-byte lines.
+ * Without honoring the reservation, two SPUs both "claim" the same slot and the
+ * queue corrupts (observed: the 2nd claim returns garbage [1,1,1,1] -> the SPU
+ * traps). PUTLLC must FAIL when the line changed since GETLLAR. We implement the
+ * compare-and-swap under one global lock across all SPU host threads.
+ * ===========================================================================*/
+extern uint8_t* vm_base;
+
+/* Global spinlock guarding all atomic line ops. _InterlockedExchange is a
+ * clang-cl/MSVC intrinsic (no runtime library symbol needed). */
+#include <intrin.h>
+static volatile long g_resv_lock = 0;
+static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { } }
+static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
+
+/* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
+static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+{
+    uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+    uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
+    uint8_t* ls  = &ctx->ls[lsa];
+    uint8_t* mem = vm_base + ea;
+
+    switch (cmd) {
+    case MFC_GETLLAR_CMD:
+        resv_lock();
+        memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
+        memcpy(ctx->resv_line, mem, MFC_ATOMIC_LINE);  /* snapshot for compare */
+        ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
+        resv_unlock();
+        return 1;
+
+    case MFC_PUTLLC_CMD:
+        resv_lock();
+        if (ctx->resv_valid && ctx->resv_ea == ea &&
+            memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+            memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
+        } else {
+            ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
+        }
+        ctx->resv_valid = 0;                           /* reservation consumed */
+        resv_unlock();
+        return 1;
+
+    case MFC_PUTLLUC_CMD:
+    case MFC_PUTQLLUC_CMD:
+        resv_lock();
+        memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        ctx->resv_valid = 0; ctx->atomic_stat = 0;
+        resv_unlock();
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
 static int channel_is_mfc(uint32_t ch)
 {
     switch (ch) {
@@ -75,6 +137,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
     if (channel_is_mfc(channel)) {
+        /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
+         * not the plain GET/PUT the DMA engine would do. */
+        if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
+            return;
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
         return;
     }
