@@ -332,6 +332,22 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
 
+    if (getenv("YDKJ_SPUIMG") && img_ea && thread_num == 0) {
+        uint32_t type  = vm_read_be32(img_ea + 0);
+        uint32_t entry = vm_read_be32(img_ea + 4);
+        uint32_t segs  = vm_read_be32(img_ea + 8);
+        uint32_t nsegs = vm_read_be32(img_ea + 12);
+        fprintf(stderr, "[SPUIMG] img=0x%08X type=0x%X entry=0x%X segs=0x%08X nsegs=%u\n",
+                img_ea, type, entry, segs, nsegs);
+        for (uint32_t s = 0; s < nsegs && s < 8; s++) {
+            uint32_t b = segs + s * 0x18;  /* sys_spu_segment: type,ls,size,src(pa64) */
+            fprintf(stderr, "[SPUIMG]  seg%u type=0x%X ls=0x%X size=0x%X src=0x%08X%08X\n",
+                    s, vm_read_be32(b+0), vm_read_be32(b+4), vm_read_be32(b+8),
+                    vm_read_be32(b+0x10), vm_read_be32(b+0x14));
+        }
+        fflush(stderr);
+    }
+
     if (thread_num < 8)
         g->thread_indices[thread_num] = (uint32_t)(t - s_spu_threads);
 
