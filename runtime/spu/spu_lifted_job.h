@@ -15,6 +15,7 @@
 
 #include "spu_context.h"
 #include <string.h>
+#include <stdio.h>
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
 
@@ -23,20 +24,41 @@ typedef void (*spu_lifted_entry_fn)(spu_context*);
  * (the SPURS task ABI), the lifted entry runs, and the LS is written back.
  * The caller links the channel ABI (spu_wrch/spu_rdch/...) that the lifted code
  * uses to reach DMA / mailboxes / events. Returns the job's exit code (0). */
-static inline int32_t spu_run_lifted_job_img(spu_lifted_entry_fn entry,
+/* spurs_task_abi: when nonzero, set up r3 per the SPURS task kernel ABI instead
+ * of the simple-job ABI. A SPURS task entry expects r3 (128-bit) = a pair:
+ *   word0 = {high half 0x40 (kernel marker), low half = DMA tag}
+ *   word1 = eaContext  (the task's context save area; the entry DMAs it in)
+ * The simple-job ABI just puts the single arg EA in word0. (Verified against the
+ * lifted SPURS entry: it checks (r3.word0 >> 16) == 0x40 then DMAs 64 bytes from
+ * r3.word1, tag = r3.word0 & 0xFFFF — see spu_func_00003E68/00003ED8.) */
+static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
                                              uint8_t* local_store,
                                              uint32_t args_ea,
-                                             int image_id)
+                                             int image_id,
+                                             int spurs_task_abi)
 {
     if (!entry) return -1;
     spu_context ctx;
     spu_context_init(&ctx, 0);
     ctx.image_id = image_id;     /* select this image's indirect-branch table */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
-    ctx.gpr[3]._u32[0] = args_ea;                               /* SPURS task arg -> r3 */
+    if (spurs_task_abi) {
+        ctx.gpr[3]._u32[0] = 0x00400000u;   /* 0x40 marker (>>16==64), DMA tag 0 */
+        ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
+    } else {
+        ctx.gpr[3]._u32[0] = args_ea;                           /* simple-job arg -> r3 */
+    }
     entry(&ctx);                                                /* run the lifted job  */
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
     return 0;
+}
+
+static inline int32_t spu_run_lifted_job_img(spu_lifted_entry_fn entry,
+                                             uint8_t* local_store,
+                                             uint32_t args_ea,
+                                             int image_id)
+{
+    return spu_run_lifted_job_abi(entry, local_store, args_ea, image_id, 0);
 }
 
 static inline int32_t spu_run_lifted_job(spu_lifted_entry_fn entry,
