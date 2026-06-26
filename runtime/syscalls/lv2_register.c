@@ -326,6 +326,10 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     }
     t->group_id = group_id;
     t->index    = thread_num;
+    /* Record the SPURS kernel context EA (the SPU thread's argument) so the
+     * event layer can dispatch the title's real lifted SPU task runtime against
+     * it when a PPU thread blocks waiting for SPU completion. */
+    { extern uint32_t g_ydkj_spurs_ctx_ea; if (args_ea) g_ydkj_spurs_ctx_ea = args_ea; }
     /* Read entry point from the SPU image struct if available.
      * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);

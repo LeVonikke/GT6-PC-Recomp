@@ -4,7 +4,13 @@
 
 #include "sys_event.h"
 #include "../memory/vm.h"
+#include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
+#include <stdlib.h>               /* getenv */
+
+/* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
+ * context EA the title's SPU task runtime is dispatched against. */
+uint32_t g_ydkj_spurs_ctx_ea = 0;
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -199,6 +205,26 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
     if (!q->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    /* SPURS bring-up: when a PPU thread is about to block forever for SPU
+     * completion (libsre created the taskset correctly but never started its SPU
+     * kernel), drive the title's REAL lifted SPU task runtime (image 22 @guest
+     * 0x004F5F80) against the recorded SPURS context. It claims the ready task
+     * from libsre's taskset and runs the task body -- real recompiled SPU code,
+     * not a synthesized completion. Gated by YDKJ_SPUTASK; fire once. */
+    if (getenv("YDKJ_SPUTASK") && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
+        static int s_fired = 0;
+        if (!s_fired) {
+            s_fired = 1;
+            extern uint8_t* vm_base;
+            extern int spu_workload_dispatch_async(const uint8_t*, uint32_t, uint32_t);
+            const uint8_t* elf = vm_base + 0x004F5F80u;
+            size_t sz = spu_elf_image_size(elf, 2u * 1024 * 1024);
+            fprintf(stderr, "[ydkj] block on q=%u -> dispatch real SPU task runtime "
+                    "(img@0x4F5F80 sz=%zu ctx=0x%08X)\n", queue_id, sz, g_ydkj_spurs_ctx_ea);
+            if (sz) spu_workload_dispatch_async(elf, (uint32_t)sz, g_ydkj_spurs_ctx_ea);
+        }
+    }
 
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
