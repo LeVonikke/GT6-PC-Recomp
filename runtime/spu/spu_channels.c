@@ -16,6 +16,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <setjmp.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -286,13 +289,18 @@ void spu_indirect_branch(spu_context* ctx)
         fn(ctx);
         return;
     }
-    { static int _n=0; if (_n++ < 8) {
-        const uint8_t* b = ctx->ls + 0xBEC0;
-        fprintf(stderr, "[SPU] indirect branch to LS 0x%05X (image %d) lr=0x%05X r1=0x%05X "
-                "LS[0xBEC0]=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                ctx->pc & SPU_LS_MASK, ctx->image_id,
-                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK,
-                b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]); } }
+    { static int _n=0; if (_n++ < 2) {
+        fprintf(stderr, "[SPU] branch-to-0 lr=0x%05X r1=0x%05X\n",
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK);
+#ifdef _WIN32
+        void* frames[24]; unsigned short fn = RtlCaptureStackBackTrace(0, 24, frames, NULL);
+        char* base = (char*)GetModuleHandleA(NULL);
+        fprintf(stderr, "[SPU] host bt RVAs:");
+        for (unsigned short i = 0; i < fn; i++)
+            fprintf(stderr, " 0x%zX", (size_t)((char*)frames[i] - base));
+        fprintf(stderr, "\n");
+#endif
+    } }
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
 
