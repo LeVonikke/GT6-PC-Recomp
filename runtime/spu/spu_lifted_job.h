@@ -31,11 +31,18 @@ typedef void (*spu_lifted_entry_fn)(spu_context*);
  * The simple-job ABI just puts the single arg EA in word0. (Verified against the
  * lifted SPURS entry: it checks (r3.word0 >> 16) == 0x40 then DMAs 64 bytes from
  * r3.word1, tag = r3.word0 & 0xFFFF — see spu_func_00003E68/00003ED8.) */
+/* r3_override (optional, 4 words, big-endian/native lane values): when non-NULL
+ * and spurs_task_abi is set, the full 128-bit r3 the SPURS kernel hands the task
+ * is supplied by the caller (captured race-free at dispatch time from the game's
+ * eaContext+0x10 descriptor: {0x40-marker handle, eaContext, queue/lock EA,
+ * ...}). The claim CAS computes its atomic EA from r3.word2/3 & 0xFFFFFF80, so a
+ * zero there locks address 0 and the runtime finds "no ready task". */
 static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
                                              uint8_t* local_store,
                                              uint32_t args_ea,
                                              int image_id,
-                                             int spurs_task_abi)
+                                             int spurs_task_abi,
+                                             const uint32_t* r3_override)
 {
     if (!entry) return -1;
     spu_context ctx;
@@ -48,8 +55,15 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* 0x3FFF0 for a 256KB LS */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
     if (spurs_task_abi) {
-        ctx.gpr[3]._u32[0] = 0x00400000u;   /* 0x40 marker (>>16==64), DMA tag 0 */
-        ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
+        if (r3_override) {
+            ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle      */
+            ctx.gpr[3]._u32[1] = args_ea;          /* eaContext (DMA'd first) */
+            ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA           */
+            ctx.gpr[3]._u32[3] = r3_override[3];
+        } else {
+            ctx.gpr[3]._u32[0] = 0x00400000u;   /* 0x40 marker (>>16==64), DMA tag 0 */
+            ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
+        }
     } else {
         ctx.gpr[3]._u32[0] = args_ea;                           /* simple-job arg -> r3 */
     }
@@ -63,7 +77,7 @@ static inline int32_t spu_run_lifted_job_img(spu_lifted_entry_fn entry,
                                              uint32_t args_ea,
                                              int image_id)
 {
-    return spu_run_lifted_job_abi(entry, local_store, args_ea, image_id, 0);
+    return spu_run_lifted_job_abi(entry, local_store, args_ea, image_id, 0, 0);
 }
 
 static inline int32_t spu_run_lifted_job(spu_lifted_entry_fn entry,
