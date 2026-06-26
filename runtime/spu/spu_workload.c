@@ -239,7 +239,9 @@ static void spu_async_run(spu_async_job* j)
     if (ls) {
         uint32_t entry = 0;
         if (spu_elf_load_to_ls(j->image, j->image_size, ls, &entry)) {
-            int32_t rc = spu_run_lifted_job_img(j->fn, ls, j->args_ea, j->image_id);
+            /* Async dispatch is the SPURS-task path: the entry expects the SPURS
+             * task kernel ABI in r3 ({0x40 marker, eaContext}), not a bare arg. */
+            int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id, 1);
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
         }

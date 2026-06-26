@@ -10,6 +10,11 @@
 
 #include "cellGcmSys.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
+#include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+
+/* Guest EA of the GCM context (begin/end/current/callback) the title writes its
+ * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
+static u32 s_gcm_context_ea = 0;
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -321,6 +326,7 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         gwrite32(cdata + 0xC, 0);                   /* callback OPD (bridge fills) */
         if (ctx_out_addr)
             gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
+        s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
     }
     return cdata;
 }
@@ -430,6 +436,30 @@ void cellGcmTickFlip(void)
  * rsx_process_command_buffer so the game's clears/draws render. */
 void cellGcm_rsx_process_fifo(void)
 {
+    static rsx_state s_state;
+    static int  s_inited = 0;
+    static u32  s_get    = 0;     /* guest EA we've drained up to */
+
+    if (!s_gcm_context_ea) return;
+    if (!s_inited) { rsx_state_init(&s_state); s_get = s_config.ioAddress; s_inited = 1; }
+
+    /* The title's cellGcm macros write methods to the context's `current` pointer
+     * (context+0x8) and advance it. Read it (vm_read32 byte-swaps BE->host). */
+    u32 current = vm_read32(s_gcm_context_ea + 0x8);
+    if (current < s_get) s_get = s_config.ioAddress;   /* wrapped */
+    if (current <= s_get) return;                       /* nothing new */
+
+    u32 words = (current - s_get) / 4;
+    if (words > 0x40000u) words = 0x40000u;             /* cap 1MB/frame */
+
+    /* Byte-swap the BE command words into a host buffer (the parser reads host
+     * endian); vm_read32 does the swap per word. */
+    static u32 cmds[0x40000];
+    for (u32 i = 0; i < words; i++)
+        cmds[i] = vm_read32(s_get + i * 4);
+
+    rsx_process_command_buffer(&s_state, cmds, words * 4);
+    s_get += words * 4;
 }
 
 /* NID: 0xDC09357E */
