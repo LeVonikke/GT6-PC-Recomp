@@ -231,6 +231,8 @@ typedef struct {
     uint32_t            args_ea;
     spu_lifted_entry_fn fn;
     int                 image_id;
+    uint32_t            r3[4];        /* captured race-free at dispatch time */
+    int                 have_r3;
 } spu_async_job;
 
 static void spu_async_run(spu_async_job* j)
@@ -240,8 +242,11 @@ static void spu_async_run(spu_async_job* j)
         uint32_t entry = 0;
         if (spu_elf_load_to_ls(j->image, j->image_size, ls, &entry)) {
             /* Async dispatch is the SPURS-task path: the entry expects the SPURS
-             * task kernel ABI in r3 ({0x40 marker, eaContext}), not a bare arg. */
-            int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id, 1);
+             * task kernel ABI in r3 ({0x40 marker, eaContext, queue EA, ...}),
+             * captured at dispatch time (j->r3) so it doesn't race the PPU
+             * overwriting the stack-allocated context. */
+            int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+                                                1, j->have_r3 ? j->r3 : 0);
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
         }
@@ -276,6 +281,19 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
+    /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
+     * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
+     * async SPU thread reading it later would race the PPU stack. word1 is
+     * overridden to args_ea (eaContext) in spu_run_lifted_job_abi. */
+    j->have_r3 = 0;
+    if (args_ea) {
+        extern uint8_t* vm_base;
+        const uint8_t* c = vm_base + args_ea + 0x10;
+        for (int k = 0; k < 4; k++)
+            j->r3[k] = ((uint32_t)c[k*4]<<24)|((uint32_t)c[k*4+1]<<16)|
+                       ((uint32_t)c[k*4+2]<<8)|c[k*4+3];
+        if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
+    }
 
     fprintf(stderr,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
