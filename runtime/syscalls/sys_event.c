@@ -396,6 +396,18 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
     return 0;
 }
 
+/* EXPERIMENT: inject an event into a queue by id, to probe whether unblocking
+ * the SPURS completion queue (q=1) lets the PPU reach its render loop. */
+int sys_event_queue_inject(uint32_t qid, uint64_t source,
+                           uint64_t d1, uint64_t d2, uint64_t d3)
+{
+    if (qid == 0 || qid > SYS_EVENT_QUEUE_MAX) return -1;
+    sys_event_queue_info* q = &g_sys_event_queues[qid - 1];
+    if (!q->active) return -1;
+    sys_event_t evt; evt.source = source; evt.data1 = d1; evt.data2 = d2; evt.data3 = d3;
+    return event_queue_push(q, &evt);
+}
+
 int64_t sys_event_port_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
