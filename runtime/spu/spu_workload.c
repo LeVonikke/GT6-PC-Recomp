@@ -298,6 +298,12 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     fprintf(stderr,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
+    if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
+        static int _d=0; if (_d++ < 2) {
+            fprintf(stderr, "[spu_workload] eaContext@0x%08X dump:", args_ea);
+            for (int k=0;k<0x40;k+=4)
+                fprintf(stderr, " %02X%02X%02X%02X", c[k],c[k+1],c[k+2],c[k+3]);
+            fprintf(stderr, "\n"); } }
 
 #ifdef _WIN32
     HANDLE th = CreateThread(NULL, 1u << 20, spu_async_thread, j, 0, NULL);
