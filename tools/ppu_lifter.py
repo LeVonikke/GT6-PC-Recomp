@@ -405,26 +405,38 @@ class PPULifter:
         # possibly-clobbered stack slot. The store/load stay (ABI shape); only the
         # restored *value* changes. Pair save<->restore by (offset, reg) so an
         # unrelated reload of a stack local is never rewritten.
-        # Only rewrite a restore that PAIRS with a save in the same body (same
-        # offset+reg): then the entry snapshot is exactly the value the prologue
-        # stored (the caller's preserved register). A mid-function tail-entry has
-        # the restore but NOT the prologue save in its body, so its snapshot would
-        # capture the mid-function value, not the caller's -- skip those (they
-        # keep reading the shared frame slot, which is correct unless corrupted).
+        # The snapshot SOURCE differs by whether the prologue save is in this body:
+        #  * PAIRED restore (normal function: matching save+restore here) -> the
+        #    prologue stores the caller's register, so snapshot the REGISTER at
+        #    entry (its value before the body's stdu/save).
+        #  * UNPAIRED restore (mid-function tail-entry: restore present, prologue
+        #    save lives in the original function before this entry) -> snapshot
+        #    from MEMORY at entry: the slot still holds the original saved value
+        #    because none of THIS body's callees have run yet to corrupt it.
+        # Either way the restore then reads a value captured before any frame
+        # drift, immune to a deeper callee clobbering the slot.
         _saved_slots = set()
         for _l in func.body_lines:
             _m = _CS_SAVE_RE.search(_l)
             if _m:
                 _saved_slots.add((_m.group(1), _m.group(2)))
-        _snap_regs = set()
+        _reg_snap = set()        # regs to snapshot from the register at entry
+        _mem_snap = {}           # reg -> offset, snapshot from memory at entry
         for _i, _l in enumerate(func.body_lines):
             _m = _CS_REST_RE.search(_l)
-            if _m and (_m.group(2), _m.group(1)) in _saved_slots:
-                _snap_regs.add(int(_m.group(1)))
-                func.body_lines[_i] = f"    ctx->gpr[{_m.group(1)}] = _cs_{_m.group(1)};"
-        if _snap_regs:
-            func.body_lines = [f"    uint64_t _cs_{_n} = ctx->gpr[{_n}];"
-                               for _n in sorted(_snap_regs)] + func.body_lines
+            if _m:
+                _reg = int(_m.group(1)); _off = _m.group(2)
+                if (_off, _m.group(1)) in _saved_slots:
+                    _reg_snap.add(_reg)
+                else:
+                    _mem_snap.setdefault(_reg, _off)
+                func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
+        if _reg_snap or _mem_snap:
+            _decls = [f"    uint64_t _cs_{_n} = ctx->gpr[{_n}];"
+                      for _n in sorted(_reg_snap)]
+            _decls += [f"    uint64_t _cs_{_n} = vm_read64(ctx->gpr[1] + {_off});"
+                       for _n, _off in sorted(_mem_snap.items()) if _n not in _reg_snap]
+            func.body_lines = _decls + func.body_lines
 
         self.functions.append(func)
         return func
