@@ -286,8 +286,10 @@ void spu_indirect_branch(spu_context* ctx)
         fn(ctx);
         return;
     }
-    fprintf(stderr, "[SPU] indirect branch to unknown LS address 0x%05X (image %d)\n",
-            ctx->pc & SPU_LS_MASK, ctx->image_id);
+    { static int _n=0; if (_n++ < 16)
+        fprintf(stderr, "[SPU] indirect branch to unknown LS 0x%05X (image %d) from call-site lr=0x%05X r1=0x%05X\n",
+                ctx->pc & SPU_LS_MASK, ctx->image_id,
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK); }
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
 
