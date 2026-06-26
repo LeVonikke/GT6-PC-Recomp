@@ -197,6 +197,15 @@ def _reg_idx(token: str) -> str:
     return m.group(1) if m else token
 
 
+# Callee-saved register save/restore (r14-r31) to/from the frame, for the
+# robust ABI-preservation pass in lift_function. Group order: SAVE -> (off, reg);
+# RESTORE -> (reg, off), so a save and its restore pair on matching (off, reg).
+_CS_SAVE_RE = re.compile(
+    r'vm_write64\(ctx->gpr\[1\] \+ (0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
+_CS_REST_RE = re.compile(
+    r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(ctx->gpr\[1\] \+ (0x[0-9A-Fa-f]+|-?\d+)\);')
+
+
 def _xea(ra, rb):
     """X-form (indexed) effective-address base: in PPC indexed addressing an rA
     field of 0 denotes the literal value 0, NOT the contents of GPR r0. Returns
@@ -384,6 +393,33 @@ class PPULifter:
         # are handled by the boundary-recovery prologue scan instead.
         if not _last_line_is_terminator(func.body_lines):
             func.fallthrough_to = end
+
+        # Robust callee-saved-register preservation. The PPC ABI guarantees
+        # r14-r31 survive a call; the callee saves them to its frame and restores
+        # at the epilogue. But a frame-drift bug (a deeper callee whose stack
+        # pointer drifted writes into THIS function's callee-save slot) corrupts
+        # the value the epilogue reloads -- observed: func_00182DD8's saved r29
+        # (a small loop count) comes back as the TOC pointer, giving a 5.5M-iter
+        # hang. Make each restore source its value from a snapshot of the
+        # register taken at function entry (a C local) instead of re-reading the
+        # possibly-clobbered stack slot. The store/load stay (ABI shape); only the
+        # restored *value* changes. Pair save<->restore by (offset, reg) so an
+        # unrelated reload of a stack local is never rewritten.
+        # A load from the frame into a non-volatile GPR (r14-r31) is always a
+        # callee-save restore -- the compiler never spills/reloads those for
+        # temporaries (it uses volatile regs), so this also covers mid-function
+        # tail-entries whose matching prologue save sits before the entry point.
+        # The entry snapshot equals the value the restore must produce (the
+        # caller's preserved register) for both normal entries and tail-entries.
+        _snap_regs = set()
+        for _i, _l in enumerate(func.body_lines):
+            _m = _CS_REST_RE.search(_l)
+            if _m:
+                _snap_regs.add(int(_m.group(1)))
+                func.body_lines[_i] = f"    ctx->gpr[{_m.group(1)}] = _cs_{_m.group(1)};"
+        if _snap_regs:
+            func.body_lines = [f"    uint64_t _cs_{_n} = ctx->gpr[{_n}];"
+                               for _n in sorted(_snap_regs)] + func.body_lines
 
         self.functions.append(func)
         return func
