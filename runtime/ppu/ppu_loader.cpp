@@ -163,6 +163,13 @@ extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
  * (ctx->pc, updated by lifted code at block boundaries) of a host AV. */
 extern "C" __declspec(thread) ppu_context* g_active_ctx = nullptr;
 
+/* Caller LR of the guest function currently in an HLE call (for HLE-side
+ * diagnostics: pin which lifted function invoked us). 0 if none. */
+extern "C" uint32_t ppu_active_lr(void)
+{
+    return g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u;
+}
+
 /* ---------------------------------------------------------------------------
  * Function registry: guest code address -> lifted host function.
  * Open-addressing hash (load factor kept low); 14k+ functions in a real EBOOT.
