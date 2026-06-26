@@ -11,6 +11,8 @@
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
 uint32_t g_ydkj_spurs_ctx_ea = 0;
+/* Optional title-set hook to run the real lifted SPURS kernel on an SPU thread. */
+void (*g_spurs_kernel_hook)(uint32_t) = 0;
 
 /* ---------------------------------------------------------------------------
  * Globals

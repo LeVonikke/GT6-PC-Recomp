@@ -330,6 +330,9 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
      * event layer can dispatch the title's real lifted SPU task runtime against
      * it when a PPU thread blocks waiting for SPU completion. */
     { extern uint32_t g_ydkj_spurs_ctx_ea; if (args_ea) g_ydkj_spurs_ctx_ea = args_ea; }
+    /* Optional title hook: run the real lifted SPURS kernel on this SPU thread's
+     * context (libsre leaves the kernel image empty + never starts the group). */
+    { extern void (*g_spurs_kernel_hook)(uint32_t); if (g_spurs_kernel_hook) g_spurs_kernel_hook(args_ea); }
     /* Read entry point from the SPU image struct if available.
      * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
