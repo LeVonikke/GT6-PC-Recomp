@@ -238,8 +238,11 @@ static void spu_async_run(spu_async_job* j)
     uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
     if (ls) {
         uint32_t entry = 0;
-        if (spu_elf_load_to_ls(j->image, j->image_size, ls, &entry))
-            spu_run_lifted_job_img(j->fn, ls, j->args_ea, j->image_id);
+        if (spu_elf_load_to_ls(j->image, j->image_size, ls, &entry)) {
+            int32_t rc = spu_run_lifted_job_img(j->fn, ls, j->args_ea, j->image_id);
+            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                    "(job ran to completion, did not loop)\n", j->image_id, rc);
+        }
         free(ls);
     }
     free(j);
