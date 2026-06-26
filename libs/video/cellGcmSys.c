@@ -18,6 +18,9 @@ static u32 s_gcm_context_ea = 0;
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <stdint.h>
 
 #ifdef _WIN32
@@ -820,6 +823,16 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
 
     printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u)\n",
            index, location, offset, size, pitch);
+    { static int _src=0; if (_src++ < 3) {
+        extern unsigned short vm_read16(unsigned long long);
+        /* func_00062598/A4 read display w/h from guest 0x546D50/0x546D52 -- the
+         * config source for the tile/displaybuffer setup. Dump the region. */
+        fprintf(stderr, "[GCM-src] 0x546D50=%04X 0x546D52=%04X 0x546D54=%04X  d[0x546D40..70]:",
+                vm_read16(0x546D50), vm_read16(0x546D52), vm_read16(0x546D54));
+        for (unsigned a = 0x546D40; a < 0x546D70; a += 4)
+            fprintf(stderr, " %08X", vm_read32(a));
+        fprintf(stderr, "\n");
+    } }
 
     s_tiles[index].offset = offset;
     s_tiles[index].size   = size;
