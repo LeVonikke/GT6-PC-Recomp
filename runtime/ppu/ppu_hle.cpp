@@ -62,6 +62,15 @@ void vm_write64(uint64_t addr, uint64_t val);
 extern "C" uint32_t    g_last_hle_nid  = 0;
 extern "C" const char* g_last_hle_name = "";
 
+/* Real-PRX bridge: a loaded system PRX (libsre = cellSpurs/cellSync) may export
+ * this NID. If so, dispatch into the REAL recompiled Sony code (its OPD -> our
+ * indirect dispatcher -> the registered lifted libsre function) instead of the
+ * HLE stub. prx_resolve_export returns 0 when no PRX exports the NID, so this is
+ * a no-op when no PRX is loaded. */
+extern "C" uint32_t prx_resolve_export(uint32_t nid);
+extern "C" void     ps3_indirect_call(ppu_context* ctx);
+extern "C" uint32_t vm_read32(uint64_t a);
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     g_last_hle_nid = nid;
@@ -72,6 +81,19 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * import call leaves the caller with a garbage r2 -> all later TOC-relative
      * loads (the C++ ctor list, globals, ...) read garbage -> boot corruption. */
     vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
+
+    /* Real libsre (loaded PRX) takes priority over the HLE stub. */
+    {
+        uint32_t opd = prx_resolve_export(nid);
+        if (opd) {
+            uint32_t code = vm_read32(opd);
+            uint32_t toc  = vm_read32(opd + 4);
+            ctx->gpr[2] = toc;            /* libsre's own TOC */
+            ctx->ctr    = code;
+            ps3_indirect_call(ctx);       /* -> registered lifted libsre fn; r3=ret */
+            return;
+        }
+    }
 
     for (uint32_t i = 0; i < g_ctx_count; i++)
         if (g_ctx[i].nid == nid) { g_ctx[i].fn(ctx); return; }

@@ -31,6 +31,12 @@ void     ppu_sysprx_register(void);
 void     ppu_fs_register(void);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
+/* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
+ * guest RAM and register their exports. Weak default is a no-op; a title that
+ * links a lifted PRX defines a strong version. Called after the lifted function
+ * table is registered and vm_base is live, before the game runs. */
+void     ps3_load_prx_modules(void) __attribute__((weak));
+void     ps3_load_prx_modules(void) {}
 }
 
 #include <string.h>
@@ -323,6 +329,7 @@ int main(int argc, char** argv)
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
 
     ppu_recomp_register();   /* lifted function table -> address map */
+    ps3_load_prx_modules();  /* real system PRX (libsre) -> guest RAM + exports */
     ppu_hle_init();          /* firmware import NID -> HLE handlers */
     ppu_sysprx_register();   /* boot-critical CRT (sys_initialize_tls, ...) */
     ppu_fs_register();       /* cellFs VFS over the real game directory */
