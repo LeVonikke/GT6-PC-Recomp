@@ -286,10 +286,13 @@ void spu_indirect_branch(spu_context* ctx)
         fn(ctx);
         return;
     }
-    { static int _n=0; if (_n++ < 16)
-        fprintf(stderr, "[SPU] indirect branch to unknown LS 0x%05X (image %d) from call-site lr=0x%05X r1=0x%05X\n",
+    { static int _n=0; if (_n++ < 8) {
+        const uint8_t* b = ctx->ls + 0xBEC0;
+        fprintf(stderr, "[SPU] indirect branch to LS 0x%05X (image %d) lr=0x%05X r1=0x%05X "
+                "LS[0xBEC0]=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
                 ctx->pc & SPU_LS_MASK, ctx->image_id,
-                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK); }
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK,
+                b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]); } }
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
 
