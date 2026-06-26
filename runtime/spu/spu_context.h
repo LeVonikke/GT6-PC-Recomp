@@ -90,6 +90,13 @@ extern "C" {
 #define MFC_EIEIO_CMD       0xC8
 #define MFC_SYNC_CMD        0xCC
 
+/* Atomic (lock-line reservation) commands -- operate on a 128-byte line. */
+#define MFC_GETLLAR_CMD     0xD0   /* get + reserve line                      */
+#define MFC_PUTLLC_CMD      0xB4   /* store conditional (fails if line moved) */
+#define MFC_PUTLLUC_CMD     0xB0   /* store unconditional, clears reservation */
+#define MFC_PUTQLLUC_CMD    0xB8   /* queued store unconditional              */
+#define MFC_ATOMIC_LINE     128
+
 /* ---------------------------------------------------------------------------
  * Channel state
  * -----------------------------------------------------------------------*/
@@ -156,6 +163,15 @@ typedef struct spu_context {
     /* MFC tag completion mask and status */
     uint32_t mfc_tag_mask;
     uint32_t mfc_tag_status;
+
+    /* Atomic reservation state (GETLLAR/PUTLLC lock-line semantics). Multiple
+     * SPU kernel threads share a lock-free queue in main memory; PUTLLC must
+     * FAIL if the reserved 128-byte line changed since GETLLAR, or concurrent
+     * claims corrupt the queue. */
+    uint32_t resv_ea;          /* reserved 128-byte line EA, aligned (0 = none) */
+    int      resv_valid;
+    uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
+    uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
 
 } spu_context;
 

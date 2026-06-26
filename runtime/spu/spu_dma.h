@@ -337,10 +337,11 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
     case MFC_RdListStallStat:
         return 0; /* no stalls in synchronous mode */
     case MFC_RdAtomicStat:
-        /* Atomic operation status: 0 = success (MFC_PUTLLC_SUCCESS),
-         * 1 = failed (MFC_PUTLLC_FAILURE). In single-threaded recomp,
-         * atomic ops always succeed. */
-        return 0; /* MFC_PUTLLC_SUCCESS */
+        /* Result of the last atomic line op (GETLLAR/PUTLLC/PUTLLUC), set by
+         * spu_mfc_atomic(): 0 = PUTLLC_SUCCESS, 1 = PUTLLC_FAILURE (line moved,
+         * SPU must retry). Honoring this is what keeps the SPURS lock-free queue
+         * consistent across concurrent SPU kernel threads. */
+        return spu->atomic_stat;
     default:
         return 0;
     }
