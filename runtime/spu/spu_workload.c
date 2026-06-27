@@ -299,11 +299,30 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
-        static int _d=0; if (_d++ < 2) {
-            fprintf(stderr, "[spu_workload] eaContext@0x%08X dump:", args_ea);
-            for (int k=0;k<0x40;k+=4)
-                fprintf(stderr, " %02X%02X%02X%02X", c[k],c[k+1],c[k+2],c[k+3]);
-            fprintf(stderr, "\n"); } }
+        static int _d=0; if (_d++ < 1) {
+            /* Dump a larger window of the task context buffer + scan for any word
+             * that looks like the LS[0xBEC0] target (i.e. a small LS-range value),
+             * to see if the kernel-restored LS data lives here (real game data). */
+            /* The policy module restores the task context from a save buffer into
+             * LS 0xB200; LS[0xBEC0] = ctxbuf + 0xCC0. Check the heap-EA candidates
+             * in the descriptor for a save buffer whose +0xCC0/+0xCC8 holds a
+             * small LS pointer (a valid P for LS[0xBEC8]). */
+            uint32_t cand[5];
+            cand[0]=((uint32_t)c[0x14]<<24)|((uint32_t)c[0x15]<<16)|((uint32_t)c[0x16]<<8)|c[0x17];
+            cand[1]=((uint32_t)c[0x1C]<<24)|((uint32_t)c[0x1D]<<16)|((uint32_t)c[0x1E]<<8)|c[0x1F];
+            cand[2]=((uint32_t)c[0x98]<<24)|((uint32_t)c[0x99]<<16)|((uint32_t)c[0x9A]<<8)|c[0x9B];
+            cand[3]=((uint32_t)c[0xB8]<<24)|((uint32_t)c[0xB9]<<16)|((uint32_t)c[0xBA]<<8)|c[0xBB];
+            cand[4]=((uint32_t)c[0x16C]<<24)|((uint32_t)c[0x16D]<<16)|((uint32_t)c[0x16E]<<8)|c[0x16F];
+            for (int ci=0; ci<5; ci++) {
+                uint32_t ea=cand[ci]; if (!ea || ea>=0x10000000) continue;
+                const uint8_t* b = vm_base + ea + 0xCC0;
+                fprintf(stderr, "[ctxbuf cand 0x%08X +0xCC0]:", ea);
+                for (int k=0;k<0x20;k+=4) {
+                    uint32_t w=((uint32_t)b[k]<<24)|((uint32_t)b[k+1]<<16)|((uint32_t)b[k+2]<<8)|b[k+3];
+                    fprintf(stderr, " %08X%s", w, (w>0&&w<0x40000)?"<LS":"");
+                }
+                fprintf(stderr, "\n");
+            } } }
 
 #ifdef _WIN32
     HANDLE th = CreateThread(NULL, 1u << 20, spu_async_thread, j, 0, NULL);
