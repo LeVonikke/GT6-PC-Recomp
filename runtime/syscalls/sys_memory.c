@@ -114,6 +114,7 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     a->addr         = alloc_addr;
     a->size         = size;
     a->container_id = 0;
+    a->page_size    = alignment;  /* 0x100000 (1M) or 0x10000 (64K) */
 
     bump_unlock();
 
@@ -170,6 +171,49 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
         write_be32(out_addr + 4, avail);
     }
 
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_memory_get_page_attribute (syscall 351 / 0x15F)
+ *
+ * r3 = address to query
+ * r4 = pointer to sys_page_attribute_t:
+ *        +0x00 attribute   (u64)
+ *        +0x08 access_right(u64)
+ *        +0x10 page_size   (u32)   <- the field titles actually check
+ *        +0x14 pad         (u32)
+ *
+ * Was unimplemented (fell through to the return-0 stub), so the output struct
+ * was never filled -> callers reading page_size got stack garbage. Dantelion2's
+ * graphics init (func_009F6D40) queries a 1MB-page buffer and only proceeds to
+ * construct a sub-object when page_size == 0x100000; the stub made it take the
+ * failure path, leaving that sub-object NULL -> later null-deref crash.
+ * -----------------------------------------------------------------------*/
+int64_t sys_memory_get_page_attribute(ppu_context* ctx)
+{
+    uint32_t addr     = LV2_ARG_U32(ctx, 0);
+    uint32_t attr_out = LV2_ARG_PTR(ctx, 1);
+
+    /* Report the page size of the allocation containing addr. */
+    uint32_t page_size = 0x10000;  /* default 64K */
+    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
+        if (g_sys_mem_allocs[i].active &&
+            addr >= g_sys_mem_allocs[i].addr &&
+            addr <  g_sys_mem_allocs[i].addr + g_sys_mem_allocs[i].size) {
+            page_size = g_sys_mem_allocs[i].page_size ? g_sys_mem_allocs[i].page_size : 0x10000;
+            break;
+        }
+    }
+
+    if (attr_out != 0) {
+        write_be32(attr_out + 0x00, 0);          /* attribute    (hi) */
+        write_be32(attr_out + 0x04, 0x00040000); /* attribute    (lo) PROT_READ_WRITE-ish */
+        write_be32(attr_out + 0x08, 0);          /* access_right (hi) */
+        write_be32(attr_out + 0x0C, 0x00000008); /* access_right (lo) PPU_THREAD-ish */
+        write_be32(attr_out + 0x10, page_size);  /* page_size */
+        write_be32(attr_out + 0x14, 0);          /* pad */
+    }
     return CELL_OK;
 }
 
@@ -389,6 +433,7 @@ void sys_memory_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);
     lv2_syscall_register(tbl, SYS_MEMORY_GET_USER_MEMORY_SIZE, sys_memory_get_user_memory_size);
+    lv2_syscall_register(tbl, SYS_MEMORY_GET_PAGE_ATTRIBUTE,   sys_memory_get_page_attribute);
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_CREATE,     sys_memory_container_create);
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_DESTROY,    sys_memory_container_destroy);
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_GET_SIZE,   sys_memory_container_get_size);
