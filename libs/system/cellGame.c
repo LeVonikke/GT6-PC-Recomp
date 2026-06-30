@@ -6,6 +6,7 @@
 
 #include "cellGame.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
+#include "ps3emu/guest_call.h"              /* g_ps3_guest_caller (funcStat dispatch) */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -282,6 +283,67 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     }
 
     return CELL_GAME_ERROR_NOTFOUND;
+}
+
+/* cellGameDataCheckCreate2 (NID 0xC9645C41) -- check/prepare game data, invoking the
+ * title's funcStat callback (CellGameDataStatCallback) exactly like firmware so the
+ * save/boot state machine advances. Struct layout + behavior cross-referenced against
+ * RPCS3 cellGame.cpp. Demon's Souls's DsSaveLoadMan thread calls this; without the
+ * callback firing, its game-data check never completes, the sema/SLSession chain
+ * stalls, and the cellSaveDataAutoLoad2 (auto-save notice) dialog never appears.
+ *
+ * funcStat(cbResult, get, set): the title reads `get` (isNewData, free space, params)
+ * and writes cbResult->result. We report existing data (isNewData=0) + ample space;
+ * DeS's callback returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+#define GAMEDATA_CB_BASE   0x02520000u   /* guest scratch (distinct from savedata's) */
+#define CELL_GAMEDATA_CBRESULT_OK_CANCEL  1
+#define CELL_GAMEDATA_CBRESULT_OK         0
+
+s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
+                             void* funcStat, u32 container)
+{
+    (void)errDialog; (void)container;
+    uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
+    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
+    const char* dir = dir_ea ? (const char*)(vm_base + dir_ea) : "";
+    printf("[cellGame] DataCheckCreate2(version=%u dir='%s' errDialog=%u funcStat=0x%08X)\n",
+           version, dir, errDialog, func_opd);
+
+    if (version != 0 || !dir_ea || !func_opd)
+        return CELL_GAME_ERROR_PARAM;
+    if (!g_ps3_guest_caller)
+        return CELL_OK;
+
+    /* Guest scratch for the 3 callback structs: CBResult(0x18)/StatGet(0xBE8)/StatSet(0x0C). */
+    uint32_t cb  = GAMEDATA_CB_BASE;
+    uint32_t get = cb + 0x20;
+    uint32_t set = get + 0xC00;
+    memset(vm_base + cb, 0, (set + 0x20) - cb);
+
+    /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
+    vm_write32(get + 0x000, 40u * 1024u * 1024u - 256u);  /* hddFreeSizeKB (~40 GB) */
+    vm_write32(get + 0x004, 0);                            /* isNewData = 0 (data exists) */
+    snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
+    snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
+    vm_write32(get + 0xB9C, 0xFFFFFFFFu);                  /* sizeKB = NOTCALC (-1) */
+    vm_write32(get + 0xBA0, 0);                            /* sysSizeKB */
+    /* getParam (CellGameDataSystemFileParam @0x860): title / titleId / dataVersion / attribute. */
+    uint32_t gp = get + 0x860;
+    snprintf((char*)(vm_base + gp + 0x000), 128, "%s", s_title);
+    snprintf((char*)(vm_base + gp + 0xA80), 10,  "%s", dir);        /* titleId = dir (e.g. BLUS30443) */
+    snprintf((char*)(vm_base + gp + 0xA8C), 6,   "%s", s_app_ver);  /* dataVersion */
+    vm_write32(gp + 0xA98, 0);                                      /* attribute = CELL_GAMEDATA_ATTR_NORMAL */
+
+    /* StatSet left zeroed (setParam = NULL: callback chooses whether to modify). */
+
+    g_ps3_guest_caller(func_opd, cb, get, set, 0);
+
+    s32 result = (s32)vm_read32(cb + 0x000);
+    printf("[cellGame] DataCheckCreate2: funcStat returned result=%d\n", result);
+    if (result < 0)
+        return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
+    /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */
+    return CELL_OK;
 }
 
 s32 cellGameGetParamInt(s32 id, s32* value)
