@@ -409,15 +409,19 @@ static void fill_cell_stat(uint32_t stat_addr, struct stat* st)
     mode |= CELL_FS_S_IWUSR; /* assume writable on Windows */
 #endif
 
-    write_be32(stat_addr + 0,  mode);
-    write_be32(stat_addr + 4,  0);  /* uid */
-    write_be32(stat_addr + 8,  0);  /* gid */
-    write_be32(stat_addr + 12, 0);  /* pad */
-    write_be64(stat_addr + 16, (uint64_t)st->st_atime);
-    write_be64(stat_addr + 24, (uint64_t)st->st_mtime);
-    write_be64(stat_addr + 32, (uint64_t)st->st_ctime);
-    write_be64(stat_addr + 40, (uint64_t)st->st_size);
-    write_be64(stat_addr + 48, 4096ULL);  /* blksize */
+    /* CellFsStat is 0x34 (52) bytes, 4-byte aligned: the s64/u64 members are
+     * be_t<...,4> so there is NO pad after gid (RPCS3: CHECK_SIZE_ALIGN(...,52,4)).
+     * mode@0 uid@4 gid@8 atime@0x0C mtime@0x14 ctime@0x1C size@0x24 blksize@0x2C.
+     * The old 8-byte-aligned 0x38 layout overran the struct by 4 bytes and, for
+     * a stat embedded inside a larger object, clobbered the field after it. */
+    write_be32(stat_addr + 0x00, mode);
+    write_be32(stat_addr + 0x04, 0);  /* uid */
+    write_be32(stat_addr + 0x08, 0);  /* gid */
+    write_be64(stat_addr + 0x0C, (uint64_t)st->st_atime);
+    write_be64(stat_addr + 0x14, (uint64_t)st->st_mtime);
+    write_be64(stat_addr + 0x1C, (uint64_t)st->st_ctime);
+    write_be64(stat_addr + 0x24, (uint64_t)st->st_size);
+    write_be64(stat_addr + 0x2C, 4096ULL);  /* blksize */
 }
 
 /* ---------------------------------------------------------------------------
