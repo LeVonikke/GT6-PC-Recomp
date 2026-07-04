@@ -48,11 +48,13 @@
 #define FRAME_COUNT         2   /* double buffering */
 #define MAX_VERTICES      4096  /* per-frame vertex buffer */
 #define MAX_DRAWS          256  /* per-frame draw records */
+#define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
 typedef struct {
     u32 vb_byte_offset; /* offset into vb_mapped where this draw's verts live */
     u32 vertex_count;
     u32 topology;       /* D3D_PRIMITIVE_TOPOLOGY_* */
+    int textured;       /* 1 = sample the bound font/atlas texture (dbgfont) */
 } D3D12DrawRecord;
 
 /* ---------------------------------------------------------------------------
@@ -99,6 +101,25 @@ typedef struct {
     u32                   vb_offset;      /* current write position */
 
     int                   pipeline_ready; /* 1 if root sig + PSO created */
+
+    /* Debug: copy the presented backbuffer to disk as BMP for the first N
+     * frames (enabled by env CELLMARK_DUMP). Lets us verify what actually
+     * rendered without racing the window/process lifetime. */
+    ID3D12Resource*       readback_buf;
+    u32                   readback_pitch;
+    int                   dump_frames_left;
+
+    /* Textured pipeline (dbgfont / 2D atlas quads). The font atlas is an 8-bit
+     * coverage texture uploaded as R8_UNORM and sampled in the pixel shader. */
+    ID3D12PipelineState*  pipeline_state_tex;   /* triangle + texture + blend */
+    ID3D12DescriptorHeap* srv_heap;             /* shader-visible, 1 SRV slot  */
+    ID3D12Resource*       tex_resource;         /* current atlas texture       */
+    ID3D12Resource*       tex_upload;           /* staging buffer for uploads  */
+    u32                   tex_w, tex_h;         /* dims of tex_resource         */
+    int                   tex_ready;            /* 1 once an atlas is uploaded  */
+    u32                   tex_src_offset;       /* guest RSX offset of atlas    */
+    int                   tex_bound;            /* a texture is bound for draws */
+    int                   tex_dirty;            /* re-upload needed this frame  */
 
     /* Per-frame draw recording */
     int                   frame_recording; /* 1 if cmd list is open for recording */
@@ -367,16 +388,41 @@ static int init_d3d12(u32 width, u32 height)
      * Visible only to the vertex shader — pixel shader doesn't need it.
      * ---------------------------------------------------------------*/
     {
-        D3D12_ROOT_PARAMETER root_params[1] = {0};
+        /* param 0: mat4 MVP as 16 root constants at b0 (vertex shader).
+         * param 1: one SRV (t0) descriptor table for the atlas texture (pixel).
+         * static sampler s0: linear clamp. The plain (untextured) PSO simply
+         * never references t0/s0, so it ignores them. */
+        D3D12_DESCRIPTOR_RANGE srv_range = {0};
+        srv_range.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srv_range.NumDescriptors     = 1;
+        srv_range.BaseShaderRegister = 0;   /* t0 */
+        srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER root_params[2] = {0};
         root_params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         root_params[0].Constants.ShaderRegister = 0;   /* b0 */
         root_params[0].Constants.RegisterSpace  = 0;
         root_params[0].Constants.Num32BitValues = 16;  /* mat4 */
         root_params[0].ShaderVisibility         = D3D12_SHADER_VISIBILITY_VERTEX;
+        root_params[1].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        root_params[1].DescriptorTable.NumDescriptorRanges = 1;
+        root_params[1].DescriptorTable.pDescriptorRanges   = &srv_range;
+        root_params[1].ShaderVisibility         = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC samp = {0};
+        samp.Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samp.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.ShaderRegister   = 0;   /* s0 */
+        samp.MaxLOD           = D3D12_FLOAT32_MAX;
+        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-        rs_desc.NumParameters = 1;
-        rs_desc.pParameters   = root_params;
+        rs_desc.NumParameters     = 2;
+        rs_desc.pParameters       = root_params;
+        rs_desc.NumStaticSamplers = 1;
+        rs_desc.pStaticSamplers   = &samp;
         rs_desc.Flags         = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
                               | D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS
                               | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS
@@ -460,6 +506,8 @@ static int init_d3d12(u32 width, u32 height)
                  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                 {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12,
                  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
             };
 
             D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {0};
@@ -469,7 +517,7 @@ static int init_d3d12(u32 width, u32 height)
             pso_desc.PS.pShaderBytecode = ps_blob->lpVtbl->GetBufferPointer(ps_blob);
             pso_desc.PS.BytecodeLength = ps_blob->lpVtbl->GetBufferSize(ps_blob);
             pso_desc.InputLayout.pInputElementDescs = input_layout;
-            pso_desc.InputLayout.NumElements = 2;
+            pso_desc.InputLayout.NumElements = 3;
             pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
             pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
             pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
@@ -518,6 +566,89 @@ static int init_d3d12(u32 width, u32 height)
             vs_blob->lpVtbl->Release(vs_blob);
             ps_blob->lpVtbl->Release(ps_blob);
         }
+
+        /* -----------------------------------------------------------------
+         * Textured triangle PSO (dbgfont / 2D atlas quads). Same MVP VS but
+         * carrying UV; the PS samples the single-channel atlas as coverage
+         * and modulates the vertex color, with straight alpha blending so
+         * glyph edges composite over the framebuffer. Depth off (2D overlay).
+         * ----------------------------------------------------------------*/
+        {
+            static const char vs_tex[] =
+                "cbuffer cb0 : register(b0){float4 c0;float4 c1;float4 c2;float4 c3;};\n"
+                "struct VSIn { float3 pos:POSITION; float4 col:COLOR; float2 uv:TEXCOORD; };\n"
+                "struct VSOut{ float4 pos:SV_POSITION; float4 col:COLOR; float2 uv:TEXCOORD; };\n"
+                "VSOut main(VSIn i){ VSOut o; float4 p=float4(i.pos,1.0);\n"
+                "  o.pos=c0*p.x+c1*p.y+c2*p.z+c3*p.w; o.col=i.col; o.uv=i.uv; return o; }\n";
+            static const char ps_tex[] =
+                "Texture2D tex : register(t0);\n"
+                "SamplerState smp : register(s0);\n"
+                "struct PSIn{ float4 pos:SV_POSITION; float4 col:COLOR; float2 uv:TEXCOORD; };\n"
+                "float4 main(PSIn i):SV_TARGET{\n"
+                /* dbgfont texcoords are compressed ~10x (U) / ~8x (V) vs. the
+                 * atlas; scale to recover glyph cells. Exact per-glyph offset
+                 * still being calibrated. */
+                "  float2 uv2 = float2(i.uv.x*10.0, i.uv.y*8.0 + 0.59);\n"
+                "  float cov = tex.Sample(smp, uv2).r;\n"
+                "  return float4(i.col.rgb, i.col.a * cov); }\n";
+
+            ID3DBlob *vtb = NULL, *ptb = NULL, *e2 = NULL;
+            hr = D3DCompile(vs_tex, sizeof(vs_tex) - 1, "vs_tex", NULL, NULL, "main", "vs_5_0", 0, 0, &vtb, &e2);
+            if (FAILED(hr)) printf("[D3D12] VS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
+            hr = D3DCompile(ps_tex, sizeof(ps_tex) - 1, "ps_tex", NULL, NULL, "main", "ps_5_0", 0, 0, &ptb, &e2);
+            if (FAILED(hr)) printf("[D3D12] PS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
+
+            if (vtb && ptb) {
+                D3D12_INPUT_ELEMENT_DESC il[] = {
+                    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                    {"COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                    {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                };
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+                pd.pRootSignature = s_d3d.root_signature;
+                pd.VS.pShaderBytecode = vtb->lpVtbl->GetBufferPointer(vtb);
+                pd.VS.BytecodeLength  = vtb->lpVtbl->GetBufferSize(vtb);
+                pd.PS.pShaderBytecode = ptb->lpVtbl->GetBufferPointer(ptb);
+                pd.PS.BytecodeLength  = ptb->lpVtbl->GetBufferSize(ptb);
+                pd.InputLayout.pInputElementDescs = il;
+                pd.InputLayout.NumElements = 3;
+                pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+                pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                pd.BlendState.RenderTarget[0].BlendEnable    = TRUE;
+                pd.BlendState.RenderTarget[0].SrcBlend       = D3D12_BLEND_SRC_ALPHA;
+                pd.BlendState.RenderTarget[0].DestBlend      = D3D12_BLEND_INV_SRC_ALPHA;
+                pd.BlendState.RenderTarget[0].BlendOp        = D3D12_BLEND_OP_ADD;
+                pd.BlendState.RenderTarget[0].SrcBlendAlpha  = D3D12_BLEND_ONE;
+                pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                pd.BlendState.RenderTarget[0].BlendOpAlpha   = D3D12_BLEND_OP_ADD;
+                pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+                pd.SampleMask = UINT_MAX;
+                pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                pd.NumRenderTargets = 1;
+                pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+                pd.DepthStencilState.DepthEnable = FALSE;
+                pd.DepthStencilState.StencilEnable = FALSE;
+                pd.SampleDesc.Count = 1;
+                hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+                    s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_d3d.pipeline_state_tex);
+                if (SUCCEEDED(hr)) printf("[D3D12] Pipeline state created (textured class)\n");
+                else printf("[D3D12] PSO TEX creation failed (0x%08lX)\n", hr);
+            }
+            if (vtb) vtb->lpVtbl->Release(vtb);
+            if (ptb) ptb->lpVtbl->Release(ptb);
+        }
+
+        /* SRV descriptor heap (shader-visible) for the atlas texture. */
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+            hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            hd.NumDescriptors = 1;
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
+                s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.srv_heap);
+            if (FAILED(hr)) printf("[D3D12] SRV heap creation failed (0x%08lX)\n", hr);
+        }
     }
 
     /* ---------------------------------------------------------------
@@ -529,7 +660,7 @@ static int init_d3d12(u32 width, u32 height)
 
         D3D12_RESOURCE_DESC buf_desc = {0};
         buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buf_desc.Width = MAX_VERTICES * 28; /* 28 bytes per vertex (pos3+col4) */
+        buf_desc.Width = MAX_VERTICES * VERTEX_STRIDE;
         buf_desc.Height = 1;
         buf_desc.DepthOrArraySize = 1;
         buf_desc.MipLevels = 1;
@@ -546,10 +677,10 @@ static int init_d3d12(u32 width, u32 height)
                 s_d3d.vertex_buffer, 0, &read_range, &s_d3d.vb_mapped);
             s_d3d.vb_view.BufferLocation =
                 s_d3d.vertex_buffer->lpVtbl->GetGPUVirtualAddress(s_d3d.vertex_buffer);
-            s_d3d.vb_view.StrideInBytes = 28;
-            s_d3d.vb_view.SizeInBytes = MAX_VERTICES * 28;
+            s_d3d.vb_view.StrideInBytes = VERTEX_STRIDE;
+            s_d3d.vb_view.SizeInBytes = MAX_VERTICES * VERTEX_STRIDE;
             printf("[D3D12] Vertex buffer created (%u KB)\n",
-                   (MAX_VERTICES * 28) / 1024);
+                   (MAX_VERTICES * VERTEX_STRIDE) / 1024);
         }
     }
 
@@ -596,13 +727,201 @@ static void move_to_next_frame(void)
  * Render a frame (clear + present)
  * -----------------------------------------------------------------------*/
 
+/* Write the mapped readback buffer (R8G8B8A8, row pitch = readback_pitch) out
+ * as a 24-bit bottom-up BMP. Debug-only. */
+static void dump_backbuffer_bmp(void)
+{
+    if (!s_d3d.readback_buf) return;
+    void* mapped = NULL;
+    D3D12_RANGE rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
+    if (FAILED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &rr, &mapped)) || !mapped)
+        return;
+
+    static int idx = 0;
+    char path[300];
+    snprintf(path, sizeof(path),
+             "C:/Users/sewshee/Documents/Dev/ps3/ps3recomp/cellmark/frame_%03d.bmp", idx++);
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        u32 w = s_d3d.width, h = s_d3d.height;
+        u32 padded = (w * 3 + 3) & ~3u;
+        u32 imgsz  = padded * h;
+        u32 filesz = 54 + imgsz;
+        unsigned char hdr[54] = {0};
+        hdr[0] = 'B'; hdr[1] = 'M';
+        hdr[2]=filesz&0xFF; hdr[3]=(filesz>>8)&0xFF; hdr[4]=(filesz>>16)&0xFF; hdr[5]=(filesz>>24)&0xFF;
+        hdr[10]=54; hdr[14]=40;
+        hdr[18]=w&0xFF; hdr[19]=(w>>8)&0xFF; hdr[20]=(w>>16)&0xFF; hdr[21]=(w>>24)&0xFF;
+        hdr[22]=h&0xFF; hdr[23]=(h>>8)&0xFF; hdr[24]=(h>>16)&0xFF; hdr[25]=(h>>24)&0xFF;
+        hdr[26]=1; hdr[28]=24;
+        hdr[34]=imgsz&0xFF; hdr[35]=(imgsz>>8)&0xFF; hdr[36]=(imgsz>>16)&0xFF; hdr[37]=(imgsz>>24)&0xFF;
+        fwrite(hdr, 1, 54, f);
+        unsigned char* row = (unsigned char*)malloc(padded);
+        if (row) {
+            memset(row, 0, padded);
+            for (int y = (int)h - 1; y >= 0; y--) {   /* BMP is bottom-up */
+                unsigned char* src = (unsigned char*)mapped + (u32)y * s_d3d.readback_pitch;
+                for (u32 x = 0; x < w; x++) {
+                    row[x*3+0] = src[x*4+2]; /* B */
+                    row[x*3+1] = src[x*4+1]; /* G */
+                    row[x*3+2] = src[x*4+0]; /* R */
+                }
+                fwrite(row, 1, padded, f);
+            }
+            free(row);
+        }
+        fclose(f);
+        printf("[D3D12] dumped %s (%ux%u)\n", path, s_d3d.width, s_d3d.height);
+    }
+    D3D12_RANGE wr = {0, 0};
+    s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr);
+}
+
 static void render_frame(void)
 {
     u32 fi = s_d3d.frame_index;
 
+    { static int rc=0; if (rc<3){ printf("[D3D12] render_frame #%d draws=%u dump_left=%d\n", rc, s_d3d.draw_count, s_d3d.dump_frames_left); rc++; } }
+
+    /* Lazily create the readback buffer the first time a dump is requested. */
+    if (s_d3d.dump_frames_left > 0 && !s_d3d.readback_buf) {
+        s_d3d.readback_pitch = (s_d3d.width * 4 + 255) & ~255u;
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = (u64)s_d3d.readback_pitch * s_d3d.height;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void**)&s_d3d.readback_buf);
+    }
+
     /* Reset command allocator and list */
     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
     s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+
+    /* Upload the bound font atlas once (or after a dims change) into an
+     * R8_UNORM texture and create its SRV. The atlas is a linear 8-bit
+     * coverage map, so a straight row copy (no deswizzle) suffices. */
+    if (s_d3d.tex_bound && !s_d3d.tex_ready && s_d3d.srv_heap && s_d3d.pipeline_state_tex) {
+        extern uint8_t* vm_base;
+        u32 w = s_d3d.tex_w, h = s_d3d.tex_h;
+        u32 pitch = (w + 255) & ~255u;   /* D3D12 requires 256-byte row pitch */
+
+        if (s_d3d.tex_resource) { s_d3d.tex_resource->lpVtbl->Release(s_d3d.tex_resource); s_d3d.tex_resource = NULL; }
+        if (s_d3d.tex_upload)   { s_d3d.tex_upload->lpVtbl->Release(s_d3d.tex_upload);     s_d3d.tex_upload = NULL; }
+
+        D3D12_HEAP_PROPERTIES hp_def = {0}; hp_def.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td = {0};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8_UNORM; td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        HRESULT thr = s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp_def, D3D12_HEAP_FLAG_NONE, &td,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void**)&s_d3d.tex_resource);
+
+        D3D12_HEAP_PROPERTIES hp_up = {0}; hp_up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC ud = {0};
+        ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        ud.Width = (u64)pitch * h; ud.Height = 1; ud.DepthOrArraySize = 1; ud.MipLevels = 1;
+        ud.SampleDesc.Count = 1; ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (SUCCEEDED(thr))
+            thr = s_d3d.device->lpVtbl->CreateCommittedResource(
+                s_d3d.device, &hp_up, D3D12_HEAP_FLAG_NONE, &ud,
+                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                &IID_ID3D12Resource, (void**)&s_d3d.tex_upload);
+
+        if (SUCCEEDED(thr) && vm_base) {
+            void* mapped = NULL;
+            D3D12_RANGE nr = {0, 0};
+            if (SUCCEEDED(s_d3d.tex_upload->lpVtbl->Map(s_d3d.tex_upload, 0, &nr, &mapped)) && mapped) {
+                const u8* srcbase = vm_base + s_d3d.tex_src_offset;
+                for (u32 y = 0; y < h; y++)
+                    memcpy((u8*)mapped + (u64)y * pitch, srcbase + (u64)y * w, w);
+                s_d3d.tex_upload->lpVtbl->Unmap(s_d3d.tex_upload, 0, NULL);
+
+                /* DEBUG: dump the atlas as a grayscale BMP so we can see the
+                 * font bitmap and glyph placement. */
+                {
+                    FILE* af = fopen("C:/Users/sewshee/Documents/Dev/ps3/ps3recomp/cellmark/atlas.bmp", "wb");
+                    if (af) {
+                        u32 padded = (w + 3) & ~3u, imgsz = padded * h;
+                        u32 dataoff = 54 + 1024, filesz = dataoff + imgsz;
+                        unsigned char hh[54] = {0};
+                        hh[0]='B';hh[1]='M';hh[2]=filesz&0xFF;hh[3]=(filesz>>8)&0xFF;hh[4]=(filesz>>16)&0xFF;hh[5]=(filesz>>24)&0xFF;
+                        hh[10]=dataoff&0xFF;hh[11]=(dataoff>>8)&0xFF;hh[14]=40;hh[18]=w&0xFF;hh[19]=(w>>8)&0xFF;hh[20]=(w>>16)&0xFF;hh[21]=(w>>24)&0xFF;
+                        hh[22]=h&0xFF;hh[23]=(h>>8)&0xFF;hh[24]=(h>>16)&0xFF;hh[25]=(h>>24)&0xFF;
+                        hh[26]=1;hh[28]=8;   /* 8-bit paletted */
+                        hh[34]=imgsz&0xFF;hh[35]=(imgsz>>8)&0xFF;hh[36]=(imgsz>>16)&0xFF;hh[37]=(imgsz>>24)&0xFF;
+                        fwrite(hh,1,54,af);
+                        for (int g = 0; g < 256; g++) { unsigned char pe[4]={(unsigned char)g,(unsigned char)g,(unsigned char)g,0}; fwrite(pe,1,4,af); }
+                        unsigned char* rowb=(unsigned char*)malloc(padded); memset(rowb,0,padded);
+                        for (int y=(int)h-1;y>=0;y--){ memcpy(rowb, srcbase+(u64)y*w, w); fwrite(rowb,1,padded,af);}
+                        free(rowb); fclose(af);
+                        printf("[D3D12] atlas dumped to atlas.bmp\n");
+                    }
+                    /* Bounding box of nonzero (glyph) texels in the sampled
+                     * memory, so we know the atlas coordinate space dbgfont
+                     * targets. */
+                    u32 minx=w, maxx=0, miny=h, maxy=0; u64 nz=0;
+                    for (u32 y=0;y<h;y++) for (u32 x=0;x<w;x++) {
+                        if (srcbase[(u64)y*w+x]) { nz++; if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y; }
+                    }
+                    printf("[D3D12] atlas nonzero: %llu texels, x=[%u..%u] y=[%u..%u] (of %ux%u)\n",
+                           (unsigned long long)nz, minx, maxx, miny, maxy, w, h);
+                    /* dbgfont's internal sTexWidth@0x170884 / sTexHeight@0x170886 (BE u16). */
+                    {
+                        u32 stw = (vm_base[0x170884]<<8)|vm_base[0x170885];
+                        u32 sth = (vm_base[0x170886]<<8)|vm_base[0x170887];
+                        printf("[D3D12] dbgfont sTexWidth=%u sTexHeight=%u\n", stw, sth);
+                    }
+                    { extern float g_umin,g_umax,g_vmin,g_vmax; extern int g_uvn;
+                      printf("[D3D12] raw texcoord range (n=%d): U[%.5f..%.5f] V[%.5f..%.5f]\n",
+                             g_uvn, g_umin, g_umax, g_vmin, g_vmax); }
+                }
+
+                D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+                dst.pResource = s_d3d.tex_resource;
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.SubresourceIndex = 0;
+                src.pResource = s_d3d.tex_upload;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint.Offset = 0;
+                src.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8_UNORM;
+                src.PlacedFootprint.Footprint.Width    = w;
+                src.PlacedFootprint.Footprint.Height   = h;
+                src.PlacedFootprint.Footprint.Depth    = 1;
+                src.PlacedFootprint.Footprint.RowPitch = pitch;
+                s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+
+                D3D12_RESOURCE_BARRIER tb = {0};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource   = s_d3d.tex_resource;
+                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &tb);
+
+                D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
+                sv.Format = DXGI_FORMAT_R8_UNORM;
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sv.Texture2D.MipLevels = 1;
+                D3D12_CPU_DESCRIPTOR_HANDLE sh;
+                s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
+                s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.tex_resource, &sv, sh);
+
+                s_d3d.tex_ready = 1;
+                printf("[D3D12] atlas uploaded (%ux%u R8) -> textured\n", w, h);
+            }
+        }
+    }
 
     /* Transition render target to RENDER_TARGET state */
     D3D12_RESOURCE_BARRIER barrier = {0};
@@ -644,6 +963,16 @@ static void render_frame(void)
         s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.root_signature);
         s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &s_d3d.vb_view);
 
+        /* Make the atlas SRV heap current and bind its table (t0) for textured
+         * draws. Safe to set even if no draw is textured. */
+        if (s_d3d.tex_ready && s_d3d.srv_heap) {
+            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
+            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, 1, heaps);
+            D3D12_GPU_DESCRIPTOR_HANDLE gh;
+            s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
+            s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+        }
+
         /* Push the MVP matrix from RSX vertex constants slots 0..3.
          * If the game hasn't written any constants (e.g. placeholder data
          * already in clip space), fall back to identity. */
@@ -676,9 +1005,12 @@ static void render_frame(void)
         for (u32 d = 0; d < draws; d++) {
             const D3D12DrawRecord* dr = &s_d3d.draws[d];
 
-            /* Select PSO based on topology class: */
+            /* Select PSO: textured triangles (dbgfont) use the atlas PSO;
+             * otherwise pick by topology class. */
             ID3D12PipelineState* target_pso = s_d3d.pipeline_state; /* default triangle */
-            if (dr->topology == D3D_TOPOLOGY_POINTLIST) {
+            if (dr->textured && s_d3d.tex_ready && s_d3d.pipeline_state_tex) {
+                target_pso = s_d3d.pipeline_state_tex;
+            } else if (dr->topology == D3D_TOPOLOGY_POINTLIST) {
                 target_pso = s_d3d.pipeline_state_points
                              ? s_d3d.pipeline_state_points : s_d3d.pipeline_state;
             } else if (dr->topology == D3D_TOPOLOGY_LINELIST ||
@@ -694,7 +1026,7 @@ static void render_frame(void)
                 s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, dr->topology);
                 last_topo = dr->topology;
             }
-            u32 start_vert = dr->vb_byte_offset / 28; /* 28 bytes per BasicVertex */
+            u32 start_vert = dr->vb_byte_offset / VERTEX_STRIDE;
             s_d3d.cmd_list->lpVtbl->DrawInstanced(
                 s_d3d.cmd_list, dr->vertex_count, 1, start_vert, 0);
         }
@@ -702,15 +1034,47 @@ static void render_frame(void)
     s_d3d.vb_offset  = 0; /* reset for next frame */
     s_d3d.draw_count = 0;
 
-    /* Transition render target to PRESENT state */
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+    int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf);
+    if (dumping) {
+        /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+        dst.pResource = s_d3d.readback_buf;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = 0;
+        dst.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
+        dst.PlacedFootprint.Footprint.Width    = s_d3d.width;
+        dst.PlacedFootprint.Footprint.Height   = s_d3d.height;
+        dst.PlacedFootprint.Footprint.Depth    = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = s_d3d.readback_pitch;
+        src.pResource = s_d3d.render_targets[fi];
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+    } else {
+        /* Transition render target to PRESENT state */
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+    }
 
     /* Close and execute */
     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
+
+    if (dumping) {
+        wait_for_gpu();            /* ensure the copy finished before mapping */
+        dump_backbuffer_bmp();
+        s_d3d.dump_frames_left--;
+    }
 
     /* Present */
     s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */
@@ -799,99 +1163,124 @@ static void d3d12_set_viewport(void* ud, const rsx_state* state)
     (void)state;
 }
 
-/* Helper: read RSX vertex data from guest memory and convert to our BasicVertex format.
- * Reads position (float3) from attrib 0 and color (float4) from attrib 3.
- * If attribs aren't available, generates placeholder geometry.
- * Returns the actual number of vertices uploaded (may be less than `count`
- * if the per-frame buffer is full). */
-static u32 upload_vertices_from_rsx(u32 first, u32 count)
+/* Our host vertex layout: position (xyz) + color (rgba) + texcoord (uv), 36 bytes. */
+typedef struct { float x, y, z; float r, g, b, a; float u, v; } BasicVertex;
+
+/* Debug: raw texcoord range across a frame, to calibrate the atlas mapping. */
+float g_umin=1e9f, g_umax=-1e9f, g_vmin=1e9f, g_vmax=-1e9f; int g_uvn=0;
+
+/* Read a big-endian 32-bit float from guest memory. */
+static float rd_bef(const u8* src)
+{
+    u32 w;
+    memcpy(&w, src, 4);
+    w = ((w>>24)&0xFF)|((w>>8)&0xFF00)|((w<<8)&0xFF0000)|((w<<24)&0xFF000000);
+    float f; memcpy(&f, &w, 4); return f;
+}
+
+/* Read one RSX vertex (by absolute vertex index) from guest memory into our
+ * host layout. Position is attrib 0 (float3+), color is attrib 3 (ubyte4 or
+ * float4); missing attribs default to opaque white. RSX stores each 32-bit
+ * component big-endian, so every lane is byte-swapped. */
+static void read_rsx_vertex(const rsx_state* state, u32 vindex, BasicVertex* out)
 {
     extern uint8_t* vm_base;
-    typedef struct { float x, y, z; float r, g, b, a; } BasicVertex;
+    extern u32 cellGcmResolveOffset(u32);
+
+    out->x = out->y = out->z = 0.0f;
+    out->r = out->g = out->b = out->a = 1.0f;
+    out->u = out->v = 0.0f;
+    if (!state || !vm_base) return;
+
+    const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
+    if (pos->enabled && pos->type == 2 /* float */ && pos->size >= 2) {
+        u8* src = vm_base + cellGcmResolveOffset(pos->offset + vindex * pos->stride);
+        out->x = rd_bef(src);
+        out->y = rd_bef(src + 4);
+        if (pos->size >= 3) out->z = rd_bef(src + 8);
+
+        /* dbgfont (and similar 2D overlays) store screen positions biased far
+         * outside clip space; their vertex program folds them back to clip
+         * space using transform constants we don't execute. When a position is
+         * well outside NDC, recover the fractional part as a normalized [0,1]
+         * screen coord and map it to NDC (screen Y-down -> clip Y-up). In this
+         * layout the attribute is [posX, posY, U, V] (size 4), so the last two
+         * components are the atlas texcoords, not depth.
+         * TODO: execute the real vertex-program / RSX viewport transform so
+         * this is not needed. */
+        if (out->x > 2.0f || out->x < -2.0f || out->y > 2.0f || out->y < -2.0f) {
+            float sx = out->x - floorf(out->x);
+            float sy = out->y - floorf(out->y);
+            out->x = sx * 2.0f - 1.0f;
+            out->y = 1.0f - sy * 2.0f;
+            out->z = 0.0f;
+            if (pos->size >= 4) {
+                out->u = rd_bef(src + 8);   /* U */
+                out->v = rd_bef(src + 12);  /* V */
+                extern float g_umin,g_umax,g_vmin,g_vmax; extern int g_uvn;
+                if (out->u<g_umin)g_umin=out->u; if (out->u>g_umax)g_umax=out->u;
+                if (out->v<g_vmin)g_vmin=out->v; if (out->v>g_vmax)g_vmax=out->v; g_uvn++;
+            }
+        }
+    }
+
+    const rsx_vertex_attrib* col = &state->vertex_attribs[3];
+    if (col->enabled && col->size >= 3) {
+        u8* src = vm_base + cellGcmResolveOffset(col->offset + vindex * col->stride);
+        if (col->type == 4 /* ubyte */) {
+            out->r = src[0] / 255.0f;
+            out->g = src[1] / 255.0f;
+            out->b = src[2] / 255.0f;
+            out->a = (col->size >= 4) ? src[3] / 255.0f : 1.0f;
+        } else if (col->type == 2 /* float */) {
+            u32 fr, fg, fb, fa;
+            memcpy(&fr, src,     4); fr = ((fr>>24)&0xFF)|((fr>>8)&0xFF00)|((fr<<8)&0xFF0000)|((fr<<24)&0xFF000000);
+            memcpy(&fg, src + 4, 4); fg = ((fg>>24)&0xFF)|((fg>>8)&0xFF00)|((fg<<8)&0xFF0000)|((fg<<24)&0xFF000000);
+            memcpy(&fb, src + 8, 4); fb = ((fb>>24)&0xFF)|((fb>>8)&0xFF00)|((fb<<8)&0xFF0000)|((fb<<24)&0xFF000000);
+            memcpy(&out->r, &fr, 4); memcpy(&out->g, &fg, 4); memcpy(&out->b, &fb, 4);
+            if (col->size >= 4) {
+                memcpy(&fa, src + 12, 4); fa = ((fa>>24)&0xFF)|((fa>>8)&0xFF00)|((fa<<8)&0xFF0000)|((fa<<24)&0xFF000000);
+                memcpy(&out->a, &fa, 4);
+            }
+        }
+    }
+}
+
+/* Upload `count` sequential vertices [first, first+count). Returns the count
+ * actually written (clamped to the remaining per-frame buffer). */
+static u32 upload_vertices_from_rsx(u32 first, u32 count)
+{
     BasicVertex* verts = (BasicVertex*)((u8*)s_d3d.vb_mapped + s_d3d.vb_offset);
-    u32 max_verts = (MAX_VERTICES * 28 - s_d3d.vb_offset) / sizeof(BasicVertex);
+    u32 max_verts = (MAX_VERTICES * VERTEX_STRIDE - s_d3d.vb_offset) / sizeof(BasicVertex);
     if (count > max_verts) count = max_verts;
-
     const rsx_state* state = s_d3d.current_rsx_state;
-    int has_position = 0;
-    int has_color = 0;
-
-    /* Check if position attrib (typically attrib 0) is enabled and is float */
-    if (state) {
-        const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
-        if (pos->enabled && pos->type == 2 /* float */ && pos->size >= 3) {
-            has_position = 1;
-        }
-        /* Color is typically attrib 3 (diffuse) */
-        const rsx_vertex_attrib* col = &state->vertex_attribs[3];
-        if (col->enabled && col->size >= 3) {
-            has_color = 1;
-        }
-    }
-
-    for (u32 i = 0; i < count; i++) {
-        if (has_position && vm_base) {
-            /* Read position from guest memory.
-             * RSX stores vertices in big-endian. For float type, each component
-             * is a 32-bit BE float. We need to byte-swap. */
-            const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
-            u32 addr = pos->offset + (first + i) * pos->stride;
-            if (addr < 0x20000000) { /* sanity check */
-                u8* src = vm_base + addr;
-                /* Byte-swap each float component (BE → LE) */
-                u32 fx, fy, fz;
-                memcpy(&fx, src,     4); fx = ((fx>>24)&0xFF)|((fx>>8)&0xFF00)|((fx<<8)&0xFF0000)|((fx<<24)&0xFF000000);
-                memcpy(&fy, src + 4, 4); fy = ((fy>>24)&0xFF)|((fy>>8)&0xFF00)|((fy<<8)&0xFF0000)|((fy<<24)&0xFF000000);
-                memcpy(&fz, src + 8, 4); fz = ((fz>>24)&0xFF)|((fz>>8)&0xFF00)|((fz<<8)&0xFF0000)|((fz<<24)&0xFF000000);
-                memcpy(&verts[i].x, &fx, 4);
-                memcpy(&verts[i].y, &fy, 4);
-                memcpy(&verts[i].z, &fz, 4);
-            } else {
-                verts[i].x = verts[i].y = verts[i].z = 0.0f;
-            }
-        } else {
-            /* Placeholder: distribute vertices in a circle */
-            float t = (float)(first + i) / 100.0f;
-            verts[i].x = sinf(t * 6.28f) * 0.5f;
-            verts[i].y = cosf(t * 6.28f) * 0.5f;
-            verts[i].z = 0.0f;
-        }
-
-        if (has_color && vm_base) {
-            const rsx_vertex_attrib* col = &state->vertex_attribs[3];
-            u32 addr = col->offset + (first + i) * col->stride;
-            if (addr < 0x20000000 && col->type == 4 /* ubyte */) {
-                u8* src = vm_base + addr;
-                /* RGBA bytes, normalized to 0-1 */
-                verts[i].r = src[0] / 255.0f;
-                verts[i].g = src[1] / 255.0f;
-                verts[i].b = src[2] / 255.0f;
-                verts[i].a = (col->size >= 4) ? src[3] / 255.0f : 1.0f;
-            } else if (addr < 0x20000000 && col->type == 2 /* float */) {
-                u8* src = vm_base + addr;
-                u32 fr, fg, fb, fa;
-                memcpy(&fr, src,     4); fr = ((fr>>24)&0xFF)|((fr>>8)&0xFF00)|((fr<<8)&0xFF0000)|((fr<<24)&0xFF000000);
-                memcpy(&fg, src + 4, 4); fg = ((fg>>24)&0xFF)|((fg>>8)&0xFF00)|((fg<<8)&0xFF0000)|((fg<<24)&0xFF000000);
-                memcpy(&fb, src + 8, 4); fb = ((fb>>24)&0xFF)|((fb>>8)&0xFF00)|((fb<<8)&0xFF0000)|((fb<<24)&0xFF000000);
-                memcpy(&verts[i].r, &fr, 4);
-                memcpy(&verts[i].g, &fg, 4);
-                memcpy(&verts[i].b, &fb, 4);
-                if (col->size >= 4) {
-                    memcpy(&fa, src + 12, 4); fa = ((fa>>24)&0xFF)|((fa>>8)&0xFF00)|((fa<<8)&0xFF0000)|((fa<<24)&0xFF000000);
-                    memcpy(&verts[i].a, &fa, 4);
-                } else {
-                    verts[i].a = 1.0f;
-                }
-            } else {
-                verts[i].r = 1.0f; verts[i].g = 1.0f; verts[i].b = 1.0f; verts[i].a = 1.0f;
-            }
-        } else {
-            /* Default white */
-            verts[i].r = 1.0f; verts[i].g = 1.0f; verts[i].b = 1.0f; verts[i].a = 1.0f;
-        }
-    }
+    for (u32 i = 0; i < count; i++)
+        read_rsx_vertex(state, first + i, &verts[i]);
     s_d3d.vb_offset += count * sizeof(BasicVertex);
     return count;
+}
+
+/* Upload RSX QUADS (prim 8) as a triangle list: each 4-vertex quad v0..v3
+ * (perimeter winding) splits into triangles (v0,v1,v2) and (v0,v2,v3).
+ * D3D12 has no quad topology, so this expansion is how quads render at all.
+ * Returns the number of triangle-list vertices emitted (6 per quad). */
+static u32 upload_quads_from_rsx(u32 first, u32 count)
+{
+    const rsx_state* state = s_d3d.current_rsx_state;
+    u32 quads = count / 4;
+    u32 max_verts = (MAX_VERTICES * VERTEX_STRIDE - s_d3d.vb_offset) / sizeof(BasicVertex);
+    if (quads * 6 > max_verts) quads = max_verts / 6;
+    BasicVertex* verts = (BasicVertex*)((u8*)s_d3d.vb_mapped + s_d3d.vb_offset);
+    u32 o = 0;
+    for (u32 q = 0; q < quads; q++) {
+        BasicVertex c[4];
+        for (u32 k = 0; k < 4; k++)
+            read_rsx_vertex(state, first + q * 4 + k, &c[k]);
+        verts[o++] = c[0]; verts[o++] = c[1]; verts[o++] = c[2];
+        verts[o++] = c[0]; verts[o++] = c[2]; verts[o++] = c[3];
+    }
+    s_d3d.vb_offset += o * sizeof(BasicVertex);
+    return o;
 }
 
 static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
@@ -914,13 +1303,21 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     static int s_dumped = 0;
     if (!s_dumped && s_d3d.current_rsx_state) {
         extern uint8_t* vm_base;
+    extern u32 cellGcmResolveOffset(u32);
         s_dumped = 1;
         const rsx_state* st = s_d3d.current_rsx_state;
-        printf("[D3D12-DUMP] vertex_constants slots 0..7:\n");
-        for (u32 i = 0; i < 8; i++) {
-            printf("  [%u] = (% .4f, % .4f, % .4f, % .4f)\n", i,
-                   st->vertex_constants[i][0], st->vertex_constants[i][1],
-                   st->vertex_constants[i][2], st->vertex_constants[i][3]);
+        printf("[D3D12-DUMP] nonzero vertex_constants:\n");
+        for (u32 i = 0; i < RSX_MAX_VERTEX_CONSTANTS; i++) {
+            float* c = st->vertex_constants[i];
+            if (c[0]||c[1]||c[2]||c[3])
+                printf("  c[%u] = (% .5f, % .5f, % .5f, % .5f)\n", i, c[0], c[1], c[2], c[3]);
+        }
+        {
+            extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+            static char hlsl[64*1024];
+            int ni = rsx_vp_decompile(st->vp_ucode, st->vp_ucode_bytes, hlsl, sizeof hlsl);
+            printf("[VP] ucode_bytes=%u instrs=%d\n=== VP-HLSL BEGIN ===\n%s\n=== VP-HLSL END ===\n",
+                   st->vp_ucode_bytes, ni, hlsl);
         }
         printf("[D3D12-DUMP] vc dirty=%d range=[%u..%u]\n",
                st->vertex_constants_dirty,
@@ -928,30 +1325,51 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         printf("[D3D12-DUMP] viewport=%ux%u clip=%ux%u\n",
                st->viewport_w, st->viewport_h,
                st->surface_clip_w, st->surface_clip_h);
+        for (u32 ai = 0; ai < RSX_MAX_VERTEX_ATTRIBS; ai++) {
+            const rsx_vertex_attrib* a = &st->vertex_attribs[ai];
+            if (a->enabled)
+                printf("[D3D12-DUMP] attrib%u: type=%u size=%u stride=%u offset=0x%08X\n",
+                       ai, a->type, a->size, a->stride, a->offset);
+        }
         const rsx_vertex_attrib* pos = &st->vertex_attribs[0];
-        printf("[D3D12-DUMP] attrib0: enabled=%d type=%u size=%u stride=%u offset=0x%08X\n",
-               pos->enabled, pos->type, pos->size, pos->stride, pos->offset);
         if (pos->enabled && pos->type == 2 && vm_base) {
             for (u32 v = 0; v < (count < 4 ? count : 4); v++) {
-                u32 addr = pos->offset + (first + v) * pos->stride;
-                if (addr >= 0x20000000) break;
+                u32 addr = cellGcmResolveOffset(pos->offset + (first + v) * pos->stride);
                 u8* src = vm_base + addr;
-                u32 fx, fy, fz;
-                memcpy(&fx, src,     4); fx = ((fx>>24)&0xFF)|((fx>>8)&0xFF00)|((fx<<8)&0xFF0000)|((fx<<24)&0xFF000000);
-                memcpy(&fy, src + 4, 4); fy = ((fy>>24)&0xFF)|((fy>>8)&0xFF00)|((fy<<8)&0xFF0000)|((fy<<24)&0xFF000000);
-                memcpy(&fz, src + 8, 4); fz = ((fz>>24)&0xFF)|((fz>>8)&0xFF00)|((fz<<8)&0xFF0000)|((fz<<24)&0xFF000000);
-                float x, y, z;
-                memcpy(&x, &fx, 4); memcpy(&y, &fy, 4); memcpy(&z, &fz, 4);
-                printf("[D3D12-DUMP] v[%u] pos=(% .4f, % .4f, % .4f)\n", v, x, y, z);
+                u32 bw[4]; float ff[4];
+                for (int k = 0; k < 4; k++) {
+                    memcpy(&bw[k], src + k*4, 4);
+                    bw[k] = ((bw[k]>>24)&0xFF)|((bw[k]>>8)&0xFF00)|((bw[k]<<8)&0xFF0000)|((bw[k]<<24)&0xFF000000);
+                    memcpy(&ff[k], &bw[k], 4);
+                }
+                printf("[D3D12-DUMP] v[%u] f0..3 = (% .5f, % .5f, % .5f, % .5f)\n", v, ff[0], ff[1], ff[2], ff[3]);
             }
         }
     }
 
+    /* QUADS (prim 8) have no D3D12 topology; expand to a triangle list.
+     * dbgfont draws all text as quads, so without this nothing renders. */
+    if (primitive == 8 /* CELL_GCM_PRIMITIVE_QUADS */) {
+        u32 record_offset = s_d3d.vb_offset;
+        u32 emitted = upload_quads_from_rsx(first, count);
+        if (emitted == 0) return;
+        if (s_d3d.draw_count < MAX_DRAWS) {
+            s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
+            s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
+            s_d3d.draws[s_d3d.draw_count].topology       = D3D_TOPOLOGY_TRIANGLELIST;
+            /* Candidate for texturing if an atlas was bound; the actual upload
+             * completes at the top of render_frame, so the final textured
+             * decision (needs tex_ready) is made there. */
+            s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
+            s_d3d.draw_count++;
+        }
+        return;
+    }
+
     u32 topo = rsx_to_d3d12_topology(primitive);
     if (topo == D3D_TOPOLOGY_UNDEFINED) {
-        /* Skip primitives that still need index-buffer conversion
-         * (quads, line loops, triangle fans) rather than silently
-         * rendering them as the wrong shape. */
+        /* Other primitives still needing index-buffer conversion
+         * (line loops, triangle fans) — skip rather than draw wrong. */
         static int s_skipped_nontri = 0;
         if (s_skipped_nontri < 3) {
             printf("[D3D12] draw_arrays: skipping prim=%u (needs index conversion)\n",
@@ -969,6 +1387,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
         s_d3d.draws[s_d3d.draw_count].vertex_count   = actual_count;
         s_d3d.draws[s_d3d.draw_count].topology       = topo;
+        s_d3d.draws[s_d3d.draw_count].textured       = 0;
         s_d3d.draw_count++;
     }
 }
@@ -989,6 +1408,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
 {
     (void)ud;
     extern uint8_t* vm_base;
+    extern u32 cellGcmResolveOffset(u32);
 
     u32 width  = (tex->image_rect >> 16) & 0xFFFF;
     u32 height = tex->image_rect & 0xFFFF;
@@ -1002,46 +1422,26 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         log_count++;
     }
 
-    /* Texture upload is complex and requires:
-     * 1. Matching DXGI format from RSX format
-     * 2. Creating a texture resource in DEFAULT heap
-     * 3. Creating an upload buffer in UPLOAD heap
-     * 4. Copying pixel data from guest memory (with potential deswizzle)
-     * 5. Recording CopyTextureRegion into the command list
-     * 6. Creating a SRV descriptor
-     * 7. Binding to the shader
-     *
-     * For now we log the texture parameters. The infrastructure is ready:
-     * - rsx_texture_formats.h provides format mapping
-     * - rsx_to_dxgi_texture_format() converts RSX → DXGI
-     * - Guest memory is accessible via vm_base + offset
-     *
-     * Full implementation requires:
-     * - A texture cache (avoid re-uploading unchanged textures)
-     * - A SRV descriptor heap (CBV_SRV_UAV type)
-     * - Root signature update to include SRV table
-     * - A textured PSO (with sampler state)
-     */
-
-    /* Validate that we CAN read this texture */
     if (!vm_base || width == 0 || height == 0) return;
-    if (offset >= 0x20000000) return; /* out of range */
 
-    /* Log format details for debugging */
-    static int detail_log = 0;
-    if (detail_log < 5) {
-        const char* fmt_name = "unknown";
-        switch (format) {
-        case 0x85: fmt_name = "A8R8G8B8"; break;
-        case 0x84: fmt_name = "R5G6B5"; break;
-        case 0x86: fmt_name = "DXT1"; break;
-        case 0x88: fmt_name = "DXT5"; break;
-        case 0x81: fmt_name = "B8"; break;
-        case 0x9E: fmt_name = "D8R8G8B8"; break;
+    /* Record the currently-bound atlas so subsequent quad draws sample it. The
+     * actual GPU upload happens in render_frame (we have no open command list
+     * here). Only the 8-bit single-channel font atlas (B8, RSX fmt base 0x81 /
+     * as-seen 0xA1 with the LN flag) is wired up so far; other formats fall
+     * back to untextured. */
+    u32 base_fmt = format & 0x9F;   /* strip LN(0x20)/UN(0x40) flags */
+    if (base_fmt == 0x81 /* B8 */) {
+        s_d3d.tex_src_offset = cellGcmResolveOffset(offset);
+        if (s_d3d.tex_w != width || s_d3d.tex_h != height) {
+            /* dims changed -> resource must be (re)created in render_frame */
+            s_d3d.tex_ready = 0;
         }
-        printf("[D3D12]   texture: %s (%ux%u) at guest 0x%08X\n",
-               fmt_name, width, height, offset);
-        detail_log++;
+        s_d3d.tex_w     = width;
+        s_d3d.tex_h     = height;
+        s_d3d.tex_bound = 1;
+        s_d3d.tex_dirty = 1;
+    } else {
+        s_d3d.tex_bound = 0;
     }
 }
 
@@ -1136,6 +1536,9 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     s_d3d.clear_color[1] = 0.0f;
     s_d3d.clear_color[2] = 0.1f;
     s_d3d.clear_color[3] = 1.0f;
+
+    /* Debug: dump the first N presented frames to BMP if CELLMARK_DUMP is set. */
+    s_d3d.dump_frames_left = getenv("CELLMARK_DUMP") ? 24 : 0;
 
     /* Create window */
     s_d3d.hwnd = create_window(width, height, title);
