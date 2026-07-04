@@ -537,6 +537,22 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     ctx.gpr[1] = stack_top;   /* stack pointer */
     ctx.gpr[2] = toc;         /* TOC base (r2) */
 
+    /* PS3 process-entry ABI: the loader hands _start register state the CRT
+     * (_initialize) consumes directly:
+     *   r7..r10 = TLS descriptor (thread_id, seg vaddr, seg filesz, memsz),
+     *             forwarded to sys_initialize_tls;
+     *   r12     = the lv2 page size (1 MB), stored to the global lv2_page_size
+     *             and used as the malloc granularity. Without it the SDK heap
+     *             (dinkum malloc) has granularity 0 and every allocation fails
+     *             (observed: cellmark's memalign returns NULL, no sys_memory
+     *             call is ever made). Values come from the ELF PT_TLS captured
+     *             by ppu_load_elf. */
+    ctx.gpr[7]  = 1;               /* main thread id */
+    ctx.gpr[8]  = g_tls_vaddr;     /* TLS segment vaddr  */
+    ctx.gpr[9]  = g_tls_filesz;    /* TLS segment filesz */
+    ctx.gpr[10] = g_tls_memsz;     /* TLS segment memsz  */
+    ctx.gpr[12] = 0x100000;        /* lv2 page size (1 MB) -> malloc granularity */
+
     /* Main-thread TLS: copy the PT_TLS template into the TLS image (zeroing the
      * BSS tail) and point r13 at TP. The CRT accesses thread-locals relative to
      * r13; without this they hit address ~0 and corrupt the boot. */
