@@ -165,11 +165,15 @@ extern "C" __declspec(thread) ppu_context* g_active_ctx = nullptr;
 
 /* ---------------------------------------------------------------------------
  * Function registry: guest code address -> lifted host function.
- * Open-addressing hash (load factor kept low); 14k+ functions in a real EBOOT.
+ * Open-addressing hash (load factor kept low). Large retail titles exceed 64k
+ * lifted functions (Minecraft 37k, LittleBigPlanet 68k), so the table MUST be
+ * larger than any title's function count or the insert probe below never finds
+ * a free slot and spins forever at startup. 2^18 = 262144 slots keeps a 68k
+ * image at ~26% load with headroom to ~190k functions at 75%.
  * -----------------------------------------------------------------------*/
 typedef void (*ppu_fn)(ppu_context*);
 
-#define PPU_HASH_BITS 16
+#define PPU_HASH_BITS 18
 #define PPU_HASH_SIZE (1u << PPU_HASH_BITS)
 #define PPU_HASH_MASK (PPU_HASH_SIZE - 1)
 
@@ -181,11 +185,17 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
 {
     uint32_t a = (uint32_t)addr;
     uint32_t i = (a * 2654435761u) & PPU_HASH_MASK;
-    for (;;) {
+    /* Bounded probe: never loop past the whole table. A full table (function
+     * count >= PPU_HASH_SIZE) would otherwise spin forever here at startup. */
+    for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
         if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; return; }
         if (g_addr[i] == a) { g_fn[i] = fn; return; }   /* overwrite */
         i = (i + 1) & PPU_HASH_MASK;
     }
+    static int warned = 0;
+    if (warned++ < 4)
+        fprintf(stderr, "[ppu] function table full (%u/%u) -- raise PPU_HASH_BITS; "
+                "0x%08X dropped\n", g_fn_count, (unsigned)PPU_HASH_SIZE, a);
 }
 
 static ppu_fn ppu_lookup(uint32_t a)
