@@ -156,6 +156,14 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
 #define GCM_LABEL_STRIDE      0x10u
 static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
 
+/* GCM control register (put/get/ref). This MUST live in guest memory: the title
+ * takes the pointer from cellGcmGetControlRegister, writes `put` when it kicks
+ * the FIFO, and spins reading `get`/`ref` to know the RSX has caught up. A host
+ * pointer would be read through vm_base as a guest address and never update, so
+ * every FIFO-space / cellGcmFinish wait would hang. Placed just past the 256
+ * label slots (0x03000000..0x03001000). Fields are big-endian (vm_write32). */
+#define GCM_CONTROL_GUEST_ADDR 0x03002000u
+
 /* ---------------------------------------------------------------------------
  * Internal helpers
  * -----------------------------------------------------------------------*/
@@ -300,6 +308,11 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
         s_io_mapping_count = 1;
     }
 
+    /* Zero the guest-visible control register (put/get/ref). */
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, 0);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, 0);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, 0);
+
     s_gcm_initialized = 1;
     return CELL_OK;
 }
@@ -356,7 +369,10 @@ s32 cellGcmGetConfiguration(CellGcmConfig* config)
 /* NID: 0x8572A8E0 */
 CellGcmControl* cellGcmGetControlRegister(void)
 {
-    return &s_control;
+    /* Return the GUEST address of the control register (not &s_control, a host
+     * pointer). The recompiled title reads/writes it through vm_base, so it must
+     * be a guest EA for put/get/ref to actually flow. */
+    return (CellGcmControl*)(uintptr_t)GCM_CONTROL_GUEST_ADDR;
 }
 
 /* ---------------------------------------------------------------------------
@@ -460,6 +476,17 @@ void cellGcm_rsx_process_fifo(void)
 
     rsx_process_command_buffer(&s_state, cmds, words * 4);
     s_get += words * 4;
+
+    /* Report FIFO drain + reference completion back to the guest so its waits
+     * unblock: get catches up to put, and ref reflects the last SET_REFERENCE
+     * the FIFO carried (cellGcmFinish / wait-label spin on this). Guest reads
+     * these big-endian, so mirror with vm_write32. */
+    {
+        extern u32 g_rsx_last_reference;
+        u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, put);                    /* get = put */
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 8, g_rsx_last_reference);   /* ref      */
+    }
 }
 
 /* NID: 0xDC09357E */
@@ -764,6 +791,28 @@ s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea)
     printf("[cellGcmSys] WARNING: IoOffsetToAddress failed for 0x%08X\n", ioOffset);
     vm_write32(ea_ea, 0);
     return CELL_GCM_ERROR_FAILURE;
+}
+
+/* Resolve an RSX FIFO offset (from a vertex-array / texture / surface method)
+ * to a guest effective address the backend can read via vm_base + addr.
+ *
+ * An RSX offset refers to either IO-mapped *main* memory or *local* video
+ * memory, distinguished on hardware by a per-object location bit that the
+ * command stream no longer carries by the time the backend sees it. Resolve by
+ * table: if the offset's 1MB page is IO-mapped, it's main memory; otherwise it
+ * is local video memory (localAddress + offset). IO mappings are sparse (the
+ * command/IO window is a few MB) while local objects sit high in the local
+ * heap, so this disambiguates every real case — only offsets inside the small
+ * IO window are treated as main. */
+u32 cellGcmResolveOffset(u32 offset)
+{
+    u32 page = offset >> 20;
+    if (page < 65536) {
+        u16 ea_page = s_ea_address_table[page];
+        if (ea_page != 0 && ea_page != 0xFFFF)
+            return ((u32)ea_page << 20) | (offset & 0xFFFFF);
+    }
+    return s_config.localAddress + offset;
 }
 
 /* ---------------------------------------------------------------------------

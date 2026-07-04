@@ -24,6 +24,12 @@
 
 static rsx_backend* s_backend = NULL;
 
+/* Last NV406E_SET_REFERENCE value seen in the FIFO. The title writes a
+ * reference then spins on the GCM control register's `ref` field until the RSX
+ * reports it as reached; cellGcmSys mirrors this into the guest control
+ * register after each drain so those waits (cellGcmFinish / wait-label) unblock. */
+u32 g_rsx_last_reference = 0;
+
 void rsx_set_backend(rsx_backend* backend)
 {
     s_backend = backend;
@@ -432,9 +438,30 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_SET_TRANSFORM_PROGRAM_LOAD) {
-        /* Vertex program load slot — index into vertex program instruction memory */
+        /* Vertex program load slot — instruction index (each = 16 bytes).
+         * Following NV4097_SET_TRANSFORM_PROGRAM words fill from here. */
         state->transform_program_load = data;
+        state->vp_ucode_write = data * 16;
         state->shader_dirty = 1;
+        return 0;
+    }
+
+    /* NV4097_SET_TRANSFORM_PROGRAM[0..31] — a run of 32-bit vertex-program
+     * microcode words appended at the current write cursor. Capture them so the
+     * backend can decompile the real VP (4 words = one NV40 instruction). */
+    if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
+        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
+        u32 w = state->vp_ucode_write;
+        if (w + 4 <= sizeof(state->vp_ucode)) {
+            /* data is host-endian already; store as little-endian bytes. */
+            state->vp_ucode[w+0] = (u8)(data);
+            state->vp_ucode[w+1] = (u8)(data >> 8);
+            state->vp_ucode[w+2] = (u8)(data >> 16);
+            state->vp_ucode[w+3] = (u8)(data >> 24);
+            state->vp_ucode_write = w + 4;
+            if (w + 4 > state->vp_ucode_bytes) state->vp_ucode_bytes = w + 4;
+            state->vp_dirty = 1;
+        }
         return 0;
     }
     if (method == NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) {
@@ -557,6 +584,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_SET_SCISSOR_VERTICAL) {
         state->scissor_y = data & 0xFFFF;
         state->scissor_h = (data >> 16) & 0xFFFF;
+        return 0;
+    }
+
+    /* NV406E_SET_REFERENCE (0x0050): the title writes a reference value it then
+     * spins on (cellGcmFinish / cellGcmSetWaitLabel). Record the latest so the
+     * GCM control register can report completion back to the guest and unblock
+     * the spin. Class 0 (software) method, no subchannel state needed here. */
+    if (method == 0x0050) {
+        g_rsx_last_reference = data;
         return 0;
     }
 
