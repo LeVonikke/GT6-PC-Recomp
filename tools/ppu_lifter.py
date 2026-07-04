@@ -321,6 +321,36 @@ class PPULifter:
         # (ppu_context, func_entry) stay unprefixed — integration TUs declare
         # the prefixed table extern manually rather than including two headers.
         self.prefix = prefix
+        # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
+        # the instruction-list identity so the FULL list (mid-function / serial
+        # lift) is sorted+indexed once, not rescanned per call.
+        self._range_cache: tuple | None = None
+
+    def _range_insns(self, instructions: list["Instruction"],
+                     start: int, end: int) -> list["Instruction"]:
+        """Instructions whose addr is in [start, end), via a cached sorted index.
+
+        lift_function is called once per target; the mid-function tail-entry
+        pass runs it over the FULL instruction list. A linear [start, end)
+        filter there is O(N) per call -> O(refs * N) overall, which on a large
+        title (Minecraft: ~3M insns, thousands of mid-function refs) is tens of
+        billions of Python ops -- the pass never completes in practice. Cache a
+        sorted (addr -> instruction) index per instruction-list identity and
+        binary-search the sub-range instead: O(N log N) once, O(log N + span)
+        per call. Small per-function lists (worker path) just re-sort cheaply.
+        """
+        import bisect
+        cache = self._range_cache
+        if (cache is None or cache[0] is not instructions
+                or cache[1] != len(instructions)):
+            ordered = sorted(instructions, key=lambda ins: ins.addr)
+            addrs = [ins.addr for ins in ordered]
+            self._range_cache = (instructions, len(instructions), ordered, addrs)
+        else:
+            ordered, addrs = cache[2], cache[3]
+        lo = bisect.bisect_left(addrs, start)
+        hi = bisect.bisect_left(addrs, end)
+        return ordered[lo:hi]
 
     def lift_function(self, instructions: list[Instruction],
                       start: int, end: int) -> LiftedFunction:
@@ -339,11 +369,13 @@ class PPULifter:
             self.functions.append(func)
             return func
 
+        # Instructions in [start, end), located via a cached sorted index so
+        # this is O(log N + span) rather than a full O(N) scan per call.
+        range_insns = self._range_insns(instructions, start, end)
+
         # Collect branch targets within the function for labels
         internal_targets: set[int] = set()
-        for insn in instructions:
-            if insn.addr < start or insn.addr >= end:
-                continue
+        for insn in range_insns:
             if insn.mnemonic.startswith("b") and insn.mnemonic not in (
                     "blr", "bctr", "bctrl", "bl", "blrl"):
                 ops = _parse_operands(insn.operands)
@@ -357,10 +389,7 @@ class PPULifter:
                             pass
 
         emitted_labels: set[int] = set()
-        for insn in instructions:
-            if insn.addr < start or insn.addr >= end:
-                continue
-
+        for insn in range_insns:
             # Label
             if insn.addr in internal_targets:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
