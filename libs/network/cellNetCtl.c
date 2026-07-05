@@ -8,6 +8,7 @@
 #include "cellNetCtl.h"
 #include "cellSysutil.h"   /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
+#include "ps3emu/endian.h" /* ps3_bswap32 -- CellNetCtlInfo/NatInfo integer fields are guest big-endian */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -163,7 +164,7 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
     switch (code)
     {
     case CELL_NET_CTL_INFO_DEVICE:
-        info->device = CELL_NET_CTL_DEVICE_WIRED;
+        info->device = ps3_bswap32((u32)CELL_NET_CTL_DEVICE_WIRED);
         break;
 
     case CELL_NET_CTL_INFO_ETHER_ADDR:
@@ -177,15 +178,15 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_MTU:
-        info->mtu = 1500;
+        info->mtu = ps3_bswap32(1500u);
         break;
 
     case CELL_NET_CTL_INFO_LINK:
-        info->link = CELL_NET_CTL_LINK_CONNECTED;
+        info->link = ps3_bswap32((u32)CELL_NET_CTL_LINK_CONNECTED);
         break;
 
     case CELL_NET_CTL_INFO_LINK_TYPE:
-        info->link_type = CELL_NET_CTL_LINK_TYPE_1000BASE_FULL;
+        info->link_type = ps3_bswap32((u32)CELL_NET_CTL_LINK_TYPE_1000BASE_FULL);
         break;
 
     case CELL_NET_CTL_INFO_IP_ADDRESS:
@@ -219,7 +220,7 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_UPNP_CONFIG:
-        info->upnp_config = 1; /* enabled */
+        info->upnp_config = ps3_bswap32(1u); /* enabled */
         break;
 
     default:
@@ -240,8 +241,8 @@ s32 cellNetCtlGetNatInfo(CellNetCtlNatInfo* natInfo)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
     natInfo = GUEST_PTR(natInfo, CellNetCtlNatInfo*);
-    natInfo->size        = sizeof(CellNetCtlNatInfo);
-    natInfo->nat_type    = CELL_NET_CTL_NATINFO_NAT_TYPE_2; /* moderate */
+    natInfo->size        = ps3_bswap32((u32)sizeof(CellNetCtlNatInfo));
+    natInfo->nat_type    = ps3_bswap32((u32)CELL_NET_CTL_NATINFO_NAT_TYPE_2); /* moderate */
     natInfo->stun_status = 0;
     natInfo->upnp_status = 0;
 
