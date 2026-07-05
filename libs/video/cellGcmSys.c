@@ -66,6 +66,19 @@ static u64 get_timestamp_ns(void)
 static int  s_gcm_initialized = 0;
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+
+/* Count of guest flip requests (SetFlipCommand / SetPrepareFlip). The present
+ * loop uses this as the frame boundary: presenting only when a flip arrived
+ * keeps partially-drained frames off screen (the ticker otherwise presents on
+ * a fixed 16ms clock, and a drain that catches the guest mid-frame -- e.g.
+ * while it's blocked in the FIFO-wrap recycle callback -- would show a
+ * clear+few-draws frame as a visible flicker). */
+static volatile u32 s_flip_request_count = 0;
+
+u32 cellGcm_flip_request_count(void)
+{
+    return s_flip_request_count;
+}
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 
 /* Display buffers */
@@ -583,6 +596,7 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke via OPD resolution, not a raw call into guest code. */
@@ -620,6 +634,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     s_current_display_buffer_id = bufferId;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
