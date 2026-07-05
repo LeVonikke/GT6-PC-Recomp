@@ -2448,21 +2448,13 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 break
         if disp is None or not toc:
             continue
+        toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
         # offset table iff an `add rC, *, r_base` combines the loaded value + base
         is_offset = any(
             w.mnemonic == 'add' and
             [x.strip() for x in w.operands.split(',')][0] == rC and
             r_base in [x.strip() for x in w.operands.split(',')][1:]
             for w in win)
-        if base_is_ld:
-            hi = read_u32((toc + disp) & 0xFFFFFFFF)
-            table_base = read_u32((toc + disp + 4) & 0xFFFFFFFF)
-            if hi:                      # table addresses live in the 32-bit VA space
-                table_base = None
-        else:
-            table_base = read_u32((toc + disp) & 0xFFFFFFFF)
-        if table_base is None:
-            continue
         # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
         count = None
         for w in reversed(win):
@@ -2474,22 +2466,43 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 break
         if count is None or count < 0 or count > 4096:
             count = 256
-        targets = []
-        for k in range(count + 1):
-            v = read_u32((table_base + k * 4) & 0xFFFFFFFF)
-            if v is None:
-                break
-            if is_offset:
-                off = v - (1 << 32) if (v & 0x80000000) else v
-                t = (table_base + off) & 0xFFFFFFFF
+
+        # Multi-TOC executables (e.g. LBP: two TOCs, ~3.6k/2.2k functions each)
+        # load the table base relative to WHICHEVER r2 their function runs
+        # with. We don't track per-function TOCs here, so try each candidate
+        # and keep the one whose table decodes to the most in-text case
+        # targets (a wrong TOC reads unrelated data and validates 0 targets).
+        best = []
+        for cand in toc_candidates:
+            if not cand:
+                continue
+            if base_is_ld:
+                hi = read_u32((cand + disp) & 0xFFFFFFFF)
+                table_base = read_u32((cand + disp + 4) & 0xFFFFFFFF)
+                if hi:              # table addresses live in the 32-bit VA space
+                    table_base = None
             else:
-                t = v
-            if text_lo <= t < text_hi and t % 4 == 0:
-                targets.append(t)
-            else:
-                break
-        if targets:
-            tables[all_insns[i].addr] = sorted(set(targets))
+                table_base = read_u32((cand + disp) & 0xFFFFFFFF)
+            if table_base is None:
+                continue
+            targets = []
+            for k in range(count + 1):
+                v = read_u32((table_base + k * 4) & 0xFFFFFFFF)
+                if v is None:
+                    break
+                if is_offset:
+                    off = v - (1 << 32) if (v & 0x80000000) else v
+                    t = (table_base + off) & 0xFFFFFFFF
+                else:
+                    t = v
+                if text_lo <= t < text_hi and t % 4 == 0:
+                    targets.append(t)
+                else:
+                    break
+            if len(targets) > len(best):
+                best = targets
+        if best:
+            tables[all_insns[i].addr] = sorted(set(best))
     return tables
 
 
@@ -2843,7 +2856,29 @@ def main() -> None:
                 if got_addr:
                     toc = (got_addr + 0x8000) & 0xFFFFFFFF
                     print(f"  TOC: entry descriptor bogus, using .got+0x8000 = 0x{toc:X}")
-            tables = discover_jump_tables(all_insns, _read_u32, toc, text_lo, text_hi)
+            # Multi-TOC executables (large Sony-toolchain builds like LBP carry
+            # two or more TOCs): harvest candidates by scanning the data
+            # segments for OPD descriptor pairs {code-in-text, toc} and keeping
+            # frequent toc values. Dispatcher table loads are then tried
+            # against each candidate (see discover_jump_tables).
+            toc_candidates = [toc]
+            from collections import Counter
+            toc_freq = Counter()
+            for v0, v1, d in seg_map:
+                if v0 <= text_lo < v1:      # skip the text segment itself
+                    continue
+                for o in range(0, len(d) - 7, 8):
+                    c = int.from_bytes(d[o:o+4], 'big')
+                    t = int.from_bytes(d[o+4:o+8], 'big')
+                    if text_lo <= c < text_hi and (c & 3) == 0 and \
+                       v0 <= t < v1 and (t & 3) == 0:
+                        toc_freq[t] += 1
+            for t, n in toc_freq.most_common(8):
+                if n >= 64 and t not in toc_candidates:
+                    toc_candidates.append(t)
+            if len(toc_candidates) > 1:
+                print(f"  TOC candidates: {', '.join(hex(t) for t in toc_candidates)}")
+            tables = discover_jump_tables(all_insns, _read_u32, toc_candidates, text_lo, text_hi)
             for ts in tables.values():
                 jt_targets.update(ts)
             import bisect
@@ -2890,6 +2925,14 @@ def main() -> None:
 
     lifter = PPULifter(prefix=args.symbol_prefix)
     lifter.code_hi = args.code_end
+    # Without --code-end, default the executable window to the function-bounds
+    # span so branches into data still get clamped. With no window at all, a
+    # garbage target decoded from data (e.g. dead bytes after a blrl reached by
+    # fallthrough) is emitted as a call to a nonexistent func_XXXXXXXX and the
+    # link fails (LBP: func_FFFFFFEC from a literal pool misread as a bc).
+    if lifter.code_hi is None and func_bounds:
+        lifter.code_lo = min(s for s, _ in func_bounds)
+        lifter.code_hi = max(e for _, e in func_bounds)
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
 
