@@ -179,6 +179,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
 {
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
+    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] mutex_lock(mutex=%u timeout=%llu)\n", mutex_id,(unsigned long long)timeout_us); }
 
     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
