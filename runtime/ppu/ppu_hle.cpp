@@ -20,6 +20,7 @@
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>       /* getenv, atoi (boot trace) */
 
 /* Single flat NID -> handler table (all modules share it; resolution is by
  * NID which is globally unique). Sized for the firmware import surface. */
@@ -74,6 +75,17 @@ extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     g_last_hle_nid = nid;
+
+    /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
+     * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
+    static int s_trace = -2;
+    if (s_trace == -2) { const char* e = getenv("PS3_HLE_TRACE"); s_trace = e ? atoi(e) : 0; }
+    if (s_trace > 0) {
+        s_trace--;
+        fprintf(stderr, "[HLETRACE] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X lr=0x%08X\n",
+                nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                (uint32_t)ctx->gpr[5], (uint32_t)ctx->lr);
+    }
     /* PPC64 ELFv1 cross-module ABI: the caller restores its TOC right after the
      * call with `ld r2, 0x28(r1)`, expecting the import stub to have saved the
      * caller's r2 into that slot. The real .lib.stub trampoline did this; the

@@ -305,6 +305,11 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
 
     s_local_mem_allocated = 0;
     s_io_mapping_count = 0;
+    /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
+     * this every unmapped EA page silently aliased io page 0 (and vice versa),
+     * producing plausible-but-wrong offsets instead of a translation failure. */
+    memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
+    memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
     s_current_display_buffer_id = 0;
     s_flip_handler = NULL;
     s_vblank_handler = NULL;
@@ -353,6 +358,14 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
 {
     if (cmdSize < 0x10000)
         cmdSize = 0x10000;
+
+    /* PSL1GHT's gcmInitBody passes ioAddress = 0, expecting gcm to allocate the
+     * IO region itself (the official SDK has the app allocate and pass it).
+     * Taking the 0 literally put the FIFO command buffer at guest address 0 --
+     * the guest then wrote its command stream over low memory and every offset
+     * resolution failed. Allocate a guest region of ioSize instead. */
+    if (ioAddress == 0 && galloc)
+        ioAddress = galloc(ioSize ? ioSize : 0x100000, 0x100000);
 
     cellGcmInit(cmdSize, ioSize, ioAddress);
 
@@ -492,45 +505,91 @@ void cellGcmTickFlip(void)
  * the recompiled code to update it via vm_write). Once that's fixed (+ the title
  * runs past its early self-exit to actually draw), parse get..put here with
  * rsx_process_command_buffer so the game's clears/draws render. */
+/* Translate an RSX IO offset to a guest EA via the offset table (1MB pages,
+ * populated by cellGcmInit / cellGcmMapMainMemory / MapEaIoAddress). */
+static u32 gcm_io2ea(u32 io)
+{
+    u32 page = io >> 20;
+    if (page >= 65536) return 0;
+    u16 ea_page = s_ea_address_table[page];
+    if (ea_page == 0xFFFF) return 0;
+    return ((u32)ea_page << 20) | (io & 0xFFFFFu);
+}
+
+/* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
+ * recycle path teleports these when it resets a ring without a JUMP command. */
+static u32 s_fifo_getoff  = 0;
+static u32 s_fifo_calloff = 0;
+
 void cellGcm_rsx_process_fifo(void)
 {
     static rsx_state s_state;
     static int  s_inited = 0;
-    static u32  s_get    = 0;     /* guest EA we've drained up to */
+    extern u32 g_rsx_last_reference;
 
     if (!s_gcm_context_ea) return;
-    if (!s_inited) { rsx_state_init(&s_state); s_get = s_config.ioAddress; s_inited = 1; }
+    if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
 
-    /* The title's cellGcm macros write methods to the context's `current` pointer
-     * (context+0x8) and advance it. Read it (vm_read32 byte-swaps BE->host). */
-    u32 current = vm_read32(s_gcm_context_ea + 0x8);
-    if (current < s_get) s_get = s_config.ioAddress;   /* wrapped */
-    g_gcm_fifo_drained_ea = s_get;                      /* publish drain progress */
-    if (current <= s_get) return;                       /* nothing new */
+    /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
+     * offset in the control register), decoding method headers and following
+     * JUMP/CALL/RET control words. The old linear drain copied context->current
+     * onward and treated a JUMP as end-of-buffer -- fine for titles that write
+     * one flat ring (cellmark), but PSL1GHT/Tiny3D immediately JUMPs into its
+     * own command ring, so everything after the jump (including the reference
+     * writes its waits spin on) silently never executed. */
+    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
 
-    u32 words = (current - s_get) / 4;
-    if (words > 0x40000u) words = 0x40000u;             /* cap 1MB/frame */
-
-    /* Byte-swap the BE command words into a host buffer (the parser reads host
-     * endian); vm_read32 does the swap per word. */
-    static u32 cmds[0x40000];
-    for (u32 i = 0; i < words; i++)
-        cmds[i] = vm_read32(s_get + i * 4);
-
-    rsx_process_command_buffer(&s_state, cmds, words * 4);
-    s_get += words * 4;
-    g_gcm_fifo_drained_ea = s_get;
-
-    /* Report FIFO drain + reference completion back to the guest so its waits
-     * unblock: get catches up to put, and ref reflects the last SET_REFERENCE
-     * the FIFO carried (cellGcmFinish / wait-label spin on this). Guest reads
-     * these big-endian, so mirror with vm_write32. */
-    {
-        extern u32 g_rsx_last_reference;
-        u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
-        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, put);                    /* get = put */
-        vm_write32(GCM_CONTROL_GUEST_ADDR + 8, g_rsx_last_reference);   /* ref      */
+    if (getenv("GCM_DRAINDBG")) {
+        static int n = 0;
+        if (n++ % 60 == 0)
+            printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
+                   s_fifo_getoff, put, vm_read32(GCM_CONTROL_GUEST_ADDR + 8),
+                   vm_read32(s_gcm_context_ea + 0x8));
     }
+
+    int budget = 0x100000;                    /* words per tick cap */
+    while (s_fifo_getoff != put && budget-- > 0) {
+        u32 ea = gcm_io2ea(s_fifo_getoff);
+        if (!ea) break;
+        u32 w = vm_read32(ea);
+        u32 type = w >> 29;
+
+        if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+            s_fifo_getoff = w & 0x1FFFFFFCu;
+            continue;
+        }
+        if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+            s_fifo_calloff = s_fifo_getoff + 4;
+            s_fifo_getoff  = w & 0x1FFFFFFCu;
+            continue;
+        }
+        if (w == 0x00020000u) {                /* RET */
+            s_fifo_getoff = s_fifo_calloff;
+            s_fifo_calloff = 0;
+            continue;
+        }
+        if (type == 0 || type == 2) {          /* method (incrementing / NI) */
+            u32 count  = (w >> 18) & 0x7FF;
+            u32 method = w & 0x1FFCu;
+            for (u32 i = 0; i < count; i++) {
+                u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                if (!dea) break;
+                rsx_process_method(&s_state,
+                                   (type == 0) ? method + i * 4 : method,
+                                   vm_read32(dea));
+            }
+            s_fifo_getoff += 4 + count * 4;
+            continue;
+        }
+        s_fifo_getoff += 4;                    /* unknown word: skip */
+    }
+
+    /* Publish progress: get chases put; ref reflects the last SET_REFERENCE
+     * (cellGcmFinish / wait-label spins read these big-endian). The wrap
+     * recycle path also polls the drained EA. */
+    g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, g_rsx_last_reference);       /* ref */
 }
 
 /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
@@ -542,6 +601,15 @@ void cellGcm_rsx_process_fifo(void)
  * pointer-shuffle here (the drain's own wrap-detect handles s_get). Without this
  * the ring never recycles and the whole pipeline wedges once the FIFO wraps
  * (~200 frames at the 256KB default), which looked like a GPU/driver hang. */
+static u32 gcm_ea2io(u32 ea)
+{
+    u32 page = ea >> 20;
+    if (page >= 65536) return 0xFFFFFFFFu;
+    u16 io_page = s_io_address_table[page];
+    if (io_page == 0xFFFF) return 0xFFFFFFFFu;
+    return ((u32)io_page << 20) | (ea & 0xFFFFFu);
+}
+
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
     if (!ctx_ea) return;
@@ -552,16 +620,25 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     if (getenv("CELLMARK_BLINKDBG"))
         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
 
-    /* Wait for the RSX drain to catch up to `current` so no commands are lost.
-     * Bounded (~2s) so a stalled ticker degrades to dropped commands, not a
-     * permanent hang. */
+    /* Do what the SDK's default command-buffer-full callback does: append a
+     * JUMP-to-begin at the write head and move `put` to begin. The FIFO walker
+     * consumes the tail, follows the jump, and idles at begin; then it's safe
+     * for the guest to write from begin (that region was consumed long ago). */
+    u32 io_begin = gcm_ea2io(begin);
+    if (io_begin != 0xFFFFFFFFu) {
+        vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
+    }
+
+    /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
+     * no commands are lost; a stalled ticker degrades to dropped commands. */
     int spins = 0;
-    while (g_gcm_fifo_drained_ea < current && spins < 2000) { Sleep(1); spins++; }
+    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
     if (spins >= 2000) {
         static int warned = 0;
         if (warned++ < 4)
-            printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X current=0x%08X)\n",
-                   g_gcm_fifo_drained_ea, current);
+            printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X)\n",
+                   g_gcm_fifo_drained_ea, begin);
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
@@ -607,6 +684,15 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0);  /* head 0 = primary display */
 
     return CELL_OK;
+}
+
+/* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
+ * gcmSetFlip import (NID 0xDC09357E) lands here; without it vkcube's flip was
+ * a no-op, GetFlipStatus never cleared, and init timed out into exit(-1). */
+s32 cellGcmSetFlip(void* context, u32 bufferId)
+{
+    (void)context;   /* command context — flip is immediate in HLE */
+    return cellGcmSetFlipCommand(bufferId);
 }
 
 /* NID: 0xD01B570F */
@@ -745,6 +831,24 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     if (s_config.ioAddress != 0 && address >= s_config.ioAddress &&
         address < s_config.ioAddress + s_config.ioSize) {
         vm_write32(off_ea, address - s_config.ioAddress);
+        return CELL_OK;
+    }
+
+    /* Auto-map unmapped main memory. On real hardware PSL1GHT pre-maps its
+     * whole RSX heap in gcmInitBody, so its libraries never call MapMainMemory
+     * before handing an EA to the RSX (Tiny3D's command ring lives in an
+     * sys_mmapper region). Mirror that by mapping the 1MB page on first use. */
+    if (address < 0x40000000u) {
+        static u32 s_io_auto_next = 0;
+        if (!s_io_auto_next)
+            s_io_auto_next = (s_config.ioSize + 0xFFFFFu) & ~0xFFFFFu;
+        u32 ea_page = address & ~0xFFFFFu;
+        u32 io      = s_io_auto_next;
+        s_io_auto_next += 0x100000u;
+        populate_offset_table(ea_page, io, 0x100000u);
+        printf("[cellGcmSys] AddressToOffset: auto-mapped ea 0x%08X -> io 0x%08X\n",
+               ea_page, io);
+        vm_write32(off_ea, io | (address & 0xFFFFFu));
         return CELL_OK;
     }
 
@@ -1176,6 +1280,11 @@ void cellGcmTerminate(void)
     s_queue_handler    = NULL;
     s_local_mem_allocated = 0;
     s_io_mapping_count = 0;
+    /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
+     * this every unmapped EA page silently aliased io page 0 (and vice versa),
+     * producing plausible-but-wrong offsets instead of a translation failure. */
+    memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
+    memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
     s_current_display_buffer_id = 0;
     s_last_flip_time = 0;
 }

@@ -1246,11 +1246,18 @@ class PPULifter:
                     f"ctx->gpr[{rd}] = result; }}")
 
         if mn in ("subfe", "subfe."):
+            # rd = ~rA + rB + CA. Carry-out follows the standard x+y+c rule with
+            # x = ~rA: CA = (result < ~rA) || (ca && result == ~rA). The old
+            # `(result <= rB && ca)` could NEVER set carry when ca was 0 --
+            # e.g. subfe with rA=3, rB=7, ca=0 (rB-rA-1, no borrow) must set
+            # CA=1 but produced 0, silently breaking every multi-word borrow
+            # chain (newlib's dtoa bignum loops spin forever on this).
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
-                    f"uint64_t result = ~ctx->gpr[{ra}] + ctx->gpr[{rb}] + ca; "
+                    f"uint64_t na = ~ctx->gpr[{ra}]; "
+                    f"uint64_t result = na + ctx->gpr[{rb}] + ca; "
                     f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
-                    f"((result <= ctx->gpr[{rb}] && ca) ? (1u << 29) : 0); "
+                    f"((result < na || (ca && result == na)) ? (1u << 29) : 0); "
                     f"ctx->gpr[{rd}] = result; }}")
 
         # ------- addc/subfc (carry arithmetic, carry-out only, no carry-in) -------
@@ -1489,17 +1496,25 @@ class PPULifter:
 
         # ------- addme/subfme/subfze (carry arithmetic, 2-op) -------
         if mn.startswith("addme"):
+            # rd = rA + CA - 1 (i.e. rA + 0xFFFF..F + CA). Carry-out iff
+            # rA != 0 or CA (the old `result >= rA` was 0 for every rA>0,ca=0
+            # case, where hardware sets CA=1).
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
-                    f"uint64_t result = ctx->gpr[{ra}] + ca - 1; "
+                    f"uint64_t a = ctx->gpr[{ra}]; "
+                    f"uint64_t result = a + ca - 1; "
                     f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
-                    f"((result >= ctx->gpr[{ra}]) ? (1u << 29) : 0); "
+                    f"((a != 0 || ca) ? (1u << 29) : 0); "
                     f"ctx->gpr[{rd}] = result; }}")
 
         if mn.startswith("subfme"):
+            # rd = ~rA + CA - 1. Carry-out iff ~rA != 0 or CA (was never set).
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
-                    f"uint64_t result = ~ctx->gpr[{ra}] + ca - 1; "
+                    f"uint64_t na = ~ctx->gpr[{ra}]; "
+                    f"uint64_t result = na + ca - 1; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"((na != 0 || ca) ? (1u << 29) : 0); "
                     f"ctx->gpr[{rd}] = result; }}")
 
         if mn.startswith("subfze"):
@@ -2416,13 +2431,19 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # loaded TOC-relative via `lwz base, disp(r2)`. (Hardcoding p[2] as the
         # base silently skipped every dispatcher with the operands swapped.)
         r_val = p[0]
-        disp = None; r_base = None
+        disp = None; r_base = None; base_is_ld = False
         for cand in (p[1], p[2]):
             for w in reversed(win):
-                if w.mnemonic == 'lwz':
+                # gcc (PSL1GHT/newlib) loads the table base with `ld` -- TOC
+                # entries are 64-bit under ELFv1 -- while the SN toolchain uses
+                # `lwz`. Accept both; the 64-bit entry's low word carries the
+                # 32-bit table address (big-endian: at disp+4).
+                if w.mnemonic in ('lwz', 'ld'):
                     a = [x.strip() for x in w.operands.split(',')]
                     if len(a) == 2 and a[0] == cand and '(r2)' in a[1]:
-                        disp = mem_disp(a[1]); r_base = cand; break
+                        disp = mem_disp(a[1]); r_base = cand
+                        base_is_ld = (w.mnemonic == 'ld')
+                        break
             if disp is not None:
                 break
         if disp is None or not toc:
@@ -2433,7 +2454,13 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             [x.strip() for x in w.operands.split(',')][0] == rC and
             r_base in [x.strip() for x in w.operands.split(',')][1:]
             for w in win)
-        table_base = read_u32((toc + disp) & 0xFFFFFFFF)
+        if base_is_ld:
+            hi = read_u32((toc + disp) & 0xFFFFFFFF)
+            table_base = read_u32((toc + disp + 4) & 0xFFFFFFFF)
+            if hi:                      # table addresses live in the 32-bit VA space
+                table_base = None
+        else:
+            table_base = read_u32((toc + disp) & 0xFFFFFFFF)
         if table_base is None:
             continue
         # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
@@ -2800,6 +2827,22 @@ def main() -> None:
             if args.code_end is not None:
                 text_hi = min(text_hi, args.code_end)
             toc = _read_u32((elf.elf_header.e_entry + 4) & 0xFFFFFFFF) or 0
+            # PSL1GHT/GCC ELFs: the entry descriptor's second word is NOT a TOC
+            # (it repeats the code address); the real r2 the crt establishes is
+            # .got + 0x8000 (the ELFv1 TOC bias). Without the right TOC every
+            # `ld rT, disp(r2)` table-base load reads garbage and the jump-table
+            # pass finds nothing (newlib's _vfprintf_r switch then dispatches to
+            # unlifted case addresses at runtime).
+            code = _read_u32(elf.elf_header.e_entry & 0xFFFFFFFF) or 0
+            if toc == code or toc == 0:
+                got_addr = None
+                for sec in getattr(elf, "section_headers", []) or []:
+                    if getattr(sec, "name_str", "") == ".got":
+                        got_addr = sec.sh_addr
+                        break
+                if got_addr:
+                    toc = (got_addr + 0x8000) & 0xFFFFFFFF
+                    print(f"  TOC: entry descriptor bogus, using .got+0x8000 = 0x{toc:X}")
             tables = discover_jump_tables(all_insns, _read_u32, toc, text_lo, text_hi)
             for ts in tables.values():
                 jt_targets.update(ts)
