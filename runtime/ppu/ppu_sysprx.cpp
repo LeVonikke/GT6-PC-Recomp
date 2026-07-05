@@ -226,9 +226,25 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
     ctx->gpr[3] = 0;   /* CELL_OK */
 }
 
+/* FIFO command-buffer-full callback: the title's inline gcmReserve calls
+ * context->callback(context, count) when the ring's `current` nears `end`.
+ * cellGcmSetupContext points that callback OPD at GCM_FIFO_CALLBACK_SENTINEL_EA;
+ * registering that EA here routes the indirect call into the ring recycle so the
+ * FIFO recycles on wrap instead of wedging on a null callback (which deref'd
+ * guest page 0 -> the 0xC708C708 poison vcall).  (via sagemono's fork) */
+#define GCM_FIFO_CALLBACK_SENTINEL_EA 0x03002F00u
+extern "C" void cellGcm_fifo_recycle(unsigned int ctx_ea);
+extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
+static void hle_gcm_callback(ppu_context* ctx)
+{
+    cellGcm_fifo_recycle((unsigned int)ctx->gpr[3]);   /* r3 = context EA */
+    ctx->gpr[3] = 0;                                   /* CELL_OK */
+}
+
 extern "C" void ppu_sysprx_register(void)
 {
     ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
+    ppu_register_function(GCM_FIFO_CALLBACK_SENTINEL_EA, hle_gcm_callback);
     ps3_hle_register_ctx(ps3_compute_nid("sys_initialize_tls"),       "sys_initialize_tls",       sys_initialize_tls);
     ps3_hle_register_ctx(ps3_compute_nid("sys_time_get_system_time"), "sys_time_get_system_time", sys_time_get_system_time);
     ps3_hle_register_ctx(ps3_compute_nid("sys_process_is_stack"),     "sys_process_is_stack",     sys_process_is_stack);
