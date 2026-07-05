@@ -14,6 +14,7 @@
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 extern "C" uint8_t* vm_base;
@@ -147,12 +148,30 @@ static void sys_ppu_thread_get_id(ppu_context* ctx)
 /* sys_mmapper_allocate_memory(u32 size, u64 flags, vm::ptr<u32> mem_id) ->
  * hand back a unique opaque id; the backing is the flat VM, so the later
  * search_and_map just needs a non-zero id to track. */
+static uint32_t s_mmapper_next_id = 0x1000;
 static void sys_mmapper_allocate_memory(ppu_context* ctx)
 {
-    static uint32_t s_next_id = 0x1000;
+    uint32_t size = (uint32_t)ctx->gpr[3];
     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[5];
-    if (mem_id_ptr) vm_write32(mem_id_ptr, s_next_id);
-    s_next_id++;
+    if (getenv("FLOW_MEMTRACE"))
+        fprintf(stderr, "[mmapper] allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+                size, (unsigned long long)ctx->gpr[4], mem_id_ptr, s_mmapper_next_id);
+    if (mem_id_ptr) vm_write32(mem_id_ptr, s_mmapper_next_id);
+    s_mmapper_next_id++;
+    ctx->gpr[3] = 0;
+}
+/* sys_mmapper_allocate_memory_from_container(u32 size, u32 container, u64 flags,
+ * vm::ptr<u32> mem_id) -> id in *r6. flОw's CRT uses this for its heap/mutex pool;
+ * it was previously UNregistered (CRT saw failure -> "not enough memory"). */
+static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
+{
+    uint32_t size = (uint32_t)ctx->gpr[3];
+    uint32_t mem_id_ptr = (uint32_t)ctx->gpr[6];
+    if (getenv("FLOW_MEMTRACE"))
+        fprintf(stderr, "[mmapper] alloc_from_container(size=0x%X cid=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+                size, (uint32_t)ctx->gpr[4], (unsigned long long)ctx->gpr[5], mem_id_ptr, s_mmapper_next_id);
+    if (mem_id_ptr) vm_write32(mem_id_ptr, s_mmapper_next_id);
+    s_mmapper_next_id++;
     ctx->gpr[3] = 0;
 }
 
@@ -237,6 +256,7 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_create"),      "sys_ppu_thread_create",      hle_ppu_thread_create);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_exit"),        "sys_ppu_thread_exit",        hle_ppu_thread_exit);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory"), "sys_mmapper_allocate_memory", sys_mmapper_allocate_memory);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory_from_container"), "sys_mmapper_allocate_memory_from_container", sys_mmapper_allocate_memory_from_container);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_map_memory"),     "sys_mmapper_map_memory",     crt_ok);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_unmap_memory"),   "sys_mmapper_unmap_memory",   crt_ok);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_free_memory"),    "sys_mmapper_free_memory",    crt_ok);

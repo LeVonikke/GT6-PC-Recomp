@@ -75,9 +75,21 @@ static void fs_normalize_sep(char* p) {
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
-    /* Strip leading slash for concatenation */
+    /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
+     * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
+    if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {
+        const char* env = getenv("PS3_VFS_ROOT");
+        if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
+    }
+
+    /* /app_home/ is the game's install dir (== the USRDIR root); the title opens
+     * it in several spellings ("/app_home/...", "app_home/...", "e:/app_home/...").
+     * Map anything from "app_home/" onward to <root>/... directly rather than
+     * appending a literal "app_home" directory that doesn't exist on disk. */
     const char* rel = ps3_path;
-    if (rel[0] == '/') rel++;
+    const char* ah = strstr(ps3_path, "app_home/");
+    if (ah) rel = ah + 9;                 /* everything after "app_home/" */
+    else if (rel[0] == '/') rel++;         /* otherwise just strip leading slash */
 
     snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
     fs_normalize_sep(host_path);
@@ -122,6 +134,29 @@ int64_t sys_fs_open(ppu_context* ctx)
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+
+    { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
+        size_t _l = strlen(ps3_path);
+        fprintf(stderr, "[TITLEOPEN] path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",
+                ps3_path, _l, (_l && ps3_path[_l-1]=='/')?1:0, (uint32_t)ctx->lr); fflush(stderr);
+#ifdef _WIN32
+        { char* mb=(char*)GetModuleHandleA(0); void* bt[30]; unsigned short fr=RtlCaptureStackBackTrace(0,30,bt,0);
+          char ln[820]; int p=snprintf(ln,sizeof ln,"[TITLEOPEN-bt] rva:");
+          for(unsigned short i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
+          fprintf(stderr,"%s\n",ln); fflush(stderr); }
+#endif
+    } }
+    /* DIAGNOSTIC (FLOW_TITLEFIX): the game builds the title path with an EMPTY filename
+     * (a stale-lift string-construction bug) -> opens the dir. Redirect a bare
+     * ".../Data/Titles/" open to the language file so we can confirm the render path. */
+    { extern char* getenv(const char*); if (getenv("FLOW_TITLEFIX")) {
+        size_t hl = strlen(host_path);
+        if (hl >= 8 && (strcmp(host_path + hl - 8, "Titles\\") == 0 || strcmp(host_path + hl - 8, "Titles/") == 0
+                        || strcmp(host_path + hl - 7, "Titles\\") == 0 || strcmp(host_path + hl - 7, "Titles/") == 0)) {
+            if (hl + 20 < sizeof(host_path)) { strcat(host_path, "Titles_English.xml");
+                fprintf(stderr, "[TITLEFIX] redirected empty-filename title open -> %s\n", host_path); fflush(stderr); }
+        }
+    } }
 
     /* Find free fd slot */
     int slot = -1;

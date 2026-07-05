@@ -199,7 +199,9 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
-    fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu)\n", queue_id, (unsigned long long)timeout_us);
+    fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
+            queue_id, (unsigned long long)timeout_us,
+            (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -228,6 +230,68 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    /* YDKJ_SPURS_READY (diagnostic): break the SPURS bring-up deadlock from the
+     * PPU side. cellSpursInitialize blocks forever (timeout=0) on the SPURS event
+     * queues (q=1/q=4) awaiting the kernel/policy "ready" event, while the policy
+     * (now running real code) waits for a workload the PPU only adds AFTER init
+     * returns. Synthesize a ready event so init returns -> see whether the PPU
+     * then reaches CreateTaskset and the running policy dispatches the cri task.
+     * Returns a zero-ish SPU-thread-group event; refine the format if init rejects it. */
+    if (getenv("YDKJ_SPURS_READY") && (queue_id == 1 || queue_id == 4)
+            && timeout_us == 0 && q->count == 0) {
+        static int s_fire[8] = {0};
+        if (s_fire[queue_id] < 64) {
+            s_fire[queue_id]++;
+            if (event_addr != 0) {
+                uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+                /* Match the observed real port_send(port=4) shape: data1=0, data2=1,
+                 * data3=0. source is the port name; use a SPURS-ish tag. Env
+                 * YDKJ_RDY_D2 overrides data2 for quick format experiments. */
+                const char* d2s = getenv("YDKJ_RDY_D2");
+                uint64_t d2 = d2s ? (uint64_t)strtoull(d2s, 0, 0) : 1ULL;
+                out[0] = bswap64(0x0000000000000000ULL); /* source/name */
+                out[1] = 0; out[2] = bswap64(d2); out[3] = 0;
+            }
+            fprintf(stderr, "[ydkj] SPURS_READY: synthesized ready event on q=%u (#%d)\n",
+                    queue_id, s_fire[queue_id]);
+            return CELL_OK;
+        }
+    }
+
+    /* YDKJ_FAKECOMPLETE (diagnostic): the SPURS task-completion events the SPU
+     * would post to q=2/q=3 never arrive (SPU video task not running), so the
+     * main thread times out after 30s and the title tears down. Synthesize a
+     * completion so the wait returns -> see whether the game then advances to
+     * asset load + menu draw (content). Returns immediately with a zero event. */
+    if (getenv("YDKJ_FAKECOMPLETE") && (queue_id == 2 || queue_id == 3) && q->count == 0) {
+        if (event_addr != 0) {
+            uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+            out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+        }
+        return CELL_OK;
+    }
+    /* YDKJ_HLE_DRAW (diagnostic): also unblock the AsyncLoad q=1 wait (timeout=0,
+     * blocks forever) so the loader thread proceeds. Tests whether the game's
+     * render/draw code is reachable once the completion waits are satisfied. */
+    if (getenv("YDKJ_HLE_DRAW") && queue_id == 1 && timeout_us == 0 && q->count == 0) {
+        static int s_n1 = 0;
+        if (s_n1 < 256) { s_n1++;
+            if (event_addr != 0) {
+                uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+                out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+            }
+            return CELL_OK;
+        }
+    }
+
+    /* Diagnostic: dump the guest call chain of a thread about to block on q=1
+     * (the loader/worker) -- identifies WHICH function's receive-loop it's in,
+     * so we can see why it only receives once. Fires a few times. */
+    if (queue_id == 1 && timeout_us == 0) {
+        extern void ppu_dump_guest_stack(ppu_context*, const char*);
+        static int _gs = 0; if (_gs++ < 5) ppu_dump_guest_stack(ctx, "q1-worker");
+    }
+
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 
@@ -235,9 +299,20 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         while (q->count == 0 && q->active) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
         }
+    } else if (timeout_us < 1000) {
+        /* Sub-millisecond timeout = the title's non-blocking event poll (it polls
+         * queues 2 & 3 every frame with a 30us timeout). Windows' ~15.6ms timer
+         * granularity inflates even a 1ms SleepConditionVariableCS to ~15ms, so a
+         * naive floor-to-1ms throttled the game's per-frame poll loop ~500x
+         * (each frame ate ~30ms in two polls). Honor the intent: check once and
+         * return ETIMEDOUT immediately if empty -- same result the game already
+         * handles, just without the bogus 15ms stall. */
+        if (q->count == 0 || !q->active) {
+            LeaveCriticalSection(&q->lock);
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
+        }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        if (ms == 0) ms = 1;
         while (q->count == 0 && q->active) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
@@ -302,6 +377,16 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         out[1] = bswap64(evt.data1);
         out[2] = bswap64(evt.data2);
         out[3] = bswap64(evt.data3);
+    }
+    /* Diagnostic: prove the blocked receiver was WOKEN and is returning an event
+     * (vs. staying blocked forever). Distinguishes a wake bug from game logic. */
+    if (queue_id == 1) {
+        static int _r = 0;
+        if (_r++ < 12)
+            fprintf(stderr, "[evt] q=1 receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
+                    (unsigned long long)ctx->thread_id, (unsigned long long)evt.source,
+                    (unsigned long long)evt.data1, (unsigned long long)evt.data2,
+                    (unsigned long long)evt.data3, q->count);
     }
 
     return CELL_OK;
@@ -577,11 +662,17 @@ int64_t sys_event_port_send(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
-    if (!p->active)
+    if (!p->active) {
+        fprintf(stderr, "[evt] port_send(port=%u): port NOT ACTIVE\n", port_id);
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
-    if (p->connected_queue == 0)
+    if (p->connected_queue == 0) {
+        fprintf(stderr, "[evt] port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
         return (int64_t)(int32_t)CELL_ENOTCONN;
+    }
+    fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
+            port_id, p->connected_queue, (unsigned long long)p->name);
 
     int32_t qidx = p->connected_queue;
     if (qidx <= 0 || qidx > SYS_EVENT_QUEUE_MAX)
@@ -658,6 +749,10 @@ int64_t sys_event_flag_create(ppu_context* ctx)
     if (id_out_addr != 0) {
         write_be32(id_out_addr, flag_id);
     }
+    { char nm[9]; memcpy(nm, f->name, 8); nm[8]=0;
+      for(int i=0;i<8;i++) if(nm[i] && (nm[i]<32||nm[i]>126)) nm[i]='.';
+      fprintf(stderr, "[evt] flag_create id=%u name=\"%s\" init=0x%llX type=%u\n",
+              flag_id, nm, (unsigned long long)init_pattern, f->type); }
 
     evt_table_unlock();
     return CELL_OK;
@@ -716,6 +811,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
     uint32_t mode       = LV2_ARG_U32(ctx, 2);
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
+    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
     { static int _w=0; if (_w++ < 40) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
     /* SPU-completion shim (targeted): the main thread spins in func_003319D0 until
@@ -737,15 +833,54 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         return CELL_OK;
     }
 
-    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
+    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX) {
+        { static int _e=0; if(_e++<8) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
+    /* YDKJ_F100_OK (diagnostic, env-gated): the game busy-spins ~145k times on
+     * event_flag_wait(flag=100 bits=0x2) with a GARBAGE mode (0x38CAE4) on a
+     * NEVER-CREATED flag -> ESRCH each time. Test whether returning CELL_OK
+     * (as if the flag were set) breaks the spin and lets the game progress into
+     * real render code. Diagnostic only; identifies whether the spin is the gate. */
+    { static int s_f = -1; if (s_f < 0) s_f = getenv("YDKJ_F100_OK") ? 1 : 0;
+      if (s_f && !g_sys_event_flags[flag_id-1].active) {
+        static int _n=0; if(_n++<4) fprintf(stderr,"[evt] YDKJ_F100_OK: flag=%u -> return CELL_OK (break spin)\n", flag_id);
+        if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
+        return CELL_OK;
+      } }
     sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
+    if (!f->active) {
+        { static int _e=0; if(_e++<8) {
+            uint32_t r29=(uint32_t)ctx->gpr[29], r30=(uint32_t)ctx->gpr[30], r31=(uint32_t)ctx->gpr[31], r3g=(uint32_t)ctx->gpr[3];
+            fprintf(stderr,"[evt] flag_wait flag=%u NOT ACTIVE -> ESRCH; r3=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", flag_id, r3g, r29, r30, r31);
+            /* dump the loop's likely counter object (r29-relative, like the flag=1000 shim's *(r29)/*(r29+0x24)) */
+            if (r29 && r29 < 0x10000000u) { uint8_t* p=(uint8_t*)vm_to_host(r29);
+              fprintf(stderr,"     [r29+0x00..0x30]:"); for(int i=0;i<0x34;i+=4) fprintf(stderr," %02X%02X%02X%02X",p[i],p[i+1],p[i+2],p[i+3]); fprintf(stderr,"\n"); }
+        } }
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    { static int _a=0; if(_a++<8) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
 
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
+
+    /* YDKJ_FORCE_EVF (diagnostic): the game's init blocks polling event_flag
+     * (flag=100 bits=0x2) for a subsystem/SPU completion that our HLE never fires,
+     * so boot stalls on a black screen. Force-satisfy the wait (set the awaited
+     * bits) to see if the game advances into its real render/content code. Blunt;
+     * identifies the gate. */
+    { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("YDKJ_FORCE_EVF") ? 1 : 0;
+      if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
+        static int _n = 0; if (_n++ < 20)
+            fprintf(stderr, "[evt] YDKJ_FORCE_EVF: force-satisfy flag=%u bits=0x%llX mode=%u\n",
+                    flag_id, (unsigned long long)bitpat, mode);
+#ifdef _WIN32
+        EnterCriticalSection(&f->lock); f->pattern |= bitpat; LeaveCriticalSection(&f->lock);
+#else
+        pthread_mutex_lock(&f->lock); f->pattern |= bitpat; pthread_mutex_unlock(&f->lock);
+#endif
+      } }
 
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
@@ -895,6 +1030,9 @@ int64_t sys_event_flag_set(ppu_context* ctx)
     uint32_t flag_id = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
 
+    { static int _n=0; if(_n++<200) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
+        flag_id,(unsigned long long)bitpat); }
+
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -915,6 +1053,30 @@ int64_t sys_event_flag_set(ppu_context* ctx)
 #endif
 
     return CELL_OK;
+}
+
+/* YDKJ diag (YDKJ_CRI_WAKE): the cri_mpv SPU task completes but the SPU->PPU
+ * completion (cellSpursEventFlagSet) isn't propagated, so the game blocks in
+ * event_flag_wait forever (black screen). As a probe, set all bits on every
+ * active event flag with a waiter -> wake any completion-waiter, to see if the
+ * game then advances to draw content. Blunt; identifies the gate, not a real fix. */
+void ydkj_wake_all_event_flags(void)
+{
+    for (int i = 0; i < SYS_EVENT_FLAG_MAX; i++) {
+        sys_event_flag_info* f = &g_sys_event_flags[i];
+        if (!f->active) continue;
+#ifdef _WIN32
+        EnterCriticalSection(&f->lock);
+        f->pattern |= 0xFFFFFFFFFFFFFFFFull;
+        WakeAllConditionVariable(&f->cv);
+        LeaveCriticalSection(&f->lock);
+#else
+        pthread_mutex_lock(&f->lock);
+        f->pattern |= 0xFFFFFFFFFFFFFFFFull;
+        pthread_cond_broadcast(&f->cv);
+        pthread_mutex_unlock(&f->lock);
+#endif
+    }
 }
 
 int64_t sys_event_flag_clear(ppu_context* ctx)
