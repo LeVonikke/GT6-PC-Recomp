@@ -285,6 +285,7 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 | **flOw** (thatgamecompany) | NPUA80001 | 92K functions, game reaches main() init, module loading + sysutil callbacks working, trampoline system for split-function chains, ~10K TODOs, D3D12 backend ready | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
 | **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 33K functions lifted, CRT init + HLE framework wired, indirect call dispatch | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
 | **The Simpsons Arcade Game** (Konami) | NPUB30563 | 14.7K functions; boots through CRT + GCM init with a live D3D12 window; a Konami arcade *emulator* EBOOT that routes rendering through CRI middleware on SPURS SPU tasks — drove the SPU recompilation work; blocked on the SPU-task pipeline | [sp00nznet/simpsonsarcade-ps3](https://github.com/sp00nznet/simpsonsarcade-ps3) |
+| **You Don't Know Jack** (Jellyvision/THQ) | BLUS30569 | 5,859 functions; **boots the full init stack to its main game loop** and runs a live D3D12 clear+flip at 60 Hz. Scaleform Flash UI + FMOD audio — a menu/UI-heavy title, an ideal recomp target. Frontier: GCM ring-wrap flush callback + a `0xC708C708` scene-dispatch poison gate the first real draws | [sp00nznet/youdontknowjack](https://github.com/sp00nznet/youdontknowjack) |
 
 Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
 
@@ -337,6 +338,22 @@ ps3recomp is built by a growing community. See **[CONTRIBUTORS.md](CONTRIBUTORS.
 for who did what — thank you, everyone.
 
 ## Changelog
+
+### v0.6.5 — *"The Fifteen-Millisecond Tax"* (July 2026)
+*Driving **You Don't Know Jack** (Scaleform UI + FMOD, 5,859 functions) from an instant crash to its running main loop surfaced one global performance bug worth more than any single lift fix — plus a batch of community lifter/HLE correctness PRs.*
+
+**Runtime — the event-poll timer-resolution fix** (`sys_event.c`, `tests/boot_main.cpp`):
+- Titles that poll an event queue every frame with a **sub-millisecond timeout** (YDKJ uses 30 µs) were throttled ~**500× game-wide**. `sys_event_queue_receive` floored the timeout to a 1 ms `SleepConditionVariableCS`, but Windows' default ~15.6 ms timer granularity inflates *any* sub-15 ms wait to a full tick — a two-queue-per-frame poll loop burned ~30 ms/frame doing nothing. Sub-millisecond timeouts now do a true non-blocking check (immediate `ETIMEDOUT` when empty), and the harness calls `timeBeginPeriod(1)`. YDKJ went from ~0.5 fps effective to ~60 Hz, reaching online-init ~6× faster.
+- GCM FIFO drain moved into the 60 Hz vblank tick, so RSX sync-fence labels advance regardless of `present()` latency.
+
+**Community PRs incorporated** — thank you:
+- **cellFs big-endian out-params + `CellFsStat` PS3 packing** — *[@canersaka](https://github.com/canersaka)* (#22)
+- **cellGame reads the real title id from `PARAM.SFO`** — *[@canersaka](https://github.com/canersaka)* (#24)
+- **`sys_rwlock` → `EDEADLK`/`EPERM`** on writer self-relock / bad unlock — *[@canersaka](https://github.com/canersaka)* (#25)
+- **`ppu_disasm`: opcodes 33/225 are `crnor`/`crnand`** (were swapped) — *[@canersaka](https://github.com/canersaka)* (#40)
+- **cellPad DIGITAL2 face-button packing + analog-Y reflect-about-128** — *[@sagemono](https://github.com/sagemono)* (#42)
+
+**You Don't Know Jack port** — now public at [sp00nznet/youdontknowjack](https://github.com/sp00nznet/youdontknowjack): boots the full init stack to its **main game loop** with a live D3D12 clear+flip at 60 Hz. Current frontier: the GCM command buffer's ring-wrap flush callback is `null` and a computed `0xC708C708` poison reaches the scene-graph dispatch — so only black clears render so far.
 
 ### v0.6.4 — *"Carry the One"* (July 2026)
 *A pass of hard-won correctness fixes surfaced by driving flOw (PhyreEngine, ~104k functions) deep into its boot — plus the SPU-side plumbing to get a SPURS taskset actually dispatching. Most of these are silent-corruption bugs: the lift produced valid C for the *wrong* computation, so nothing crashed until a data structure quietly filled with garbage thousands of frames later.*
