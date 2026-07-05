@@ -80,6 +80,15 @@ extern "C" {
  * function and continues execution. Implemented by the SPU program glue. */
 void spu_indirect_branch(spu_context* ctx);
 
+/* stop/stopd hook (YDKJ): the runtime inspects the stop code, may deliver a
+ * stop-and-signal event to the PPU (SPURS bring-up handshake), and longjmps the
+ * host SPU thread back to spu_run_with_halt so the job does not spin past the
+ * stop. Complements ctx->status; harmless where the runtime handles status. */
+void spu_stop(spu_context* ctx);
+/* Lower-level longjmp helper: abort the host SPU thread back to spu_run_with_halt
+ * (used for the infinite no-op self-loop / idle halt idiom). */
+void spu_halt(spu_context* ctx);
+
 /* Channel access -- implemented by the runtime (MFC DMA engine, mailboxes,
  * signal notification, decrementer). See runtime/spu/spu_dma.h. */
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
@@ -179,6 +188,56 @@ _NO_RT_WRITE = {
 }
 
 
+def _bi_target_reg(insn):
+    """Return the branch-target register of a bi/biz/binz/... insn, or None."""
+    ops = _ops(insn.operands)
+    if insn.mnemonic == "bi" and ops:
+        return _reg(ops[0])
+    if insn.mnemonic in ("biz", "binz", "bihz", "bihnz") and len(ops) >= 2:
+        return _reg(ops[1])
+    return None
+
+
+# RRR (4-operand) SPU ops write their destination in bits 21-27; the low 7 bits
+# (raw & 0x7F) are the RC *source* for these. Every other format writes bits 0-6.
+_RRR_DEST_OPS = {"selb", "shufb", "mpya", "fnms", "fma", "fms"}
+
+def _dest_reg(insn) -> int:
+    """The register an instruction writes (rt), accounting for RRR-format ops
+    whose destination is bits 21-27 rather than the low 7 bits."""
+    if insn.mnemonic in _RRR_DEST_OPS:
+        return (insn.raw >> 21) & 0x7F
+    return insn.raw & 0x7F
+
+
+def compute_bi_r0_jumps(insns, bounds) -> set:
+    """`bi $r0` (and conditional `biz/binz $r0`) is normally a function RETURN
+    (r0 = link register). But Sony's SPU code also uses it as a COMPUTED TAIL
+    JUMP after reloading r0 from memory -- e.g. the SPURS taskset launch
+    `lqa $r0, savedContextLr(0x2C80) ... bi $r0` jumps to the task entry
+    (0x3050), NOT back to the caller. Mistranslating that as `return;` makes
+    the launch fall through and the taskset dispatcher loop forever (same bug
+    class as the brsl mislifts). Detect it: within each function, a `bi $r0`
+    is a computed jump iff the NEAREST preceding write to r0 is an ABSOLUTE
+    load (lqa/lqr). A genuine return restores the link via a register/stack
+    load (lqd/lqx) or never rewrites r0 -- those stay returns. Returns the
+    set of such bi addrs."""
+    jumps = set()
+    for (s, e) in bounds:
+        fn = sorted((i for i in insns if s <= i.addr < e), key=lambda x: x.addr)
+        for idx, insn in enumerate(fn):
+            if _bi_target_reg(insn) != "0":
+                continue
+            # backward scan for the nearest instruction that writes r0
+            for j in range(idx - 1, -1, -1):
+                w = fn[j]
+                if w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == 0:
+                    if w.mnemonic in ("lqa", "lqr"):
+                        jumps.add(insn.addr)
+                    break  # nearest r0 writer found; classification decided
+    return jumps
+
+
 class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = ""):
         self.functions: list[LiftedFunction] = []
@@ -190,6 +249,10 @@ class SPULifter:
         # Lets multiple lifted SPU images link into one binary without collisions
         # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
         self.prefix = prefix
+        # Addresses of `bi/biz/... $r0` that are COMPUTED TAIL JUMPS (r0 reloaded
+        # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty
+        # set => every `bi $r0` is a return (the prior behaviour).
+        self.bi_r0_jump: set = set()
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -288,7 +351,7 @@ class SPULifter:
         if mn == "fscrwr":
             return "/* fscrwr: FP status/control write (no-op in recomp) */;"
         if mn == "stop":
-            return "ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
+            return "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;"
 
         # ---- immediate loaders ----
         if mn == "il":
@@ -315,7 +378,7 @@ class SPULifter:
         if mn in ("hgti", "hlgti", "heqi", "hgt", "hlgt", "heq"):
             return f"/* {mn}: halt-on-condition (no-op in recomp) */;"
         if mn == "stopd":
-            return "ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;"
+            return "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;"
 
         # ---- integer arithmetic (register) ----
         rr_bin = {
@@ -331,8 +394,14 @@ class SPULifter:
             "fi": "spu_fi",   # floating interpolate (reciprocal refine)
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
             "fcmeq": "spu_fcmeq", "fcmgt": "spu_fcmgt",
+            # double-precision (2 doubles/reg) + double compares
+            "dfa": "spu_dfa", "dfs": "spu_dfs", "dfm": "spu_dfm",
+            "dfceq": "spu_dfceq", "dfcmeq": "spu_dfcmeq",
+            "dfcgt": "spu_dfcgt", "dfcmgt": "spu_dfcmgt",
+            "mpyhhu": "spu_mpyhhu",
+            "eqv": "spu_eqv", "absdb": "spu_absdb", "avgb": "spu_avgb",
             "cg": "spu_cg", "bg": "spu_bg",
-            "avgb": "spu_avgb",
+            "sumb": "spu_sumb",
             # double precision
             "dfa": "spu_dfa", "dfs": "spu_dfs", "dfm": "spu_dfm",
             # Phase 2: register-variable shifts/rotates
@@ -360,6 +429,7 @@ class SPULifter:
             "gb": "spu_gb", "gbh": "spu_gbh", "gbb": "spu_gbb",
             "fesd": "spu_fesd", "frds": "spu_frds",
             "frsqest": "spu_frsqest", "frest": "spu_frest",
+            "fesd": "spu_fesd", "frds": "spu_frds",   # single<->double convert
             # Phase 3
             "xsbh": "spu_xsbh", "xshw": "spu_xshw", "xswd": "spu_xswd",
             "orx": "spu_orx",
@@ -383,7 +453,8 @@ class SPULifter:
             # Phase 3: halfword/byte immediate logic
             "andhi": "spu_andhi", "andbi": "spu_andbi",
             "orhi":  "spu_orhi",  "orbi":  "spu_orbi",
-            "xorhi": "spu_xorhi",
+            "xorhi": "spu_xorhi", "xorbi": "spu_xorbi",
+            "dftsv": "spu_dftsv",
             # RI8 float<->int conversions with scale (i8 in ops[2])
             "cflts": "spu_cflts", "cfltu": "spu_cfltu",
             "csflt": "spu_csflt", "cuflt": "spu_cuflt",
@@ -431,6 +502,15 @@ class SPULifter:
         # sfx: extended subtract — RT is also a source (carry-in = low bit of old RT).
         if mn == "sfx":
             return f"{g(rt())} = spu_sfx({g(ra())}, {g(rb())}, {g(rt())});"
+        # cgx: extended carry-generate — RT is also a source (carry-in = low bit).
+        if mn == "cgx":
+            return f"{g(rt())} = spu_cgx({g(ra())}, {g(rb())}, {g(rt())});"
+        # double FMA (dfma/dfms/dfnms/dfnma): 3-register, RT is the accumulator (c).
+        if mn in ("dfma", "dfms", "dfnms", "dfnma"):
+            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())}, {g(rt())});"
+        # mpyhha/mpyhhau: high-half multiply accumulated into RT (3-register).
+        if mn in ("mpyhha", "mpyhhau"):
+            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())}, {g(rt())});"
 
         # ---- quadword loads / stores ----
         if mn == "lqd":
@@ -454,7 +534,9 @@ class SPULifter:
         if mn == "rdch":
             return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
         if mn == "rchcnt":
-            return f"{g(rt())} = spu_splat_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
+            # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
+            # (splatting it is the spu_link bug class; RPCS3 = v128::from32r).
+            return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
             return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"
@@ -462,13 +544,39 @@ class SPULifter:
         # ---- branches ----
         if mn in ("br", "bra"):
             tgt = self._branch_target(insn)
+            # SELF-LOOP TRAP: `br .` (target == this instruction) is an infinite
+            # hang on real SPU -- a deliberate trap, no forward progress. Emitting
+            # `goto loc_self` busy-spins the host thread forever; stop the SPU
+            # instead (same halt path the lifter emits for a `stop` instruction).
+            if tgt == addr:
+                return "ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
             return self._uncond_branch(tgt, func)
         if mn in ("brsl", "brasl"):
             # The disassembler drops the link register from brsl operands, so
             # recover it from the raw encoding (rt = bits 25-31 = raw & 0x7F).
             link_rt = insn.raw & 0x7F
             tgt = self._branch_target(insn)
-            link = f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X});"
+            # Link register: preferred word only, other slots ZERO (real HW /
+            # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
+            link = f"{g(link_rt)} = spu_link(0x{addr + 4:X});"
+            # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
+            # infinite loop on real SPU (re-sets the link each pass, never
+            # advances) -- a trap, NOT a call. Emitting a host call recurses
+            # forever -> host stack overflow -> segfault (observed crashing the
+            # boot in cri_audio_00023C58). Set the link, then stop the SPU (same
+            # halt path the lifter emits for a `stop` instruction).
+            if tgt == addr:
+                return f"{link} ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
+            # PC-GETTER IDIOM: `brsl rX, .+4` (target == next instruction) just
+            # loads PC+4 into rX for PC-relative addressing / computed jump tables;
+            # it is NOT a real call. Emitting a host call here imbalances the C
+            # call/return nesting -- the "callee" falls through into the rest of
+            # the function and a later `bi $r0` return unwinds to this brsl's frame
+            # instead of the real caller (observed: SPURS taskset LoadElf's return
+            # landed back inside its own clear loop, running it with a stale count).
+            # Treat it as: set the link, then fall through to addr+4.
+            if tgt == addr + 4:
+                return f"{link} {self._uncond_branch(addr + 4, func)}"
             if tgt is not None:
                 self.call_targets.add(tgt)
                 return f"{link} {self.prefix}spu_func_{tgt:08X}(ctx);"
@@ -488,26 +596,51 @@ class SPULifter:
             tgt_reg = _reg(ops[0])
             # SPU ABI: $r0 is the link register. `bi $r0` is the standard
             # function return — translate to a host return so call/return
-            # discipline matches the C function nesting from brsl.
-            if tgt_reg == "0":
+            # discipline matches the C function nesting from brsl. EXCEPTION:
+            # when r0 was reloaded from memory (lqa/lqr) it is a COMPUTED TAIL
+            # JUMP (e.g. the SPURS task launch `lqa $r0,savedContextLr; bi $r0`),
+            # flagged by compute_bi_r0_jumps() — emit the indirect dispatch.
+            if tgt_reg == "0" and addr not in self.bi_r0_jump:
                 return "return;"
             return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"spu_indirect_branch(ctx); return;")
+        # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
+        if mn == "iret":
+            return ("ctx->pc = ctx->srr0; "
+                    "spu_indirect_branch(ctx); return;")
         if mn in ("bisl",):
             link_rt = insn.raw & 0x7F            # link reg dropped from operands
             tgt_reg = _reg(ops[0])
-            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx);")
+        # bisled: set link, branch to RA only if an external event is pending.
+        if mn in ("bisled",):
+            link_rt = insn.raw & 0x7F
+            tgt_reg = _reg(ops[0])
+            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+                    f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
+                    f"ctx->pc = {g(tgt_reg)}._u32[0]; "
+                    f"spu_indirect_branch(ctx); return; }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
             tgt_reg = _reg(ops[1])
+            # $r0 is the link register: a conditional branch to it is a
+            # conditional function return — emit a host return so it composes
+            # with the brsl->C-call nesting (mirrors the `bi $r0` case above).
+            # Dispatching to the return address would miss the C frame and
+            # land on an unregistered mid-function PC.
+            if tgt_reg == "0" and addr not in self.bi_r0_jump:
+                return f"if ({cond}) return;"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"spu_indirect_branch(ctx); return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop
         if mn in ("hbr", "hbra", "hbrr"):
             return "/* branch hint (ignored) */;"
+        # mtspr: SPU special-purpose-register writes are ignored (RPCS3: SPRs unused)
+        if mn == "mtspr":
+            return "/* mtspr: SPR write ignored */;"
 
         # ---- fallthrough: unsupported ----
         self.unsupported[mn] = self.unsupported.get(mn, 0) + 1
@@ -626,6 +759,11 @@ def main() -> None:
                    help="Prefix for all emitted spu_func_* / spu_recomp_register "
                         "symbols, so multiple lifted SPU images can link into one "
                         "binary without colliding (e.g. flow_spu_00_). Default: none.")
+    p.add_argument("--extra-funcs", default="",
+                   help="Comma-separated extra function entry addresses (e.g. "
+                        "0x10F8,0x808) to add as boundaries -- for indirect-branch "
+                        "targets that --auto-functions can't detect statically. "
+                        "Splits the containing auto-detected function at each addr.")
     args = p.parse_args()
 
     if args.auto_functions:
@@ -654,9 +792,34 @@ def main() -> None:
             # No boundary info: treat the whole image as one function.
             bounds = [(base, base + len(data))]
 
+    # Add extra function entry points (indirect-branch targets auto-detect misses)
+    # by splitting whichever bound contains each address.
+    if args.extra_funcs:
+        extra = [int(x, 0) for x in args.extra_funcs.split(",") if x.strip()]
+        bset = sorted(set(bounds))
+        for a in extra:
+            newb = []
+            split = False
+            for (s, e) in bset:
+                if s < a < e:
+                    newb.append((s, a)); newb.append((a, e)); split = True
+                else:
+                    newb.append((s, e))
+            if not split and not any(s == a for s, _ in bset):
+                newb.append((a, base + len(data)))
+            bset = sorted(set(newb))
+        bounds = bset
+        sys.stderr.write("[spu_lifter] added extra funcs: %s\n" %
+                         ", ".join("0x%X" % a for a in extra))
+
     insns = disassemble_spu(data, base)
 
     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
+    lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
+    if lifter.bi_r0_jump:
+        print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
+              f"(r0 reloaded via lqa/lqr): "
+              f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:
         lifter.lift_function(insns, s, e)

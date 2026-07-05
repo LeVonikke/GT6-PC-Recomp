@@ -16,6 +16,12 @@
 #include <pthread.h>
 #endif
 
+/* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
+ * real video-payload GET (>256B from a non-context EA) = it actually decoded,
+ * as opposed to the 64-byte context handshake DMAs. The dispatcher's
+ * YDKJ_CRI_RESUME poll-loop watches this to know real work arrived. */
+int g_cri_video_dma = 0;
+
 /* ---- fingerprint ------------------------------------------------------- */
 
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
@@ -241,12 +247,125 @@ static void spu_async_run(spu_async_job* j)
     if (ls) {
         uint32_t entry = 0;
         if (spu_elf_load_to_ls(j->image, j->image_size, ls, &entry)) {
+            /* YDKJ_CRI_POLICY (cri build experiment): the cri SPU task
+             * (image 22) calls the SPURS task-API via a jump table at LS 0x2700
+             * and reads its task descriptor at LS 0x2FB0 — both POLICY-provided,
+             * not in the task ELF (so it branch-to-0's at func_00026DE0). Preload
+             * the policy module (libsre @0x30021480 -> LS 0xA00) and write the
+             * task descriptor {0xFFFFFFFF, 0x400, 0x2700, 0x3000} at 0x2FB0, then
+             * run the cri task, to see how much further it gets. Diagnostic only. */
+            if (j->image_id == 22 && getenv("YDKJ_CRI_TASKSET")) {
+                /* cri build: load the TASKSET POLICY module (libsre 0x23680 ->
+                 * LS 0xA00) alongside the cri task (already at 0x3000), then RUN
+                 * THE POLICY ENTRY (tsp_spu_func_00000A00) under image 23. The
+                 * policy builds the 0x2700 task-API table + dispatches the cri
+                 * task. Needs the SpursKernelContext at LS[0x1C0] (instance ptr)
+                 * + r80=0x100 context base, mirroring the kernel->policy handoff. */
+                extern uint8_t* vm_base;
+                extern void tsp_spu_func_00000A00(spu_context*);
+                if (vm_base) memcpy(ls + 0xA00, vm_base + 0x30023680, 0x2200);
+                /* SpursKernelContext.spurs (LS[0x1C0]) = the CellSpurs instance EA. */
+                uint32_t inst = 0x40009D00u;
+                uint8_t* p = ls + 0x1C0;
+                p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
+                p[4]=(uint8_t)(inst>>24); p[5]=(uint8_t)(inst>>16);
+                p[6]=(uint8_t)(inst>>8);  p[7]=(uint8_t)inst;   /* lo32 */
+                fprintf(stderr, "[cri] YDKJ_CRI_TASKSET: loaded taskset policy@0xA00, LS[0x1C0]=inst, running policy entry (img23)\n");
+                fflush(stderr);
+                /* Run the taskset policy entry instead of the cri task entry. */
+                extern int32_t spu_run_lifted_job_abi(void(*)(spu_context*), uint8_t*, uint32_t, int, int, uint32_t*);
+                int32_t prc = spu_run_lifted_job_abi(tsp_spu_func_00000A00, ls,
+                                                     j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0);
+                fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);
+                fflush(stderr);
+                free(ls); free(j); return;
+            }
+            /* YDKJ HLE cri-task path (image 22, cri_mpvps3spurs.elf): the real
+             * SPURS kernel/policy would build the task's SpursTasksetContext (LS
+             * 0x2700) before dispatch. In the HLE-cellSpurs path we dispatch the
+             * task ELF directly, so LS 0x2700 is empty and the task branch-to-0's:
+             * cri func_00026DE0 reads syscallAddr@0x27C4 (=0) and branches there.
+             * Plant a minimal context so the task-API call lands on the HLE syscall
+             * trampoline (LS 0xA70, intercepted in spu_channels.c) + the task
+             * descriptor @0x2FB0. Adopted from JonathanDC64/ps3recomp (aaea4158).
+             * Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
+            if (j->image_id == 22 && !getenv("YDKJ_NO_CRI_CTX")) {
+                extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
+                if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
+                    /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
+                     * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
+                     * so the cri leaf reads valid data instead of my planted guesses. */
+                    uint64_t elf = spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+                    /* still plant the cri-specific task descriptor @0x2FB0 that build_context
+                     * doesn't cover (cri func_00026DE0 reads it). */
+                    LSBE32(0x2FB0, 0xFFFFFFFFu); LSBE32(0x2FB4, 0x400);
+                    LSBE32(0x2FB8, 0x2700);      LSBE32(0x2FBC, 0x3000);
+                    fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
+                            g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
+                } else {
+                    LSBE32(0x27C0, 0x100);     /* kernelMgmtAddr -> SPURS kernel ctx @LS 0x100 */
+                    LSBE32(0x27C4, 0xA70);     /* syscallAddr -> HLE PM syscall trampoline (0xA70) */
+                    LSBE32(0x2FB0, 0xFFFFFFFFu); LSBE32(0x2FB4, 0x400);
+                    LSBE32(0x2FB8, 0x2700);      LSBE32(0x2FBC, 0x3000);
+                    fprintf(stderr, "[cri] HLE cri-task ctx (minimal plant): syscallAddr@0x27C4=0xA70\n");
+                }
+                #undef LSBE32
+                fflush(stderr);
+            }
+            /* Dump the 64-byte decode context the cri task will DMA from eaContext
+             * (r3.word1 = args_ea). This is the job the game's cri_mpv PPU layer is
+             * supposed to populate (video-data EA, output buffer). If it's zero/garbage
+             * the PPU layer never wrote a real job -> the task decodes nothing. */
+            if (j->image_id == 22 && j->args_ea) {
+                extern uint8_t* vm_base;
+                const uint8_t* c = vm_base + (j->args_ea & 0x0FFFFFFFu);
+                fprintf(stderr, "[cri] eaContext=0x%08X 64B decode-context:", j->args_ea);
+                for (int i = 0; i < 64; i++) { if ((i&15)==0) fprintf(stderr,"\n     +%02X:", i); fprintf(stderr, " %02X", c[i]); }
+                fprintf(stderr, "\n"); fflush(stderr);
+            }
             /* Async dispatch is the SPURS-task path: the entry expects the SPURS
              * task kernel ABI in r3 ({0x40 marker, eaContext, queue EA, ...}),
              * captured at dispatch time (j->r3) so it doesn't race the PPU
              * overwriting the stack-allocated context. */
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0);
+            /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
+             * the kernel re-enters it when work is signaled. Our HLE runs it once,
+             * so it polls the (concurrently PPU-updated) eaContext, finds no work,
+             * yields and exits before the PPU marks work-ready. Approximate the
+             * resume by re-running the task (fresh context re-read from eaContext)
+             * in a bounded loop until it actually DECODES (a >256B video GET sets
+             * g_cri_video_dma) or we time out. This does NOT fake data: the task
+             * only decodes if the PPU genuinely populated real work meanwhile. */
+            if (j->image_id == 22 && getenv("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
+                for (int attempt = 0; attempt < 400 && !g_cri_video_dma; attempt++) {
+#ifdef _WIN32
+                    Sleep(3);
+#endif
+                    memset(ls, 0, SPU_LS_SIZE);
+                    uint32_t e2 = 0;
+                    if (!spu_elf_load_to_ls(j->image, j->image_size, ls, &e2)) break;
+                    rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+                                                1, j->have_r3 ? j->r3 : 0);
+                    if (g_cri_video_dma) {
+                        fprintf(stderr, "[cri] RESUME: cri task DECODED real video (attempt %d)\n", attempt);
+                        break;
+                    }
+                }
+                if (!g_cri_video_dma)
+                    fprintf(stderr, "[cri] RESUME: no work-ready after 400 polls (PPU never marked work)\n");
+                fflush(stderr);
+            }
+            /* YDKJ_CRI_WAKE probe: on cri task (image 22) completion, wake any PPU
+             * completion-waiter (the SPU->PPU cellSpursEventFlag completion isn't
+             * propagated yet). Tests whether the game then advances to draw content. */
+            if (j->image_id == 22 && getenv("YDKJ_CRI_WAKE")) {
+                extern void ydkj_wake_all_event_flags(void);
+                ydkj_wake_all_event_flags();
+                fprintf(stderr, "[cri] YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");
+            }
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
         }
