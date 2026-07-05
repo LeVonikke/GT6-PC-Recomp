@@ -116,6 +116,14 @@ SOURCE_PREAMBLE = """\
 #include <string.h>
 #include <math.h>
 
+/* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
+ * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
+#ifdef __cplusplus
+extern "C" uint64_t ppu_timebase_now(void);
+#else
+extern uint64_t ppu_timebase_now(void);
+#endif
+
 /* MSVC compatibility helpers */
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -123,12 +131,17 @@ SOURCE_PREAMBLE = """\
  * redefining them is a hard error there -- only polyfill for real MSVC. */
 #ifndef __clang__
 static inline int __builtin_clz(unsigned int x) {
+    /* BSR leaves the index undefined for x==0; PowerPC cntlzw(0) is DEFINED
+     * as 32. Without the guard this returned 31 minus an uninitialized
+     * index for zero inputs. */
     unsigned long idx;
+    if (!x) return 32;
     _BitScanReverse(&idx, x);
     return 31 - (int)idx;
 }
 static inline int __builtin_clzll(unsigned long long x) {
     unsigned long idx;
+    if (!x) return 64;
     _BitScanReverse64(&idx, x);
     return 63 - (int)idx;
 }
@@ -503,16 +516,25 @@ class PPULifter:
             return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((uint32_t){_imm(ops[1])} << 16);"
 
         if mn == "addi":
+            # Full 64-bit add (PowerISA): truncating to 32 bits corrupts any
+            # 64-bit pointer/counter arithmetic built with addi.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(ctx->gpr[{ra}] + {_imm(ops[2])});"
+            return f"ctx->gpr[{rd}] = ctx->gpr[{ra}] + (int64_t)({_imm(ops[2])});"
 
         if mn == "addis":
+            # 64-bit add of the sign-extended (imm << 16).
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(ctx->gpr[{ra}] + ((uint32_t){_imm(ops[2])} << 16));"
+            return (f"ctx->gpr[{rd}] = ctx->gpr[{ra}] + "
+                    f"(int64_t)(int32_t)((uint32_t){_imm(ops[2])} << 16);")
 
         if mn == "addic" or mn == "addic.":
+            # 64-bit add + XER[CA] from the unsigned 64-bit carry-out
+            # (the old form truncated to 32 bits and never wrote CA).
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(ctx->gpr[{ra}] + {_imm(ops[2])});"
+            return (f"{{ uint64_t _a = ctx->gpr[{ra}]; "
+                    f"uint64_t _r = _a + (uint64_t)(int64_t)({_imm(ops[2])}); "
+                    f"ctx->gpr[{rd}] = _r; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((_r < _a) ? (1u << 29) : 0u); }}")
 
         if mn in ("add", "add.", "addo", "addo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -527,20 +549,34 @@ class PPULifter:
             return f"ctx->gpr[{rd}] = ctx->gpr[{rb}] - ctx->gpr[{ra}];"
 
         if mn == "subfic":
+            # RT = EXTS(SI) - RA over the full 64 bits; XER[CA] = NOT borrow
+            # (carry-out of NOT(RA) + EXTS(SI) + 1, i.e. EXTS(SI) >= RA
+            # unsigned). The old form computed in 32 bits and never wrote CA.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)({_imm(ops[2])} - (int32_t)ctx->gpr[{ra}]);"
+            return (f"{{ uint64_t _a = ctx->gpr[{ra}]; "
+                    f"uint64_t _b = (uint64_t)(int64_t)({_imm(ops[2])}); "
+                    f"ctx->gpr[{rd}] = _b - _a; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((_b >= _a) ? (1u << 29) : 0u); }}")
 
         if mn in ("neg", "neg."):
+            # 64-bit two's complement (neg of INT64_MIN stays INT64_MIN);
+            # the old 32-bit form zeroed the high word.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(-(int32_t)ctx->gpr[{ra}]);"
+            return f"ctx->gpr[{rd}] = (uint64_t)0 - ctx->gpr[{ra}];"
 
         if mn == "mulli":
+            # mulli is the low 64 bits of the full RA * EXTS(SI) product
+            # (PowerISA); a 32-bit multiply truncates it.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] * {_imm(ops[2])});"
+            return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)ctx->gpr[{ra}] * "
+                    f"(int64_t)({_imm(ops[2])}));")
 
         if mn in ("mullw", "mullw."):
+            # Full 64-bit product of the sign-extended low words (PowerISA);
+            # multiplying as int32 truncates the high 32 bits of the result.
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] * (int32_t)ctx->gpr[{rb}]);"
+            return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)(int32_t)ctx->gpr[{ra}] * "
+                    f"(int64_t)(int32_t)ctx->gpr[{rb}]);")
 
         if mn in ("mulhw", "mulhw."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -602,6 +638,11 @@ class PPULifter:
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{ra}] = ~(ctx->gpr[{rs}] | ctx->gpr[{rb}]);"
 
+        if mn in ("eqv", "eqv."):
+            # eqv = complemented XOR (bitwise equivalence); was unhandled.
+            ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return f"ctx->gpr[{ra}] = ~(ctx->gpr[{rs}] ^ ctx->gpr[{rb}]);"
+
         if mn in ("andc", "andc."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{ra}] = ctx->gpr[{rs}] & ~ctx->gpr[{rb}];"
@@ -623,8 +664,15 @@ class PPULifter:
             return f"ctx->gpr[{ra}] = (int64_t)(int32_t)ctx->gpr[{rs}];"
 
         if mn in ("cntlzw", "cntlzw."):
+            # cntlzw(0) is DEFINED as 32 on PowerPC; raw __builtin_clz(0) is
+            # UB (x86 BSR leaves the index undefined). cntlzd below already
+            # has the guard; mirror it. Sony's SPURS queue code gates its
+            # "queue was empty -> signal the waiting task" wakeup on
+            # cntlzw(pending)>>5, so an unguarded emission silently drops
+            # every such wakeup.
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{ra}] = __builtin_clz((uint32_t)ctx->gpr[{rs}]);"
+            return (f"ctx->gpr[{ra}] = (uint32_t)ctx->gpr[{rs}] ? "
+                    f"__builtin_clz((uint32_t)ctx->gpr[{rs}]) : 32;")
 
         if mn in ("cntlzd", "cntlzd."):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
@@ -650,21 +698,24 @@ class PPULifter:
             # the count to 5 bits, yielding a wrong nonzero value (breaks code
             # that shifts a mask to zero, e.g. binned allocators). Mirror sld.
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x1F)));"
+            # slw/srw ZERO-extend: the rotate-and-mask definition clears the
+            # high 32 bits of RA. Sign-extending puts 0xFFFFFFFF in the high
+            # word whenever bit 31 of the 32-bit result is set.
+            return f"ctx->gpr[{ra}] = (uint64_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x1F)));"
 
         if mn in ("srw", "srw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x1F)));"
+            return f"ctx->gpr[{ra}] = (uint64_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x1F)));"
 
         if mn in ("sraw", "sraw."):
             # PPC sraw: for shift >= 32 the result is the sign bit replicated
             # (equivalent to an arithmetic shift by 31).
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{rs}] >> ((ctx->gpr[{rb}] & 0x20) ? 31 : (int)(ctx->gpr[{rb}] & 0x1F)));"
+            return f"ctx->gpr[{ra}] = ppc_sraw(&ctx->xer, (int32_t)ctx->gpr[{rs}], (int)(ctx->gpr[{rb}] & 0x3F));"
 
         if mn in ("srawi", "srawi."):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{rs}] >> {_imm(ops[2])});"
+            return f"ctx->gpr[{ra}] = ppc_sraw(&ctx->xer, (int32_t)ctx->gpr[{rs}], {_imm(ops[2])});"
 
         # ------- 64-bit Rotate / Shift -------
         if mn.startswith("rldicl"):
@@ -714,11 +765,11 @@ class PPULifter:
 
         if mn in ("srad", "srad."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (uint64_t)((int64_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 63));"
+            return f"ctx->gpr[{ra}] = (uint64_t)ppc_srad(&ctx->xer, (int64_t)ctx->gpr[{rs}], (int)(ctx->gpr[{rb}] & 0x7F));"
 
         if mn in ("sradi", "sradi."):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{ra}] = (uint64_t)((int64_t)ctx->gpr[{rs}] >> {_imm(ops[2])});"
+            return f"ctx->gpr[{ra}] = (uint64_t)ppc_srad(&ctx->xer, (int64_t)ctx->gpr[{rs}], {_imm(ops[2])});"
 
         # ------- Loads -------
         load_map = {
@@ -816,7 +867,8 @@ class PPULifter:
         if mn in ("stfsx", "stfdx"):
             frs, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
-            if "s" in mn:
+            # stfdx also contains 's' -- match single explicitly [fork eb5451b3]
+            if mn == "stfsx":
                 return f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32({ea}, tmp); }}"
             else:
                 return f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64({ea}, tmp); }}"
@@ -1024,8 +1076,22 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             return f"ctx->gpr[{rd_i}] = ctx->cr;"
 
-        if mn in ("mtcr", "mtcrf"):
+        if mn == "mtcr":
             return f"ctx->cr = (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}];"
+        if mn == "mtcrf":
+            # mtcrf CRM, rS -- update ONLY the CR fields whose CRM bit is set
+            # (the others are preserved). CR0 = cr bits 28-31 ... CR7 = bits 0-3;
+            # CRM 0x80 selects CR0 ... 0x01 selects CR7.
+            crm = int(ops[0], 0) if len(ops) > 1 else 0xFF
+            mask = 0
+            for f in range(8):
+                if crm & (0x80 >> f):
+                    mask |= 0xF << (28 - 4 * f)
+            rS = _reg_idx(ops[-1])
+            if mask == 0xFFFFFFFF:
+                return f"ctx->cr = (uint32_t)ctx->gpr[{rS}];"
+            return (f"ctx->cr = (ctx->cr & 0x{(~mask) & 0xFFFFFFFF:08X}u) | "
+                    f"((uint32_t)ctx->gpr[{rS}] & 0x{mask:08X}u);")
 
         # ------- Syscall -------
         if mn == "sc":
@@ -1047,7 +1113,12 @@ class PPULifter:
             frs = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                if "s" in mn:
+                # Match single-precision by EXPLICIT mnemonic, not `"s" in mn` --
+                # every "stf..." store contains an 's', so the substring test
+                # mis-classified stfd/stfdu as single and emitted a lossy 4-byte
+                # store, corrupting the double (breaks fctidz+stfd+ld float->GPR
+                # idioms and any stored double). [ps3recomp fork JonathanDC64 eb5451b3]
+                if mn in ("stfs", "stfsu"):
                     return (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
                             f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
                 else:
@@ -1200,10 +1271,12 @@ class PPULifter:
 
         if mn in ("subfe", "subfe."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            # XER[CA] = ADC carry-out of (~RA + RB + ca), per PowerISA / RPCS3 add64_flags.
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
-                    f"uint64_t result = ~ctx->gpr[{ra}] + ctx->gpr[{rb}] + ca; "
-                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
-                    f"((result <= ctx->gpr[{rb}] && ca) ? (1u << 29) : 0); "
+                    f"uint64_t a = ~ctx->gpr[{ra}], b = ctx->gpr[{rb}]; "
+                    f"uint64_t s1 = a + b; uint64_t co = (s1 < a); "
+                    f"uint64_t result = s1 + ca; co |= (result < s1); "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); "
                     f"ctx->gpr[{rd}] = result; }}")
 
         # ------- addc/subfc (carry arithmetic, carry-out only, no carry-in) -------
@@ -1416,15 +1489,20 @@ class PPULifter:
                     f"ctx->gpr[{rd}] = (int64_t)(int16_t)vm_read16(ea); ctx->gpr[{ra}] = ea; }}")
 
         # ------- Move from time base -------
+        # THE guest clock. The old emission was a per-call-site static that
+        # advanced 16667 ticks PER READ -- not time: every site had a private
+        # counter that only moved when polled, so all guest elapsed-time math
+        # (media pacers, throttles, profilers, timeout loops) computed garbage
+        # from it. Real semantics: one global monotonic timebase at 79.8 MHz
+        # (runtime ppu_timebase_now, consistent with
+        # sys_time_get_timebase_frequency).
         if mn == "mftb":
             rd = _reg_idx(ops[0])
-            return (f"{{ static uint64_t tb = 79800000ULL; tb += 16667; "
-                    f"ctx->gpr[{rd}] = tb; }}")
+            return f"ctx->gpr[{rd}] = ppu_timebase_now();"
 
         if mn == "mftbu":
             rd = _reg_idx(ops[0])
-            return (f"{{ static uint64_t tb = 79800000ULL; tb += 16667; "
-                    f"ctx->gpr[{rd}] = (tb >> 32); }}")
+            return f"ctx->gpr[{rd}] = (ppu_timebase_now() >> 32);"
 
         # ------- Cache/sync ops (safe to no-op) -------
         # dcbz zeros a 128-byte cache line — MUST be implemented, not no-oped!
@@ -1443,16 +1521,22 @@ class PPULifter:
         # ------- addme/subfme/subfze (carry arithmetic, 2-op) -------
         if mn.startswith("addme"):
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
+            # addme = RA + CA - 1 = RA + (~0) + CA; XER[CA] = ADC carry-out.
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
-                    f"uint64_t result = ctx->gpr[{ra}] + ca - 1; "
-                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
-                    f"((result >= ctx->gpr[{ra}]) ? (1u << 29) : 0); "
+                    f"uint64_t a = ctx->gpr[{ra}], b = ~0ULL; "
+                    f"uint64_t s1 = a + b; uint64_t co = (s1 < a); "
+                    f"uint64_t result = s1 + ca; co |= (result < s1); "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); "
                     f"ctx->gpr[{rd}] = result; }}")
 
         if mn.startswith("subfme"):
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
+            # subfme = ~RA + CA - 1 = ~RA + (~0) + CA; was MISSING the XER[CA] update.
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
-                    f"uint64_t result = ~ctx->gpr[{ra}] + ca - 1; "
+                    f"uint64_t a = ~ctx->gpr[{ra}], b = ~0ULL; "
+                    f"uint64_t s1 = a + b; uint64_t co = (s1 < a); "
+                    f"uint64_t result = s1 + ca; co |= (result < s1); "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); "
                     f"ctx->gpr[{rd}] = result; }}")
 
         if mn.startswith("subfze"):
@@ -1707,6 +1791,30 @@ class PPULifter:
             return (f"{{ uint32_t* a=(uint32_t*)&ctx->vr[{va}]; uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
                     f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
                     f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
+
+        # Vector compare greater-than, signed/unsigned, byte/half/word.
+        # Previously unhandled (fell to the TODO catch-all = silently skipped
+        # stores, so vD kept stale data). Dot forms set CR6 per the AltiVec
+        # PEM: bit0 (value 8) = all lanes true, bit2 (value 2) = all lanes
+        # false, written to CR field 6 (bits 4-7 of our packed ctx->cr).
+        vcmpgt_family = {
+            "vcmpgtsb": ("int8_t",   16), "vcmpgtsh": ("int16_t",  8),
+            "vcmpgtsw": ("int32_t",   4),
+            "vcmpgtub": ("uint8_t",  16), "vcmpgtuh": ("uint16_t", 8),
+            "vcmpgtuw": ("uint32_t",  4),
+        }
+        base_mn = mn.rstrip(".")
+        if base_mn in vcmpgt_family:
+            ety, n = vcmpgt_family[base_mn]
+            uty = ety.replace("int", "uint") if not ety.startswith("u") else ety
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            body = (f"{{ {ety}* a=({ety}*)&ctx->vr[{va}]; {ety}* b=({ety}*)&ctx->vr[{vb}]; "
+                    f"{uty}* d=({uty}*)&ctx->vr[{vd}]; int t=0; "
+                    f"for(int i=0;i<{n};i++){{ {uty} r=a[i]>b[i]?({uty})~({uty})0:0; d[i]=r; t+=r?1:0; }}")
+            if mn.endswith("."):
+                body += (f" uint32_t c6=(t=={n}?8u:0u)|(t==0?2u:0u); "
+                         f"ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+            return body + " }"
 
         # ------- VMX integer arithmetic (generated from disasm decode table) -------
         # These are simple per-element operations on vector registers.
@@ -2156,7 +2264,7 @@ class PPULifter:
         # Emit helper macros
         lines.append("/* Rotate helpers */")
         lines.append("static inline uint32_t ppc_rlwinm(uint32_t rs, int sh, int mb, int me) {")
-        lines.append("    uint32_t rotated = (rs << sh) | (rs >> (32 - sh));")
+        lines.append("    uint32_t rotated = sh ? ((rs << sh) | (rs >> (32 - sh))) : rs;")
         lines.append("    uint32_t mask;")
         lines.append("    if (mb <= me) {")
         lines.append("        mask = ((uint32_t)-1 >> mb) & ((uint32_t)-1 << (31 - me));")
@@ -2167,7 +2275,7 @@ class PPULifter:
         lines.append("}")
         lines.append("")
         lines.append("static inline uint32_t ppc_rlwimi(uint32_t ra, uint32_t rs, int sh, int mb, int me) {")
-        lines.append("    uint32_t rotated = (rs << sh) | (rs >> (32 - sh));")
+        lines.append("    uint32_t rotated = sh ? ((rs << sh) | (rs >> (32 - sh))) : rs;")
         lines.append("    uint32_t mask;")
         lines.append("    if (mb <= me) {")
         lines.append("        mask = ((uint32_t)-1 >> mb) & ((uint32_t)-1 << (31 - me));")
@@ -2181,7 +2289,7 @@ class PPULifter:
         lines.append("/* 64-bit rotate helpers */")
         lines.append("static inline uint64_t ppc_rotl64(uint64_t v, int n) {")
         lines.append("    n &= 63;")
-        lines.append("    return (v << n) | (v >> (64 - n));")
+        lines.append("    return n ? ((v << n) | (v >> (64 - n))) : v;")
         lines.append("}")
         lines.append("static inline uint64_t ppc_mask64(int mb, int me) {")
         lines.append("    uint64_t mask;")
@@ -2207,6 +2315,24 @@ class PPULifter:
         lines.append("    int me = 63 - sh;")
         lines.append("    uint64_t mask = ppc_mask64(mb, me);")
         lines.append("    return (ppc_rotl64(rs, sh) & mask) | (ra & ~mask);")
+        lines.append("}")
+        lines.append("")
+        # Shift-right-algebraic with XER[CA]. CA = rS<0 AND any 1-bits shifted out.
+        # Also clamps shift counts >= width (PPC yields all-sign; a raw C shift by
+        # >= the width is undefined). The carry feeds adde/addze/subfe consumers.
+        lines.append("static inline int64_t ppc_sraw(uint32_t* xer, int32_t rs, int n) {")
+        lines.append("    int sh = n & 0x3F;")
+        lines.append("    uint32_t so = (sh == 0) ? 0u : ((sh >= 32) ? (uint32_t)rs : ((uint32_t)rs & (((uint32_t)1u << sh) - 1u)));")
+        lines.append("    uint32_t ca = (rs < 0 && so != 0u) ? 1u : 0u;")
+        lines.append("    *xer = (*xer & ~(1u << 29)) | (ca << 29);")
+        lines.append("    return (int64_t)((sh >= 32) ? (rs >> 31) : (rs >> sh));")
+        lines.append("}")
+        lines.append("static inline int64_t ppc_srad(uint32_t* xer, int64_t rs, int n) {")
+        lines.append("    int sh = n & 0x7F;")
+        lines.append("    uint64_t so = (sh == 0) ? 0ull : ((sh >= 64) ? (uint64_t)rs : ((uint64_t)rs & (((uint64_t)1ull << sh) - 1ull)));")
+        lines.append("    uint32_t ca = (rs < 0 && so != 0ull) ? 1u : 0u;")
+        lines.append("    *xer = (*xer & ~(1u << 29)) | (ca << 29);")
+        lines.append("    return (sh >= 64) ? (rs >> 63) : (rs >> sh);")
         lines.append("}")
         lines.append("")
         return lines
