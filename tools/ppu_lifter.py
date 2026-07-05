@@ -919,8 +919,19 @@ class PPULifter:
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         # ------- Branches -------
-        if mn == "blr" or mn == "blrl":
+        if mn == "blr":
             return "return;"
+
+        # blrl = branch to LR *with link* = an indirect CALL through LR, not a
+        # return. The `lwz r12,0(rN); mtlr r12; lwz r2,4(rN); blrl` idiom calls a
+        # function descriptor via LR (the LR-based twin of `mtctr;bctrl`). Lumping
+        # it with blr emitted a bare `return;` -> the call was dropped AND the
+        # frame epilogue skipped, so r1 leaked the frame size every call (seen in
+        # cellmark: engine_handle_input leaked 0xA0/call, corrupting the caller's
+        # stack). LR holds the target (set by the preceding mtlr); dispatch like
+        # bctrl, then CONTINUE (link = call).
+        if mn == "blrl":
+            return "ctx->ctr = (uint32_t)ctx->lr; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);"
 
         if mn == "b":
             target = ops[0]
@@ -974,6 +985,13 @@ class PPULifter:
                 not mn.startswith("blr")):  # guard against "blr" literal
             cond = self._branch_condition(mn, ops)
             return f"if ({cond}) return;"
+
+        # Conditional indirect call through LR with link (b<cond>lrl) — the LR twin
+        # of b<cond>ctrl below. Dispatch via LR, then CONTINUE (link = call).
+        if (mn.endswith("lrl") and mn != "blrl" and mn.startswith("b")):
+            cond = self._branch_condition(mn, ops)
+            return (f"if ({cond}) {{ ctx->ctr = (uint32_t)ctx->lr; "
+                    f"ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}")
 
         # Indirect call/jump through CTR in any conditional or named form:
         #   b<cond>ctr / bcctr  (no link) -> tail jump: dispatch, then return
