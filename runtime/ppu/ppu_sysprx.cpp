@@ -195,6 +195,20 @@ static unsigned int gcm_guest_alloc(unsigned int size, unsigned int align)
 }
 static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(addr, val); }
 
+/* FIFO command-buffer-full callback. cellGcmSetupContext points the guest
+ * context's callback OPD at GCM_FIFO_CALLBACK_SENTINEL_EA; the title's inline
+ * gcmReserve calls context->callback(context, count) on ring wrap, which the
+ * indirect dispatcher routes here. r3 = guest context EA. Must match the sentinel
+ * define in libs/video/cellGcmSys.c. */
+#define GCM_FIFO_CALLBACK_SENTINEL_EA 0x03002F00u
+extern "C" void cellGcm_fifo_recycle(unsigned int ctx_ea);
+extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
+static void hle_gcm_callback(ppu_context* ctx)
+{
+    cellGcm_fifo_recycle((unsigned int)ctx->gpr[3]);   /* r3 = context EA */
+    ctx->gpr[3] = 0;                                   /* CELL_OK */
+}
+
 static void hle_cellGcmInitBody(ppu_context* ctx)
 {
     uint32_t ctx_out = (uint32_t)ctx->gpr[3];
@@ -210,6 +224,9 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
 extern "C" void ppu_sysprx_register(void)
 {
     ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
+    /* Route the GCM command-buffer-full callback (invoked indirectly via the
+     * context OPD) into cellGcm_fifo_recycle so the FIFO ring recycles on wrap. */
+    ppu_register_function(GCM_FIFO_CALLBACK_SENTINEL_EA, hle_gcm_callback);
     ps3_hle_register_ctx(ps3_compute_nid("sys_initialize_tls"),       "sys_initialize_tls",       sys_initialize_tls);
     ps3_hle_register_ctx(ps3_compute_nid("sys_time_get_system_time"), "sys_time_get_system_time", sys_time_get_system_time);
     ps3_hle_register_ctx(ps3_compute_nid("sys_process_is_stack"),     "sys_process_is_stack",     sys_process_is_stack);

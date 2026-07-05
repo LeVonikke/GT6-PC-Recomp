@@ -834,7 +834,13 @@ static void move_to_next_frame(void)
     if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[s_d3d.frame_index]) {
         s_d3d.fence->lpVtbl->SetEventOnCompletion(
             s_d3d.fence, s_d3d.fence_values[s_d3d.frame_index], s_d3d.fence_event);
-        WaitForSingleObject(s_d3d.fence_event, INFINITE);
+        if (WaitForSingleObject(s_d3d.fence_event, 2000) == WAIT_TIMEOUT) {
+            HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+            printf("[D3D12] FENCE STUCK 2s: want %llu got %llu removed=0x%08lX\n",
+                   (unsigned long long)s_d3d.fence_values[s_d3d.frame_index],
+                   (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
+                   (long)rr);
+        }
     }
 
     s_d3d.fence_values[s_d3d.frame_index] = current_fence + 1;
