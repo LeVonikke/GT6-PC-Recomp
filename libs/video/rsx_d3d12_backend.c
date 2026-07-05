@@ -46,8 +46,9 @@
  * -----------------------------------------------------------------------*/
 
 #define FRAME_COUNT         2   /* double buffering */
-#define MAX_VERTICES      4096  /* per-frame vertex buffer */
-#define MAX_DRAWS          256  /* per-frame draw records */
+#define MAX_VERTICES     65536  /* per-frame vertex buffer (dbgfont submits
+                                 * ~7.5k verts/frame; leave generous headroom) */
+#define MAX_DRAWS         1024  /* per-frame draw records */
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
 typedef struct {
@@ -1276,6 +1277,14 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     s_d3d.clear_color[1] = ((color >> 8) & 0xFF) / 255.0f;  /* G */
     s_d3d.clear_color[2] = (color & 0xFF) / 255.0f;          /* B */
     s_d3d.clear_color[3] = ((color >> 24) & 0xFF) / 255.0f;  /* A */
+
+    /* A surface clear marks the start of a new frame. If the FIFO drain
+     * batched several frames before a present, keep only the draws recorded
+     * after the most recent clear -- otherwise every batched frame's console
+     * text renders on top of the next, stacking vertically. */
+    s_d3d.draw_count   = 0;
+    s_d3d.vb_offset    = 0;
+    s_d3d.vp_vb_offset = 0;
 }
 
 static void d3d12_set_render_target(void* ud, const rsx_state* state)
