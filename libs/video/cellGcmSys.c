@@ -549,6 +549,9 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
 
+    if (getenv("CELLMARK_BLINKDBG"))
+        printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
+
     /* Wait for the RSX drain to catch up to `current` so no commands are lost.
      * Bounded (~2s) so a stalled ticker degrades to dropped commands, not a
      * permanent hang. */
