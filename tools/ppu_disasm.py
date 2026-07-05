@@ -1137,6 +1137,10 @@ def main() -> None:
                         help="Start offset within file (for raw mode)")
     parser.add_argument("--length", type=lambda x: int(x, 0), default=0,
                         help="Number of bytes to disassemble (0=all)")
+    parser.add_argument("--va", type=lambda x: int(x, 0), default=None,
+                        help="Virtual address to disassemble (ELF: maps va->file via PT_LOAD segments; "
+                             "use with --length). Correct alternative to --raw --offset, which treats "
+                             "--offset as a raw FILE offset (off by the segment base).")
     parser.add_argument("--little-endian", action="store_true",
                         help="Decode as little-endian")
     args = parser.parse_args()
@@ -1146,6 +1150,28 @@ def main() -> None:
 
     big_endian = not args.little_endian
     base_addr = args.base
+
+    # --va: disassemble a window at a VIRTUAL address, mapping va->file offset through the ELF's
+    # PT_LOAD segments (fixes the long-standing footgun where --raw --offset <vaddr> read the wrong
+    # bytes because --offset is a file offset, off by the .text segment base e.g. 0x10000).
+    if args.va is not None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from elf_parser import ELFFile, PT_LOAD
+        elf = ELFFile(args.input); elf.load()
+        big_endian = elf.elf_header.big_endian
+        va = args.va; seg = None
+        for ph in elf.program_headers:
+            if ph.p_type == PT_LOAD and ph.p_vaddr <= va < ph.p_vaddr + ph.p_filesz:
+                seg = ph; break
+        if seg is None:
+            print(f"Error: vaddr 0x{va:08X} not in any PT_LOAD file-backed range", file=sys.stderr)
+            sys.exit(1)
+        file_off = seg.p_offset + (va - seg.p_vaddr)
+        n = args.length or 0x40
+        data = file_data[file_off:file_off + n]
+        for i in disassemble_bytes(data, va, big_endian):
+            print(i)
+        return
 
     if args.raw:
         data = file_data[args.offset:]
