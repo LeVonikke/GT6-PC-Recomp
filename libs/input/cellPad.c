@@ -150,11 +150,13 @@ static void pad_poll_xinput(void)
 
         s_host_state[i].buttons = btns;
 
-        /* Analog sticks */
+        /* Analog sticks. PS3 Y axis is inverted vs XInput (up = 0). Reflect about
+         * 128 (256 - x), NOT 255 - x: the latter turns a centered stick into 127,
+         * whose bits (0x7F) alias SELECT+START and made the guest self-exit. */
         s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ly = (u8)(255 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE)); /* Y inverted */
+        s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
         s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ry = (u8)(255 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
+        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
 
         /* Triggers */
         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
@@ -405,9 +407,15 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
         len = CELL_PAD_LEN_CHANGE_PRESS_ON;
     d.len = len;
 
-    /* Digital buttons + analog sticks */
-    d.button[CELL_PAD_BTN_OFFSET_DIGITAL1]     = hs->buttons;
-    d.button[CELL_PAD_BTN_OFFSET_DIGITAL2]     = 0;
+    /* Digital buttons + analog sticks. hs->buttons packs both halves as a single
+     * 16-bit value (CELL_PAD_CTRL_*: SELECT=bit0..LEFT=bit7 in DIGITAL1,
+     * L2=bit8..SQUARE=bit15 in DIGITAL2). The guest's CellPadData splits these
+     * across two byte-sized entries: button[2] = digital1 (bits 0-7), button[3]
+     * = digital2 (the high bits shifted down to 0-7). Writing the full 16-bit
+     * value into button[2] left every DIGITAL2 face button (cross/circle/...)
+     * dead and leaked the high bits into button[2]. */
+    d.button[CELL_PAD_BTN_OFFSET_DIGITAL1]     = hs->buttons & 0xFF;
+    d.button[CELL_PAD_BTN_OFFSET_DIGITAL2]     = (hs->buttons >> 8) & 0xFF;
     d.button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
     d.button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
     d.button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
