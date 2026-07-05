@@ -1288,10 +1288,25 @@ static void d3d12_end_frame(void* ud)
     (void)ud;
 }
 
+static u32 s_dbg_clears_since_present = 0;   /* CELLMARK_BLINKDBG */
+static u32 s_clear_presents = 0;   /* presents issued at clear (frame boundary) */
+
+static int blink_dbg(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("CELLMARK_BLINKDBG") ? 1 : 0;
+    return v;
+}
+
 static void d3d12_present(void* ud, u32 buffer_id)
 {
     (void)ud;
     (void)buffer_id;
+
+    if (blink_dbg())
+        printf("[PRESENT] draws=%u clears_since_last=%u\n",
+               s_d3d.draw_count, s_dbg_clears_since_present);
+    s_dbg_clears_since_present = 0;
 
     if (s_d3d.initialized)
         render_frame();
@@ -1318,10 +1333,21 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     s_d3d.clear_color[2] = (color & 0xFF) / 255.0f;          /* B */
     s_d3d.clear_color[3] = ((color >> 24) & 0xFF) / 255.0f;  /* A */
 
-    /* A surface clear marks the start of a new frame. If the FIFO drain
-     * batched several frames before a present, keep only the draws recorded
-     * after the most recent clear -- otherwise every batched frame's console
-     * text renders on top of the next, stacking vertically. */
+    /* A surface clear marks the start of a new frame. If a completed frame is
+     * still accumulated (the drain gulped across a frame boundary -- guaranteed
+     * at the FIFO ring wrap, where rest-of-frame-N + clear-N+1 arrive in one
+     * batch), PRESENT it now instead of discarding it. Discard-then-present let
+     * the ticker show an empty/partial frame right after every ring recycle
+     * (visible blink every ~wrap). Presenting at the boundary keys presents to
+     * the guest's own frames regardless of how the drain batches them. */
+    if (s_d3d.draw_count > 0 && s_d3d.initialized) {
+        if (blink_dbg())
+            printf("[CLEAR] presenting %u accumulated draws at frame boundary\n",
+                   s_d3d.draw_count);
+        render_frame();
+        s_clear_presents++;
+    }
+    s_dbg_clears_since_present++;
     s_d3d.draw_count   = 0;
     s_d3d.vb_offset    = 0;
     s_d3d.vp_vb_offset = 0;
@@ -1804,6 +1830,20 @@ int rsx_d3d12_backend_pump_messages(void)
 
 void rsx_d3d12_backend_present(void)
 {
+    if (blink_dbg())
+        printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
+               s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);
+    s_dbg_clears_since_present = 0;
+
+    /* Once frame-boundary presents are active (d3d12_clear presents each
+     * completed frame as the drain crosses into the next one), the ticker
+     * present would only ever show the partially-accumulated NEXT frame --
+     * that partial present right after the FIFO ring recycle was the visible
+     * blink. Keep the ticker present solely as the boot-time fallback (before
+     * the first framed clear arrives). */
+    if (s_clear_presents > 0)
+        return;
+
     if (s_d3d.initialized)
         render_frame();
 }
