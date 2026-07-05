@@ -60,11 +60,12 @@ static void emit_src(u32 src, int is_abs, u32 input_src, u32 const_src,
     u32 sz = (src >> 10) & 3, sw = (src >> 8) & 3;
     int neg = (src >> 16) & 1;
 
+    /* RPCS3 vp_reg_type: 1 = TEMP, 2 = INPUT, 3 = CONSTANT. */
     char base[32];
     switch (reg_type) {
-    case 1:  snprintf(base, sizeof(base), "v[%u]", input_src); break;  /* input attr */
-    case 2:  snprintf(base, sizeof(base), "vp_c[%u]", const_src); break; /* constant */
-    default: snprintf(base, sizeof(base), "r[%u]", tmp_src); break;    /* temp */
+    case 2:  snprintf(base, sizeof(base), "v[%u]", input_src); break;    /* input attr */
+    case 3:  snprintf(base, sizeof(base), "vp_c[%u]", const_src); break; /* constant */
+    default: snprintf(base, sizeof(base), "r[%u]", tmp_src); break;      /* temp (1) */
     }
 
     char swz[8];
@@ -156,7 +157,17 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
             char line[512];
             const char* tgt = vec_result ? "o" : "r";
             u32 idx = vec_result ? dst_out : dst_tmp;
-            snprintf(line,sizeof line,"    %s[%u]%s = (%s);\n", tgt, idx, m, rhs);
+            /* RSX writes are component-wise: dst.zw = alu.zw. HLSL's
+             * `dst.zw = <float4>` instead truncates to the *leading* two
+             * components (alu.xy), which is wrong for any non-leading mask.
+             * Re-select the destination components on the RHS so the write is
+             * component-wise. DP3/DPH/DP4 return a scalar that broadcasts, so
+             * they must not be swizzled. */
+            int scalar_res = (vec_op==0x05 || vec_op==0x06 || vec_op==0x07);
+            if (scalar_res || m[0]=='\0')
+                snprintf(line,sizeof line,"    %s[%u]%s = (%s);\n", tgt, idx, m, rhs);
+            else
+                snprintf(line,sizeof line,"    %s[%u]%s = (%s)%s;\n", tgt, idx, m, rhs, m);
             emit(&b, line);
         }
 
@@ -205,8 +216,7 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
          * 14 attribute slots are zero locals. Generalising to all 16 RSX
          * vertex attributes is a follow-up (needs a wide vertex + layout). */
         "struct VSInput {\n"
-        "    float3 v0 : POSITION;\n"
-        "    float4 v3 : COLOR0;\n"
+        "    float4 v0 : POSITION;\n"
         "};\n"
         "struct VSOutput {\n"
         "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
@@ -221,20 +231,23 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         "VSOutput main(VSInput input) {\n"
         "    float4 v[16];\n"
         "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=(float4)0;\n"
-        "    v[0]=float4(input.v0,1); v[3]=input.v3;\n"
+        "    v[0]=input.v0;\n"
         "    float4 r[64]; float4 o[32];\n"
         "    [unroll] for (int _i=0;_i<64;_i++) r[_i]=(float4)0;\n"
-        "    [unroll] for (int _j=0;_j<32;_j++) o[_j]=(float4)0;\n");
+        "    [unroll] for (int _j=0;_j<32;_j++) o[_j]=(float4)0;\n"
+        /* RSX default for unwritten HPOS.w is 1 (2D overlays write only xy). */
+        "    o[0].w = 1.0;\n");
 
     emit(&o, body);
 
-    /* Map NV40 VP output registers to the VSOutput varyings.
-     * o[0]=HPOS, o[1]=COL0, o[2]=COL1, o[5]=FOG, o[8..15]=TEX0..7. */
+    /* Map NV40 VP output registers to the VSOutput varyings. Standard RSX
+     * layout: o[0]=HPOS, o[1]=COL0, o[2]=COL1, o[5]=FOG, o[6]=PSIZE,
+     * o[7..14]=TEX0..7. */
     emit(&o,
         "    VSOutput Out;\n"
         "    Out.pos = o[0]; Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5];\n"
-        "    Out.t0=o[8]; Out.t1=o[9]; Out.t2=o[10]; Out.t3=o[11];\n"
-        "    Out.t4=o[12]; Out.t5=o[13]; Out.t6=o[14]; Out.t7=o[15];\n"
+        "    Out.t0=o[7]; Out.t1=o[8]; Out.t2=o[9]; Out.t3=o[10];\n"
+        "    Out.t4=o[11]; Out.t5=o[12]; Out.t6=o[13]; Out.t7=o[14];\n"
         "    return Out;\n"
         "}\n");
 
