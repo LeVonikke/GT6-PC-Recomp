@@ -396,10 +396,13 @@ void cellGcmSetFlipMode(u32 mode)
 /* NID: 0xC44D8F34 */
 void cellGcmSetWaitFlip(void)
 {
-    /*
-     * Block until the current flip completes.  In the stub we consider
-     * flips to be instantaneous.
-     */
+    /* Block until the pending flip completes (the present thread marks it done
+     * via cellGcmTickFlip, ~once per display refresh). This throttles the title
+     * to vsync; without it the guest loops unthrottled and many frames batch
+     * into a single host present -> the console text stacks/duplicates. */
+    __declspec(dllimport) void __stdcall Sleep(unsigned long);
+    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+        Sleep(1);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 }
 
@@ -438,6 +441,9 @@ void cellGcmTickVBlank(void)
 
 void cellGcmTickFlip(void)
 {
+    /* A display refresh: the pending flip is now complete (unblocks a guest
+     * cellGcmSetWaitFlip). */
+    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     if (s_flip_handler_opd && g_ps3_guest_caller) {
         g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0);
     }
@@ -517,10 +523,10 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetFlipCommand(bufferId=%u)\n", bufferId);
-
     s_current_display_buffer_id = bufferId;
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
+     * until the present thread's cellGcmTickFlip marks it done (vsync). */
+    s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke via OPD resolution, not a raw call into guest code. */
