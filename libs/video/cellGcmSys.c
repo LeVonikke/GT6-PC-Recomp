@@ -164,6 +164,19 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
  * label slots (0x03000000..0x03001000). Fields are big-endian (vm_write32). */
 #define GCM_CONTROL_GUEST_ADDR 0x03002000u
 
+/* Synthetic guest code EA for the FIFO command-buffer-full callback. The title's
+ * inline gcmReserve calls context->callback(context, count) when `current` nears
+ * `end`; we point the context's callback OPD at this EA and register it in the
+ * PPU function table (ppu_sysprx.cpp: hle_gcm_callback) so the indirect call
+ * routes back into cellGcm_fifo_recycle(). Lives in the injected control page,
+ * never real guest code. MUST match GCM_FIFO_CALLBACK_SENTINEL_EA there. */
+#define GCM_FIFO_CALLBACK_SENTINEL_EA 0x03002F00u
+
+/* EA the ticker's RSX drain has consumed up to. Exposed so the wrap callback can
+ * wait for the RSX to catch up before recycling the ring (else the frame's
+ * just-written commands are lost). Updated in cellGcm_rsx_process_fifo. */
+volatile u32 g_gcm_fifo_drained_ea = 0;
+
 /* ---------------------------------------------------------------------------
  * Internal helpers
  * -----------------------------------------------------------------------*/
@@ -336,7 +349,17 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
         gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
         gwrite32(cdata + 0x8, cmdbuf);              /* current */
-        gwrite32(cdata + 0xC, 0);                   /* callback OPD (bridge fills) */
+        /* Command-buffer-full callback: a guest OPD {func, toc} routed to
+         * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
+         * ring never recycles and the FIFO wedges once `current` reaches `end`. */
+        u32 opd = galloc ? galloc(8, 8) : 0;
+        if (opd) {
+            gwrite32(opd + 0x0, GCM_FIFO_CALLBACK_SENTINEL_EA);  /* func EA */
+            gwrite32(opd + 0x4, 0);                              /* toc (unused) */
+            gwrite32(cdata + 0xC, opd);                          /* callback OPD */
+        } else {
+            gwrite32(cdata + 0xC, 0);
+        }
         if (ctx_out_addr)
             gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
         s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
@@ -469,6 +492,7 @@ void cellGcm_rsx_process_fifo(void)
      * (context+0x8) and advance it. Read it (vm_read32 byte-swaps BE->host). */
     u32 current = vm_read32(s_gcm_context_ea + 0x8);
     if (current < s_get) s_get = s_config.ioAddress;   /* wrapped */
+    g_gcm_fifo_drained_ea = s_get;                      /* publish drain progress */
     if (current <= s_get) return;                       /* nothing new */
 
     u32 words = (current - s_get) / 4;
@@ -482,6 +506,7 @@ void cellGcm_rsx_process_fifo(void)
 
     rsx_process_command_buffer(&s_state, cmds, words * 4);
     s_get += words * 4;
+    g_gcm_fifo_drained_ea = s_get;
 
     /* Report FIFO drain + reference completion back to the guest so its waits
      * unblock: get catches up to put, and ref reflects the last SET_REFERENCE
@@ -493,6 +518,37 @@ void cellGcm_rsx_process_fifo(void)
         vm_write32(GCM_CONTROL_GUEST_ADDR + 4, put);                    /* get = put */
         vm_write32(GCM_CONTROL_GUEST_ADDR + 8, g_rsx_last_reference);   /* ref      */
     }
+}
+
+/* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
+ * context->callback(context, count) (routed here via the synthetic OPD) when the
+ * ring's `current` nears `end`. Real libgcm flushes, waits for the RSX `get` to
+ * pass, then recycles `current` to `begin`. We mirror that: wait (bounded) for
+ * the ticker drain to consume everything up to `current`, then reset current to
+ * begin. Runs on the guest thread; the ticker owns all rendering, so we only
+ * pointer-shuffle here (the drain's own wrap-detect handles s_get). Without this
+ * the ring never recycles and the whole pipeline wedges once the FIFO wraps
+ * (~200 frames at the 256KB default), which looked like a GPU/driver hang. */
+void cellGcm_fifo_recycle(u32 ctx_ea)
+{
+    if (!ctx_ea) return;
+    u32 begin   = vm_read32(ctx_ea + 0x0);
+    u32 current = vm_read32(ctx_ea + 0x8);
+    if (current <= begin) return;                       /* nothing to recycle */
+
+    /* Wait for the RSX drain to catch up to `current` so no commands are lost.
+     * Bounded (~2s) so a stalled ticker degrades to dropped commands, not a
+     * permanent hang. */
+    int spins = 0;
+    while (g_gcm_fifo_drained_ea < current && spins < 2000) { Sleep(1); spins++; }
+    if (spins >= 2000) {
+        static int warned = 0;
+        if (warned++ < 4)
+            printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X current=0x%08X)\n",
+                   g_gcm_fifo_drained_ea, current);
+    }
+
+    vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
 }
 
 /* NID: 0xDC09357E */
