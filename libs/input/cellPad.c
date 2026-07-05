@@ -43,6 +43,12 @@
   #include <SDL2/SDL.h>
 #endif
 
+/* Guest-memory stores (big-endian) — the cellPad*Info/Data pointer args are
+ * guest VM addresses, not host pointers. */
+extern void vm_write16(uint64_t addr, uint16_t v);
+extern void vm_write32(uint64_t addr, uint32_t v);
+extern uint8_t vm_read8(uint64_t addr);
+
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
@@ -370,106 +376,106 @@ void cellPad_poll(void)
 
 s32 cellPadGetData(u32 port_no, CellPadData* data)
 {
+    /* `data` is a GUEST address; build the struct locally then serialize it to
+     * guest memory big-endian (the recompiled title reads it via vm_read). */
+    uint32_t gaddr = (uint32_t)(uintptr_t)data;
+
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
-
-    if (port_no >= s_max_connect || !data)
+    if (port_no >= s_max_connect || !gaddr)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
-
-    memset(data, 0, sizeof(CellPadData));
 
     /* Poll fresh state */
     pad_poll_backend();
 
     if (port_no >= PAD_MAX_HOST_PORTS || !s_host_state[port_no].connected) {
-        data->len = 0;
+        vm_write32(gaddr, 0);   /* len = 0: no new data this poll */
         return CELL_OK;
     }
 
+    CellPadData d;
+    memset(&d, 0, sizeof d);
     PadHostState* hs = &s_host_state[port_no];
     u32 setting = s_port_setting[port_no];
 
-    /* Determine data length based on port settings */
     s32 len = CELL_PAD_LEN_CHANGE_DEFAULT;
     if (setting & CELL_PAD_SETTING_SENSOR_ON)
         len = CELL_PAD_LEN_CHANGE_SENSOR_ON;
     else if (setting & CELL_PAD_SETTING_PRESS_ON)
         len = CELL_PAD_LEN_CHANGE_PRESS_ON;
+    d.len = len;
 
-    data->len = len;
-    data->button[0] = (u16)len;
-    data->button[1] = 0; /* reserved */
+    /* Digital buttons + analog sticks */
+    d.button[CELL_PAD_BTN_OFFSET_DIGITAL1]     = hs->buttons;
+    d.button[CELL_PAD_BTN_OFFSET_DIGITAL2]     = 0;
+    d.button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
+    d.button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
+    d.button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
+    d.button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]  = hs->analog_ly;
 
-    /* Digital buttons */
-    data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = hs->buttons;
-    data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = 0; /* PS button etc. */
-
-    /* Analog sticks */
-    data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
-    data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
-    data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
-    data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]  = hs->analog_ly;
-
-    /* Pressure-sensitive buttons (only meaningful if PRESS_ON) */
     if (setting & CELL_PAD_SETTING_PRESS_ON) {
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_RIGHT]    = hs->press_right;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_LEFT]     = hs->press_left;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_UP]       = hs->press_up;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_DOWN]     = hs->press_down;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE] = hs->press_triangle;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_CIRCLE]   = hs->press_circle;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_CROSS]    = hs->press_cross;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_SQUARE]   = hs->press_square;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_L1]       = hs->press_l1;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_R1]       = hs->press_r1;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_L2]       = hs->trigger_l2;
-        data->button[CELL_PAD_BTN_OFFSET_PRESS_R2]       = hs->trigger_r2;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_RIGHT]    = hs->press_right;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_LEFT]     = hs->press_left;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_UP]       = hs->press_up;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_DOWN]     = hs->press_down;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE] = hs->press_triangle;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_CIRCLE]   = hs->press_circle;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_CROSS]    = hs->press_cross;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_SQUARE]   = hs->press_square;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_L1]       = hs->press_l1;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_R1]       = hs->press_r1;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_L2]       = hs->trigger_l2;
+        d.button[CELL_PAD_BTN_OFFSET_PRESS_R2]       = hs->trigger_r2;
     }
-
-    /* Sensor data (only meaningful if SENSOR_ON) */
     if (setting & CELL_PAD_SETTING_SENSOR_ON) {
-        /* Default sensor values: accelerometer at rest (512 = 1g center) */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399; /* gravity */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
+        d.button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512;
+        d.button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399;
+        d.button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
+        d.button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
     }
 
+    vm_write32(gaddr, (uint32_t)d.len);
+    for (int i = 0; i < CELL_PAD_MAX_CODES; i++)
+        vm_write16(gaddr + 4 + i * 2, d.button[i]);
     return CELL_OK;
 }
 
 s32 cellPadGetInfo2(CellPadInfo2* info)
 {
+    uint32_t gaddr = (uint32_t)(uintptr_t)info;
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
-
-    if (!info)
+    if (!gaddr)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
-    /* Poll to get latest connection state */
     pad_poll_backend();
 
-    memset(info, 0, sizeof(CellPadInfo2));
-    info->max_connect = s_max_connect;
+    CellPadInfo2 in;
+    memset(&in, 0, sizeof in);
+    in.max_connect = s_max_connect;
 
     u32 connected = 0;
     for (u32 i = 0; i < s_max_connect && i < PAD_MAX_HOST_PORTS; i++) {
         if (s_host_state[i].connected) {
-            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED;
-            info->port_setting[i]      = s_port_setting[i];
-            info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
-                                       | CELL_PAD_CAPABILITY_PRESS_MODE
-                                       | CELL_PAD_CAPABILITY_SENSOR_MODE
-                                       | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
-                                       | CELL_PAD_CAPABILITY_ACTUATOR;
-            info->device_type[i]       = CELL_PAD_DEV_TYPE_STANDARD;
+            in.port_status[i]       = CELL_PAD_STATUS_CONNECTED;
+            in.port_setting[i]      = s_port_setting[i];
+            in.device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
+                                    | CELL_PAD_CAPABILITY_PRESS_MODE
+                                    | CELL_PAD_CAPABILITY_SENSOR_MODE
+                                    | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
+                                    | CELL_PAD_CAPABILITY_ACTUATOR;
+            in.device_type[i]       = CELL_PAD_DEV_TYPE_STANDARD;
             connected++;
         } else {
-            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED;
+            in.port_status[i] = CELL_PAD_STATUS_DISCONNECTED;
         }
     }
-    info->now_connect = connected;
+    in.now_connect = connected;
 
+    /* All-u32 struct: serialize word by word (big-endian). */
+    const uint32_t* w = (const uint32_t*)&in;
+    for (u32 i = 0; i < sizeof(in) / 4; i++)
+        vm_write32(gaddr + i * 4, w[i]);
     return CELL_OK;
 }
 
@@ -493,18 +499,19 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (port_no >= CELL_PAD_MAX_PORT_NUM || !info)
+    uint32_t gaddr = (uint32_t)(uintptr_t)info;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM || !gaddr)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
-    memset(info, 0, sizeof(CellPadCapabilityInfo));
-
-    /* Report standard DualShock 3 capabilities */
-    info->info[0] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
-                   | CELL_PAD_CAPABILITY_PRESS_MODE
-                   | CELL_PAD_CAPABILITY_SENSOR_MODE
-                   | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
-                   | CELL_PAD_CAPABILITY_ACTUATOR;
-
+    /* Report standard DualShock 3 capabilities in info[0]; rest zero. */
+    u32 cap = CELL_PAD_CAPABILITY_PS3_CONFORMITY
+            | CELL_PAD_CAPABILITY_PRESS_MODE
+            | CELL_PAD_CAPABILITY_SENSOR_MODE
+            | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
+            | CELL_PAD_CAPABILITY_ACTUATOR;
+    vm_write32(gaddr, cap);
+    for (int i = 1; i < CELL_PAD_MAX_CODES; i++)
+        vm_write32(gaddr + i * 4, 0);
     return CELL_OK;
 }
 
@@ -513,30 +520,29 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (port_no >= CELL_PAD_MAX_PORT_NUM || !param)
+    uint32_t gaddr = (uint32_t)(uintptr_t)param;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM || !gaddr)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
+    /* param is a guest address: read the two motor bytes via vm_read8. */
+    u8 motor_large = vm_read8(gaddr + CELL_PAD_ACTUATOR_PARAM_LARGE);
+    u8 motor_small = vm_read8(gaddr + CELL_PAD_ACTUATOR_PARAM_SMALL);
+    (void)motor_large; (void)motor_small;
+
 #if PAD_BACKEND_XINPUT
-    /* Map to XInput vibration */
     if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].connected) {
         XINPUT_VIBRATION vib;
-        vib.wLeftMotorSpeed  = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257);
-        vib.wRightMotorSpeed = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257);
+        vib.wLeftMotorSpeed  = (WORD)(motor_large * 257);
+        vib.wRightMotorSpeed = (WORD)(motor_small * 257);
         XInputSetState((DWORD)port_no, &vib);
     }
 #endif
-
 #if PAD_BACKEND_SDL2
     if (port_no < PAD_MAX_HOST_PORTS && s_sdl_controllers[port_no]) {
-        SDL_GameControllerRumble(
-            s_sdl_controllers[port_no],
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257),
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257),
-            100 /* duration ms */
-        );
+        SDL_GameControllerRumble(s_sdl_controllers[port_no],
+            (Uint16)(motor_large * 257), (Uint16)(motor_small * 257), 100);
     }
 #endif
-
     return CELL_OK;
 }
 
