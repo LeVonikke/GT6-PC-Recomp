@@ -368,24 +368,35 @@ void cellPad_poll(void)
     }
 }
 
-s32 cellPadGetData(u32 port_no, CellPadData* data)
+/* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. These
+ * runtime helpers translate + byte-swap. (cellPad was written for host pointers
+ * and was never actually invoked until its NIDs were fixed.) */
+extern void vm_write8 (unsigned long long a, unsigned char  v);
+extern void vm_write16(unsigned long long a, unsigned short v);
+extern void vm_write32(unsigned long long a, unsigned int   v);
+
+s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (port_no >= s_max_connect || !data)
+    if (port_no >= s_max_connect || !data_guest)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
+    /* Build in a local host struct, then copy to guest memory big-endian. */
+    CellPadData _d; CellPadData* data = &_d;
     memset(data, 0, sizeof(CellPadData));
 
     /* Poll fresh state */
     pad_poll_backend();
 
-    if (port_no >= PAD_MAX_HOST_PORTS || !s_host_state[port_no].connected) {
-        data->len = 0;
-        return CELL_OK;
+    if (port_no >= PAD_MAX_HOST_PORTS || (!s_host_state[port_no].connected && port_no != 0)) {
+        goto emit;   /* data stays zeroed -> len=0 */
     }
+    /* port 0 is always a valid (virtual) pad; s_host_state[0] is neutral if no
+     * physical device, which yields no-buttons-pressed data below. */
 
+    {
     PadHostState* hs = &s_host_state[port_no];
     u32 setting = s_port_setting[port_no];
 
@@ -434,27 +445,40 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
         data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
         data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
     }
+    }  /* end connected block */
 
+emit:
+    {
+        unsigned int ea = (unsigned int)(uintptr_t)data_guest;
+        vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
+        for (int _i = 0; _i < CELL_PAD_MAX_CODES; _i++)                    /* button[] u16 */
+            vm_write16((unsigned long long)ea + 4 + (unsigned int)_i * 2, data->button[_i]);
+    }
     return CELL_OK;
 }
 
-s32 cellPadGetInfo2(CellPadInfo2* info)
+s32 cellPadGetInfo2(CellPadInfo2* info_guest)
 {
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (!info)
+    if (!info_guest)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     /* Poll to get latest connection state */
     pad_poll_backend();
 
+    /* Build in a local host struct, then copy to guest memory big-endian. */
+    CellPadInfo2 _in; CellPadInfo2* info = &_in;
     memset(info, 0, sizeof(CellPadInfo2));
     info->max_connect = s_max_connect;
 
     u32 connected = 0;
     for (u32 i = 0; i < s_max_connect && i < PAD_MAX_HOST_PORTS; i++) {
-        if (s_host_state[i].connected) {
+        /* Always present a virtual pad on port 0 (standard emulator behavior) so
+         * boot flows that block until a controller is connected can proceed even
+         * with no physical device attached. */
+        if (s_host_state[i].connected || i == 0) {
             info->port_status[i]       = CELL_PAD_STATUS_CONNECTED;
             info->port_setting[i]      = s_port_setting[i];
             info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
@@ -470,6 +494,12 @@ s32 cellPadGetInfo2(CellPadInfo2* info)
     }
     info->now_connect = connected;
 
+    /* copy to guest big-endian (CellPadInfo2 is all u32 fields) */
+    {
+        unsigned int ea = (unsigned int)(uintptr_t)info_guest;
+        for (unsigned int _o = 0; _o < sizeof(CellPadInfo2); _o += 4)
+            vm_write32((unsigned long long)ea + _o, *(u32*)((char*)info + _o));
+    }
     return CELL_OK;
 }
 

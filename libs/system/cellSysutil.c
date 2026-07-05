@@ -152,55 +152,40 @@ s32 cellSysutilCheckCallback(void)
 
 s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
 {
-    if (!value)
+    /* `value` arrives as a RAW GUEST pointer via the generic HLE adapter (it is
+     * not host-translated). Dereferencing it directly faults; write through the
+     * guest VM (vm_write32 handles vm_base offset + big-endian). */
+    extern void vm_write32(unsigned long long addr, unsigned int val);
+    unsigned int gptr = (unsigned int)(unsigned long long)(uintptr_t)value;
+    if (!gptr)
         return CELL_SYSUTIL_ERROR_VALUE;
 
+    s32 v = 0;
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        *value = CELL_SYSUTIL_LANG_ENGLISH_US;
+        v = CELL_SYSUTIL_LANG_ENGLISH_US;
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
-        *value = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
+        v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
         break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:
-        *value = 0; /* YYYYMMDD */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:
-        *value = 0; /* 24-hour */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:
-        *value = 0; /* UTC */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:
-        *value = 0; /* No DST */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:
-        *value = 0; /* No restriction */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT:
-        *value = 0;
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:
-        *value = 1; /* Has NP account */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:
-        *value = 0; /* 60Hz */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:
-        *value = 1; /* Rumble on */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:
-        *value = 0; /* US/101 */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:
-        *value = 0; /* Disabled */
-        break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:    v = 0; break; /* YYYYMMDD */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:    v = 0; break; /* 24-hour */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:       v = 0; break; /* UTC */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:     v = 0; break; /* No DST */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:           v = 0; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT: v = 0; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:   v = 1; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:  v = 0; break; /* 60Hz */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:     v = 1; break; /* Rumble on */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:  v = 0; break; /* US/101 */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:    v = 0; break; /* Disabled */
     default:
         printf("[cellSysutil] GetSystemParamInt: unknown id 0x%04X\n", id);
-        *value = 0;
+        v = 0;
         break;
     }
 
+    vm_write32(gptr, (unsigned int)v);
     return CELL_OK;
 }
 
