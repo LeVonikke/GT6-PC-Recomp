@@ -162,11 +162,13 @@ extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
+extern "C" unsigned cellGcm_flip_request_count(void);
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
     int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "You Don't Know Jack (ps3recomp)") == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
+    unsigned last_flip = 0;
     for (;;) {
         Sleep(16);            /* ~60 Hz */
         cellGcmTickVBlank();
@@ -174,7 +176,16 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         if (rsx_ok) {
             if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
             cellGcm_rsx_process_fifo();      /* execute the game's GCM commands */
-            rsx_d3d12_backend_present();     /* present the frame */
+            /* Present only on a guest flip (frame boundary). A fixed-clock
+             * present can catch the drain mid-frame -- notably while the guest
+             * is blocked in the FIFO-wrap recycle callback -- and flash a
+             * partial frame (clear + a few draws). Before the first flip
+             * present freely so the window isn't stuck white during boot. */
+            unsigned fc = cellGcm_flip_request_count();
+            if (fc != last_flip || fc == 0) {
+                rsx_d3d12_backend_present();
+                last_flip = fc;
+            }
         }
     }
     return 0;
