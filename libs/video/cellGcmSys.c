@@ -81,6 +81,7 @@ static CellGcmConfig s_config;
 
 /* Command buffer control */
 static CellGcmControl s_control;
+static u32 s_control_ea = 0;   /* guest EA of the control register (see getter) */
 
 /* Offset table storage */
 static u16 s_io_address_table[65536];
@@ -123,9 +124,21 @@ extern unsigned vm_read32(unsigned long long);
 extern unsigned long long ppu_guest_call_ct(u32 code, u32 toc, u64 a0, u64 a1, u64 a2, u64 a3);
 static u32 s_flip_handler_code=0,   s_flip_handler_toc=0;
 static u32 s_vblank_handler_code=0, s_vblank_handler_toc=0;
+extern void ppu_register_opd_fixup(u32 opd, u32 code, u32 toc);
 static void capture_handler_ct(u32 opd, u32* code, u32* toc) {
-    if (opd) { *code = vm_read32(opd); *toc = vm_read32(opd + 4); }
+    if (opd) { *code = vm_read32(opd); *toc = vm_read32(opd + 4);
+               /* record so the game's direct calls through this OPD (whose code
+                * word later gets clobbered) still resolve to the real handler. */
+               ppu_register_opd_fixup(opd, *code, *toc); }
     else     { *code = 0; *toc = 0; }
+}
+/* Invoke the title's flip handler. The handler OPD (0x530D70) gets its code word
+ * clobbered in guest memory (read back as the TOC base 0x544370 -> "not
+ * registered"), so calling via the live OPD fails. Use the {code,toc} captured at
+ * registration instead; fall back to the OPD only if nothing was captured. */
+static void invoke_flip_handler(u32 head) {
+    if (s_flip_handler_code)
+        ppu_guest_call_ct(s_flip_handler_code, s_flip_handler_toc, head, 0, 0, 0);
 }
 /* Legacy host-typed slots kept around for any caller still treating
  * these as host pointers. New code should use the _opd slots. */
@@ -345,7 +358,16 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         if (ctx_out_addr)
             gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
         s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
-        fprintf(stderr, "[GCM] SetupContext ctx_ea=0x%08X cmdbuf=0x%08X cmdSize=0x%X ioAddr=0x%08X\n", cdata, cmdbuf, cmdSize, ioAddress);
+        /* Control register in GUEST memory: cellGcmGetControlRegister must hand the
+         * title a guest EA, not &s_control (a host pointer it would truncate to a
+         * garbage guest addr like 0xC708C708). {put,get,ref}. */
+        s_control_ea = galloc ? galloc(16, 16) : 0;
+        if (s_control_ea) {
+            gwrite32(s_control_ea + 0x0, 0);            /* put */
+            gwrite32(s_control_ea + 0x4, 0);            /* get */
+            gwrite32(s_control_ea + 0x8, 0);            /* ref */
+        }
+        fprintf(stderr, "[GCM] SetupContext ctx_ea=0x%08X cmdbuf=0x%08X cmdSize=0x%X ioAddr=0x%08X ctrl_ea=0x%08X\n", cdata, cmdbuf, cmdSize, ioAddress, s_control_ea);
     }
     return cdata;
 }
@@ -375,6 +397,10 @@ s32 cellGcmGetConfiguration(CellGcmConfig* config)
 /* NID: 0x8572A8E0 */
 CellGcmControl* cellGcmGetControlRegister(void)
 {
+    /* Return the GUEST EA (the HLE adapter passes the return straight to r3, which
+     * the title uses as a guest pointer). Returning &s_control (host) would give
+     * the title a 64-bit host pointer truncated to a garbage guest addr. */
+    if (s_control_ea) return (CellGcmControl*)(size_t)s_control_ea;
     return &s_control;
 }
 
@@ -517,9 +543,8 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_last_flip_time = get_timestamp_ns();
 
-    /* Invoke via OPD resolution, not a raw call into guest code. */
-    if (s_flip_handler_opd && g_ps3_guest_caller)
-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0);  /* head 0 = primary display */
+    /* Use the captured {code,toc} (the live OPD's code word is clobbered). */
+    invoke_flip_handler(0);  /* head 0 = primary display */
 
     return CELL_OK;
 }
@@ -554,11 +579,9 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_last_flip_time = get_timestamp_ns();
 
-    /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
-     * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
-     * jumps into guest code and crashes. */
-    if (s_flip_handler_opd && g_ps3_guest_caller)
-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0);
+    /* Use the captured {code,toc} (the live OPD's code word is clobbered to the
+     * TOC base, so resolving the OPD yields an unregistered code). */
+    invoke_flip_handler(0);
 
     return CELL_OK;
 }
@@ -586,6 +609,12 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
     s_flip_handler_opd = (u32)(size_t)handler;
     s_flip_handler = handler;
     capture_handler_ct(s_flip_handler_opd, &s_flip_handler_code, &s_flip_handler_toc);
+    /* Diagnostic: arm a page-guard on the handler OPD to catch the raw store that
+     * clobbers its code word to the TOC base (YDKJ_GUARD). */
+    if (getenv("YDKJ_GUARD") && s_flip_handler_opd) {
+        extern void ppu_guard_page(u32 guest_ea);
+        ppu_guard_page(s_flip_handler_opd);
+    }
     printf("[cellGcmSys] SetFlipHandler(opd=0x%08X) code=0x%08X toc=0x%08X\n",
            s_flip_handler_opd, s_flip_handler_code, s_flip_handler_toc);
 }
@@ -667,6 +696,26 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     }
 
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
+#ifdef _WIN32
+    /* Trace the caller when the address is near-null (a null render object's
+     * field, e.g. 0x28) so we can find which render-setup object is uninitialized.
+     * Resolve each host frame to the guest func_ via function_table (no symbols). */
+    if (address < 0x10000) {
+        extern const struct { unsigned long long addr; void (*func)(void*); const char* name; } function_table[];
+        extern const unsigned long long function_table_count;
+        char* mb=(char*)GetModuleHandleA(0); void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
+        char ln[900]; int p=snprintf(ln,sizeof ln,"[gcm-a2o] near-null addr=0x%08X guest-callers:",address);
+        for(int i=0;i<fr && i<10;i++){
+            uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
+            for(unsigned long long k=0;k<function_table_count;k++){
+                uintptr_t h=(uintptr_t)function_table[k].func;
+                if(h<=tgt && h>bh){ bh=h; bg=function_table[k].addr; }
+            }
+            if(bg) p+=snprintf(ln+p,sizeof(ln)-p," func_%08X+0x%llX",bg,(unsigned long long)(tgt-bh));
+        }
+        fprintf(stderr,"%s\n",ln);
+    }
+#endif
     vm_write32(off_ea, 0);
     return CELL_GCM_ERROR_FAILURE;
 }

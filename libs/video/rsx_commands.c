@@ -256,7 +256,24 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
-    /* Surface configuration */
+    { static int _rt=-1; if(_rt<0) _rt=getenv("YDKJ_RSXTRACE")?1:0;
+      if(_rt){ static int _m=0; if(_m++<250) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
+     * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
+     * buffering). Real hardware DOES this; without it the game's frame-fence
+     * loop (func_0006E6E0 polling label 0x41 @ 0x03000410) spins forever and
+     * never reaches render. NV4097_SET_SEMAPHORE_OFFSET(0x1D6C)=offset (index*0x10
+     * into the GCM label window @0x03000000); NV4097_BACK_END_WRITE_SEMAPHORE_
+     * RELEASE(0x1D70)=value. Also NV406E semaphore release (0x0010 offset/0x0014
+     * value) for the sub-channel path. */
+    { static u32 s_sem_off = 0;
+      if (method == 0x1D6C) { s_sem_off = data; return 0; }
+      if (method == 0x1D70) {
+        extern void vm_write32(uint32_t a, uint32_t v);
+        vm_write32(0x03000000u + (s_sem_off & 0x00FFFFFFu), data);
+        { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence)\n", 0x03000000u+(s_sem_off&0xFFFFFF), data); }
+        return 0;
+      } }
     if (method >= 0x200 && method <= 0x23C)
         return process_surface_method(state, method, data);
 
