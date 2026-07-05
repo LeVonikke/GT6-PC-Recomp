@@ -11,10 +11,18 @@
 
 #include "cellSpurs.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+#include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+
+/* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
+ * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
+ * SpursTasksetContext from the real taskset. Set right before dispatch_async (the PPU
+ * create path is sequential here). Gated by YDKJ_REAL_TASKSET in the dispatch. */
+uint32_t g_ydkj_real_taskset_ea = 0;
+uint32_t g_ydkj_real_taskid     = 0;
 
 /* Generic HLE adapter passes GUEST addresses; translate pointer args. CellSpurs
  * is treated opaquely by the game (passed back as a handle), so translating the
@@ -356,6 +364,11 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 {
     (void)args; (void)priority; (void)maxContention;
 
+    /* Capture the GUEST EAs (raw register values) BEFORE host translation -- the real
+     * BE taskset builder writes to guest memory at these EAs. */
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+    uint32_t spurs_ea   = (uint32_t)(uintptr_t)spurs;
+
     /* Args arrive as guest effective addresses (ps3_hle_call passes raw guest
      * register values); translate to host before dereferencing. */
     spurs   = GUEST_PTR(spurs, CellSpurs*);
@@ -371,7 +384,14 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
     taskset->initialized = 1;
     taskset->spurs = spurs;
 
-    printf("[cellSpurs] CreateTaskset()\n");
+    /* Write the REAL big-endian CellSpursTaskset layout (fork Option-B) so the lifted
+     * SPU leaf + spurs_pm_build_context read valid data (the native writes above are
+     * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
+    spurs_taskset_init(taskset_ea, spurs_ea, args, /*wid*/0,
+                       (uint32_t)sizeof(CellSpursTaskset), /*evf1*/0, /*evf2*/0);
+    g_ydkj_real_taskset_ea = taskset_ea;
+
+    printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
     return CELL_OK;
 }
 
@@ -443,6 +463,12 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
 {
     (void)context; (void)sizeContext; (void)attr;
 
+    /* Capture guest EAs BEFORE host translation (the real BE taskset builder + the
+     * SPU DMA use guest EAs). */
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+    uint32_t elf_ea     = (uint32_t)(uintptr_t)elf;
+    uint32_t context_ea = (uint32_t)(uintptr_t)context;
+
     /* taskId/taskset are guest EAs; translate before deref. elf/context stay
      * guest EAs (handled below — elf is translated for load, context kept EA). */
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
@@ -451,7 +477,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     if (!taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    if (!taskset->initialized)
+    if (!g_ydkj_real_taskset_ea)   /* real-BE init flag (native ->initialized clobbered by BE layout) */
         return CELL_SPURS_TASK_ERROR_STAT;
 
     /* Find a free task slot */
@@ -466,6 +492,15 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
 
             if (taskId_h) *taskId_h = s_tasks[i].id;
             taskset->taskCount++;
+
+            /* Register the task in the REAL BE taskset: writes task_info[slot]
+             * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
+             * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
+            spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
+                                   (uint64_t)context_ea, /*arg*/NULL, /*ls_pattern*/NULL);
+            /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
+            g_ydkj_real_taskset_ea = taskset_ea;
+            g_ydkj_real_taskid     = i;
 
             printf("[cellSpurs] CreateTask(id=%u, entry=%p) - task logged\n",
                    s_tasks[i].id, elf);
