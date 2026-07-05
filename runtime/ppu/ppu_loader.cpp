@@ -338,6 +338,26 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         ctx->gpr[3] = 0;
         return;
     }
+    case 337: {   /* sys_mmapper_search_and_map(u32 start_addr, u32 mem_id,
+                   * u64 flags, u32* alloc_addr). Flat VM: just hand out
+                   * non-overlapping VAs inside the reserved region, sized from
+                   * the allocate_memory bookkeeping (PSL1GHT maps its heap
+                   * blocks this way; the old stub returned OK without writing
+                   * alloc_addr -> the guest used a garbage pointer). */
+        extern uint32_t ps3_mmapper_block_size(uint32_t mem_id);
+        uint32_t start  = (uint32_t)ctx->gpr[3];
+        uint32_t mem_id = (uint32_t)ctx->gpr[4];
+        uint32_t outp   = (uint32_t)ctx->gpr[6];
+        static uint32_t s_map_next = 0;
+        if (!s_map_next) s_map_next = start ? start : 0x11000000u;
+        uint32_t size = ps3_mmapper_block_size(mem_id);
+        if (!size) size = 0x100000u;
+        uint32_t va = s_map_next;
+        s_map_next = (s_map_next + size + 0xFFFFFu) & ~0xFFFFFu;
+        if (outp) vm_write32(outp, va);
+        ctx->gpr[3] = 0;
+        return;
+    }
     case 988:     /* sys_tty_write — canonical LV2 number (psdevwiki); some CRTs
                    * use this instead of 403. Same ABI. */
     case 403: {   /* sys_tty_write(s32 ch, cptr buf, u32 len, ptr pwritelen) */

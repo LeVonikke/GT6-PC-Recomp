@@ -128,7 +128,7 @@ def parse_imports(elf):
         return []
     libstub_start = struct.unpack_from(">I", hdr, 24)[0]
     libstub_end = struct.unpack_from(">I", hdr, 28)[0]
-    imports = []
+    entries = []
     va = libstub_start
     while va < libstub_end:
         s_size = read_vaddr(elf, va, 1)[0]
@@ -138,12 +138,40 @@ def parse_imports(elf):
         modname = _cstr(elf, _u32(elf, va + 0x10) or 0)
         nid_tbl = _u32(elf, va + 0x14)
         stub_tbl = _u32(elf, va + 0x18)
+        entries.append([modname, nfunc, nid_tbl, stub_tbl])
+        va += s_size
+
+    # PSL1GHT's toolchain emits s_imports (nfunc) = 0 with populated NID/stub
+    # tables. The per-library counts are still fully determined by the table
+    # layout: each library's NID (and stub) table runs to the start of the next
+    # library's table. Derive the count as the tightest span available from
+    # either table (the two tables are laid out in different library orders, so
+    # every library is bounded in at least one), falling back to the libstub
+    # table start for the highest NID table.
+    if any(e[1] == 0 and e[2] and e[3] for e in entries):
+        nid_starts = sorted(e[2] for e in entries if e[2])
+        stub_starts = sorted(e[3] for e in entries if e[3])
+
+        def _span(start, starts, fallback):
+            nxt = [s for s in starts if s > start]
+            end = min(nxt) if nxt else fallback
+            return (end - start) // 4 if end and end > start else None
+
+        for e in entries:
+            if e[1] == 0 and e[2] and e[3]:
+                cands = [c for c in (_span(e[2], nid_starts, libstub_start),
+                                     _span(e[3], stub_starts, None))
+                         if c and 0 < c <= 4096]
+                if cands:
+                    e[1] = min(cands)
+
+    imports = []
+    for modname, nfunc, nid_tbl, stub_tbl in entries:
         for i in range(nfunc):
             nid = _u32(elf, nid_tbl + i * 4)
             stub = _u32(elf, stub_tbl + i * 4)
             if nid is not None and stub is not None:
                 imports.append({"library": modname, "nid": hex(nid), "stub": hex(stub)})
-        va += s_size
     return imports
 
 

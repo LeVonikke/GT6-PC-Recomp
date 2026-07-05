@@ -45,6 +45,7 @@
 
 /* Guest-memory stores (big-endian) — the cellPad*Info/Data pointer args are
  * guest VM addresses, not host pointers. */
+extern void vm_write8(uint64_t addr, uint8_t v);
 extern void vm_write16(uint64_t addr, uint16_t v);
 extern void vm_write32(uint64_t addr, uint32_t v);
 extern uint8_t vm_read8(uint64_t addr);
@@ -445,6 +446,39 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
     vm_write32(gaddr, (uint32_t)d.len);
     for (int i = 0; i < CELL_PAD_MAX_CODES; i++)
         vm_write16(gaddr + 4 + i * 2, d.button[i]);
+    return CELL_OK;
+}
+
+/* cellPadGetInfo (v1 API, NID 0x3AAAD464) — used by PSL1GHT's ioPadGetInfo.
+ * Layout (RPCS3 cellPad.h CellPadInfo, all big-endian):
+ *   +0x00 u32 max_connect        +0x04 u32 now_connect   +0x08 u32 system_info
+ *   +0x0C u16 vendor_id[7]       +0x1A u16 product_id[7] +0x28 u8 status[7]
+ * Leaving this unimplemented let the guest read stack garbage as pad state and
+ * run off into the weeds before ever reaching gcm init. */
+s32 cellPadGetInfo(CellPadInfo2* info)
+{
+    uint32_t gaddr = (uint32_t)(uintptr_t)info;
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (!gaddr)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+
+    pad_poll_backend();
+
+    u32 connected = 0;
+    for (u32 i = 0; i < s_max_connect && i < PAD_MAX_HOST_PORTS; i++)
+        if (s_host_state[i].connected) connected++;
+
+    vm_write32(gaddr + 0x00, s_max_connect);
+    vm_write32(gaddr + 0x04, connected);
+    vm_write32(gaddr + 0x08, 0);                       /* system_info */
+    for (u32 i = 0; i < CELL_PAD_MAX_PORT_NUM; i++) {
+        int on = (i < s_max_connect && i < PAD_MAX_HOST_PORTS &&
+                  s_host_state[i].connected);
+        vm_write16(gaddr + 0x0C + i * 2, on ? 0x054C : 0);   /* vendor: Sony  */
+        vm_write16(gaddr + 0x1A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
+        vm_write8(gaddr + 0x28 + i, on ? CELL_PAD_STATUS_CONNECTED : 0);
+    }
     return CELL_OK;
 }
 

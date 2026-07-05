@@ -147,11 +147,22 @@ static void sys_ppu_thread_get_id(ppu_context* ctx)
 /* sys_mmapper_allocate_memory(u32 size, u64 flags, vm::ptr<u32> mem_id) ->
  * hand back a unique opaque id; the backing is the flat VM, so the later
  * search_and_map just needs a non-zero id to track. */
+/* id -> size so sys_mmapper_search_and_map (lv2 337) can lay blocks out
+ * without overlap. Ids are dense from 0x1000. */
+static uint32_t s_mm_sizes[256];
+extern "C" uint32_t ps3_mmapper_block_size(uint32_t mem_id)
+{
+    uint32_t i = mem_id - 0x1000u;
+    return (i < 256) ? s_mm_sizes[i] : 0;
+}
+
 static void sys_mmapper_allocate_memory(ppu_context* ctx)
 {
     static uint32_t s_next_id = 0x1000;
+    uint32_t size       = (uint32_t)ctx->gpr[3];
     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[5];
     if (mem_id_ptr) vm_write32(mem_id_ptr, s_next_id);
+    if (s_next_id - 0x1000u < 256) s_mm_sizes[s_next_id - 0x1000u] = size;
     s_next_id++;
     ctx->gpr[3] = 0;
 }

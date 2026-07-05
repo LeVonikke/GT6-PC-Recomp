@@ -88,14 +88,19 @@ extern "C" {
 #define SYS_EVENT_PORT_DISCONNECT       137
 #define SYS_EVENT_PORT_SEND             138
 
-#define SYS_EVENT_FLAG_CREATE           139
-#define SYS_EVENT_FLAG_DESTROY          140
-#define SYS_EVENT_FLAG_WAIT             141
-#define SYS_EVENT_FLAG_TRYWAIT          142
-#define SYS_EVENT_FLAG_SET              143
-#define SYS_EVENT_FLAG_CLEAR            144
-#define SYS_EVENT_FLAG_CANCEL           145
-#define SYS_EVENT_FLAG_GET              146
+/* Canonical LV2 numbers (RPCS3 lv2.cpp ground truth). The previous 139-146
+ * block was fictional and collided with the timer family: 141 was also
+ * SYS_TIMER_USLEEP, so a PSL1GHT guest's usleep(30us) dispatched to
+ * sys_event_flag_wait(flag=30) -- a 65ms stall per call with bogus results
+ * (vkcube's init polled via usleep, timed out, and exited(-1)). */
+#define SYS_EVENT_FLAG_CREATE           82
+#define SYS_EVENT_FLAG_DESTROY          83
+#define SYS_EVENT_FLAG_WAIT             85
+#define SYS_EVENT_FLAG_TRYWAIT          86
+#define SYS_EVENT_FLAG_SET              87
+#define SYS_EVENT_FLAG_CLEAR            118
+#define SYS_EVENT_FLAG_CANCEL           132
+#define SYS_EVENT_FLAG_GET              139
 
 #define SYS_LWMUTEX_CREATE              150
 #define SYS_LWMUTEX_DESTROY             151
