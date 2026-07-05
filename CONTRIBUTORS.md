@@ -62,6 +62,22 @@ wrong. Landed in **v0.6.1 "Many Hands"**:
 - **`tools/show_func.py`** — dump a single lifted function's C and/or its
   original PowerPC disassembly from the chunked output.
 
+*Also incorporated (**v0.6.5**)* — cellFs big-endian out-params + `CellFsStat`
+PS3 packing (#22), cellGame title id read from `PARAM.SFO` (#24), `sys_rwlock`
+`EDEADLK`/`EPERM` lv2 semantics (#25), and the `crnor`/`crnand` opcode-33/225
+disassembler fix (#40).
+
+### sagemono — [@sagemono](https://github.com/sagemono)
+Real-controller correctness surfaced by a DualShock-as-XInput bring-up
+(**v0.6.5**):
+- **cellPad DIGITAL2 packing** — `hs->buttons` carries DIGITAL1 in its low byte
+  and DIGITAL2 (the face buttons cross/circle/triangle/square + L1/L2/R1/R2) in
+  the high byte; the whole value was being written into DIGITAL1 with DIGITAL2
+  forced to 0, so every face button was dead. Split correctly (#42).
+- **analog-Y centering** — reflect the inverted Y about 128 (`256 - x`) instead
+  of `255 - x`, which turned a centered stick into 127 (`0x7F`, aliasing
+  SELECT+START self-exit + TRIANGLE).
+
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
 in **v0.6.2** — the SPU portions were superseded by the v0.6.0 SPU subsystem and
