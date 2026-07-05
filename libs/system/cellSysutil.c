@@ -9,6 +9,12 @@
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+
+/* Guest-memory stores — out-params from the recompiled title are guest VM
+ * addresses, not host pointers. */
+extern void vm_write8(uint64_t addr, uint8_t v);
+extern void vm_write32(uint64_t addr, uint32_t v);
 
 /* ---------------------------------------------------------------------------
  * Guest callback dispatch hook (set by the game's host code at startup).
@@ -152,55 +158,46 @@ s32 cellSysutilCheckCallback(void)
 
 s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
 {
-    if (!value)
+    /* `value` is a GUEST address (the recompiled title passes its own VM
+     * pointer); dereferencing it as a host pointer faults. Compute locally
+     * and store big-endian via vm_write32 (this crashed minecraft's boot at
+     * its very first GetSystemParamInt(LANG) call). */
+    uint32_t out_ea = (uint32_t)(uintptr_t)value;
+    if (!out_ea)
         return CELL_SYSUTIL_ERROR_VALUE;
 
+    s32 v;
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        *value = CELL_SYSUTIL_LANG_ENGLISH_US;
+        v = CELL_SYSUTIL_LANG_ENGLISH_US;
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
-        *value = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:
-        *value = 0; /* YYYYMMDD */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:
-        *value = 0; /* 24-hour */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:
-        *value = 0; /* UTC */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:
-        *value = 0; /* No DST */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:
-        *value = 0; /* No restriction */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT:
-        *value = 0;
+        v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:
-        *value = 1; /* Has NP account */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:
-        *value = 0; /* 60Hz */
+        v = 1; /* Has NP account */
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:
-        *value = 1; /* Rumble on */
+        v = 1; /* Rumble on */
         break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:
-        *value = 0; /* US/101 */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:
-        *value = 0; /* Disabled */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:     /* YYYYMMDD */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:     /* 24-hour  */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:        /* UTC      */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:      /* no DST   */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT:
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:   /* 60Hz     */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:   /* US/101   */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:     /* disabled */
+        v = 0;
         break;
     default:
         printf("[cellSysutil] GetSystemParamInt: unknown id 0x%04X\n", id);
-        *value = 0;
+        v = 0;
         break;
     }
 
+    vm_write32(out_ea, (uint32_t)v);
     return CELL_OK;
 }
 
@@ -210,17 +207,26 @@ s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize)
         return CELL_SYSUTIL_ERROR_VALUE;
 
     switch (id) {
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME:
-        strncpy(buf, "ps3recomp_user", bufsize - 1);
-        buf[bufsize - 1] = '\0';
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME: {
+        /* `buf` is a GUEST address — serialize byte-wise via vm_write8. */
+        const char* s = "ps3recomp_user";
+        uint32_t ea = (uint32_t)(uintptr_t)buf;
+        u32 i;
+        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(ea + i, (uint8_t)s[i]);
+        vm_write8(ea + i, 0);
         break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USERNAME:
-        strncpy(buf, "User", bufsize - 1);
-        buf[bufsize - 1] = '\0';
+    }
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USERNAME: {
+        const char* s = "User";
+        uint32_t ea = (uint32_t)(uintptr_t)buf;
+        u32 i;
+        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(ea + i, (uint8_t)s[i]);
+        vm_write8(ea + i, 0);
         break;
+    }
     default:
         printf("[cellSysutil] GetSystemParamString: unknown id 0x%04X\n", id);
-        buf[0] = '\0';
+        vm_write8((uint32_t)(uintptr_t)buf, 0);
         break;
     }
 
