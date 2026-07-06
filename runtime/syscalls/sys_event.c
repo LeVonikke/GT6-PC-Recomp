@@ -3,6 +3,7 @@
  */
 
 #include "sys_event.h"
+#include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
@@ -915,9 +916,29 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
         }
+    } else if (timeout_us < 1000) {
+        /* Sub-ms timed wait: poll the pattern to a QPC deadline instead of a
+         * floored-to-1ms condvar wait. Safe to poll: f->pattern only changes
+         * under f->lock (sys_event_flag_set/clear), so yielding with the lock
+         * dropped never misses a committed pattern change -- it just re-reads
+         * the latest value on the next lock acquisition. */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
+        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+            if (lv2_deadline_passed(deadline)) {
+                /* Write current pattern even on timeout */
+                if (result_addr != 0) {
+                    uint64_t* out = (uint64_t*)vm_to_host(result_addr);
+                    *out = bswap64(f->pattern);
+                }
+                LeaveCriticalSection(&f->lock);
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+            }
+            LeaveCriticalSection(&f->lock);
+            SwitchToThread();
+            EnterCriticalSection(&f->lock);
+        }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        if (ms == 0) ms = 1;
         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
             if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
