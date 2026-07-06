@@ -62,6 +62,15 @@ wrong. Landed in **v0.6.1 "Many Hands"**:
 - **`tools/show_func.py`** — dump a single lifted function's C and/or its
   original PowerPC disassembly from the chunked output.
 
+*Also incorporated (**v0.6.4** "Carry the One")* — the PPU **XER[CA] carry/borrow
+bug class** (shift-algebraic `sraw`/`srad` forms + `mtcrf` mask, #21;
+`subfe`/`subfme`/`addme`, #26), `cntlzw(0) = 32` (#35), the **PPU lifter
+conformance suite** (#37), and the `vcmpgt*` handlers (#39); the SPU
+**computed-`bi $r0` tail-jump classifier** (#36), self-referential branch
+mislift fix (#30), full SPU ISA coverage (#31), byte-correct quadword helpers
+(#32), `il` double sign-extension (#33), and preferred-slot link register +
+`rchcnt` (#34); plus `mftb`/`mftbu` reading a real timebase (#38).
+
 *Also incorporated (**v0.6.5**)* — cellFs big-endian out-params + `CellFsStat`
 PS3 packing (#22), cellGame title id read from `PARAM.SFO` (#24), `sys_rwlock`
 `EDEADLK`/`EPERM` lv2 semantics (#25), and the `crnor`/`crnand` opcode-33/225

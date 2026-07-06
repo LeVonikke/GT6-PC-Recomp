@@ -358,6 +358,26 @@ for who did what — thank you, everyone.
 ### v0.6.4 — *"Carry the One"* (July 2026)
 *A pass of hard-won correctness fixes surfaced by driving flOw (PhyreEngine, ~104k functions) deep into its boot — plus the SPU-side plumbing to get a SPURS taskset actually dispatching. Most of these are silent-corruption bugs: the lift produced valid C for the *wrong* computation, so nothing crashed until a data structure quietly filled with garbage thousands of frames later.*
 
+**Community PRs incorporated** — thank you [@canersaka](https://github.com/canersaka), who found and fixed all of the below and sent them in as pull requests:
+
+*PPU lift*
+- **XER[CA] for the shift-algebraic ops** (`sraw`/`srad`/`srawi`/`sradi`) + `mtcrf` field mask — (#21)
+- **XER[CA] for `subfe`/`subfme`/`addme`** — (#26)
+- **`cntlzw(0)` is 32**, not undefined `__builtin_clz` garbage — (#35)
+- **PPU lifter conformance suite** + six emission fixes it found — (#37)
+- **`vcmpgtsb`/`sh`/`sw`/`ub`/`uh`/`uw` handlers** (dot forms set CR6) — (#39)
+
+*SPU lift*
+- **`bi $r0` reloaded via `lqa`/`lqr` is a computed tail jump**, not a return — (#36)
+- **self-referential SPU branch mislifts** — (#30)
+- **complete SPU ISA coverage** (all 199 ops + double-precision) — (#31)
+- **byte-correct SPU quadword helpers** (`shufb`, `cbd`/`chd`/`cwd`/`cdd`) — (#32)
+- **`il` negative-immediate double sign-extension** — (#33)
+- **preferred-slot-only link register + `rchcnt`** — (#34)
+
+*Runtime*
+- **`mftb`/`mftbu` read a real timebase** — (#38)
+
 **PPU lift — the carry/borrow bug class** (`ppu_lifter.py`):
 - **64-bit `add` never wrote XER[CA]** and truncated the carry-out to 32 bits. Any `adde`/`addze`/`subfe` consumer downstream (bignum math, 64-bit pointer arithmetic, the CRT's own `__eabi` helpers) then read a stale carry. Now sets CA from the true unsigned 64-bit carry-out.
 - **`subfic` computed a 32-bit result and dropped the borrow** — rewritten as `EXTS(SI) - RA` over the full 64 bits with `XER[CA] = NOT borrow` (`EXTS(SI) >= RA`).
