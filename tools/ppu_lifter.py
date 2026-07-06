@@ -578,11 +578,18 @@ class PPULifter:
             return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)(int32_t)ctx->gpr[{ra}] * "
                     f"(int64_t)(int32_t)ctx->gpr[{rb}]);")
 
-        if mn in ("mulhw", "mulhw."):
+        # mulhw/mulhwu have no architected OE form (PowerISA gives OE variants
+        # only to mullw/mulld); XO=75/11 with OE=1 set is a reserved encoding,
+        # but ppu_disasm's shared OE-suffix decode can still label it
+        # "mulhwo"/"mulhwuo". startswith() accepts that label and lifts it
+        # identically to the plain form, matching this file's convention of
+        # never writing XER[OV]/[SO] for any OE-form op (see add/subf/mullw
+        # above and addc/subfc/addme family below).
+        if mn.startswith("mulhw") and not mn.startswith("mulhwu"):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)((int64_t)(int32_t)ctx->gpr[{ra}] * (int64_t)(int32_t)ctx->gpr[{rb}] >> 32));"
 
-        if mn in ("mulhwu", "mulhwu."):
+        if mn.startswith("mulhwu"):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[{ra}] * (uint64_t)(uint32_t)ctx->gpr[{rb}] >> 32));"
 
@@ -1253,7 +1260,14 @@ class PPULifter:
                     f"ctx->gpr[{ra}] / ctx->gpr[{rb}] : 0;")
 
         # ------- Add/subtract extended (with carry) -------
-        if mn in ("adde", "adde."):
+        # startswith() captures the . (record) and o (overflow) variants, matching
+        # the addc/subfc and addme/subfme/subfze family convention below: the OE
+        # form computes the identical result and XER[CA] as the plain form. This
+        # project's lifter does not track XER[OV]/[SO] for any OE-form op (add,
+        # subf, mullw, addc, subfc, addme/subfme/subfze all share that same
+        # no-OV convention above/below), so addeo/subfeo follow suit rather than
+        # being singled out for partial overflow support.
+        if mn.startswith("adde"):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
                     f"uint64_t result = ctx->gpr[{ra}] + ctx->gpr[{rb}] + ca; "
@@ -1269,7 +1283,7 @@ class PPULifter:
                     f"((result < ctx->gpr[{ra}]) ? (1u << 29) : 0); "
                     f"ctx->gpr[{rd}] = result; }}")
 
-        if mn in ("subfe", "subfe."):
+        if mn.startswith("subfe"):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             # XER[CA] = ADC carry-out of (~RA + RB + ca), per PowerISA / RPCS3 add64_flags.
             return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
@@ -2009,6 +2023,34 @@ class PPULifter:
             vd = int(ops[0][1:]); vb = int(ops[-1][1:])
             return (f"{{ int16_t* b=(int16_t*)&ctx->vr[{vb}]; int32_t r[4]; "
                     f"for(int i=0;i<4;i++) r[i]=(int32_t)b[i]; "
+                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
+
+        if mn == "vupklsh":
+            # Unpack low signed halfword (AltiVec PEM 6-176, Fig 6-147):
+            # sign-extend the LOW 4 halfwords (BE elements 4-7) to 4 words in
+            # vD. Mirror of vupkhsh over the low half. temp so vD may alias
+            # vB. ops[-1] for vB (matches the vupkhsh convention above).
+            vd = int(ops[0][1:]); vb = int(ops[-1][1:])
+            return (f"{{ int16_t* b=(int16_t*)&ctx->vr[{vb}]; int32_t r[4]; "
+                    f"for(int i=0;i<4;i++) r[i]=(int32_t)b[4+i]; "
+                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
+
+        if mn == "vupkhsb":
+            # Unpack high signed byte (AltiVec PEM 6-172, Fig 6-143):
+            # sign-extend the HIGH 8 signed bytes (elements 0-7) to 8 signed
+            # halfwords in vD. temp so vD may alias vB.
+            vd = int(ops[0][1:]); vb = int(ops[-1][1:])
+            return (f"{{ int8_t* b=(int8_t*)&ctx->vr[{vb}]; int16_t r[8]; "
+                    f"for(int i=0;i<8;i++) r[i]=(int16_t)b[i]; "
+                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
+
+        if mn == "vupklsb":
+            # Unpack low signed byte (AltiVec PEM 6-175, Fig 6-146):
+            # sign-extend the LOW 8 signed bytes (elements 8-15) to 8 signed
+            # halfwords in vD. Mirror of vupkhsb over the low half.
+            vd = int(ops[0][1:]); vb = int(ops[-1][1:])
+            return (f"{{ int8_t* b=(int8_t*)&ctx->vr[{vb}]; int16_t r[8]; "
+                    f"for(int i=0;i<8;i++) r[i]=(int16_t)b[8+i]; "
                     f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
         # Shifts and rotates
