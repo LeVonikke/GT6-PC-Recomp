@@ -2204,6 +2204,29 @@ class PPULifter:
         if not all_refs:
             return 0
 
+        # Address-indexed view of all_insns so we can hand lift_function a small
+        # pre-sliced sublist instead of the full instruction stream. Without this,
+        # each lift_function(all_insns, ...) below rescans the entire ~millions-
+        # long instruction list twice (O(N) per target); across thousands of
+        # mid-function/gap targets x up to 25 passes that becomes a multi-O(N^2)
+        # hang on large binaries (observed: ~40 min, no output, on a 96k-function
+        # game EXEC). Slicing makes each lift O(span). Behaviour-preserving:
+        # lift_function already ignores instructions outside [start, end).
+        import bisect
+        _insn_addrs = [ins.addr for ins in all_insns]
+        if all(_insn_addrs[i] <= _insn_addrs[i + 1]
+               for i in range(len(_insn_addrs) - 1)):
+            _base, _base_addrs = all_insns, _insn_addrs
+        else:
+            _order = sorted(range(len(all_insns)), key=lambda i: _insn_addrs[i])
+            _base = [all_insns[i] for i in _order]
+            _base_addrs = [_insn_addrs[i] for i in _order]
+
+        def _insn_slice(a: int, b: int) -> list:
+            lo = bisect.bisect_left(_base_addrs, a)
+            hi = bisect.bisect_left(_base_addrs, b)
+            return _base[lo:hi]
+
         # Build an interval map: sorted list of (start, end) for existing funcs
         func_intervals = sorted((f.start_addr, f.end_addr) for f in self.functions)
 
@@ -2245,7 +2268,7 @@ class PPULifter:
             # short tail from any interior entry; bounding it keeps the common case
             # exact and turns the pathological case into a harmless truncated stub.
             fend = min(fend, target + _MAX_MID_TAIL)
-            tail_func = self.lift_function(all_insns, target, fend)
+            tail_func = self.lift_function(_insn_slice(target, fend), target, fend)
             # lift_function already appends to self.functions, so it's included
             # in output. Update defined set so we don't re-generate.
             defined.add(target)
@@ -2266,7 +2289,7 @@ class PPULifter:
                 bound = min(bound, target + _MAX_MID_TAIL)   # cap span (see above)
                 if bound <= target:
                     continue
-                self.lift_function(all_insns, target, bound)
+                self.lift_function(_insn_slice(target, bound), target, bound)
                 defined.add(target)
                 count += 1
 
