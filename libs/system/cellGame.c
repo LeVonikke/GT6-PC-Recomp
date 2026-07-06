@@ -341,9 +341,14 @@ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
     return CELL_OK;
 }
 
-s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName)
+s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
+                            char* tmp_usrdirPath)
 {
     printf("[cellGame] CreateGameData()\n");
+
+    uint32_t init_ea = (uint32_t)(uintptr_t)init;   /* guest addrs */
+    if (!init_ea)
+        return CELL_GAME_ERROR_PARAM;
 
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", s_content_path, s_title_id);
@@ -355,18 +360,19 @@ s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName)
     snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
     ensure_dirs(usrdir);
 
-    uint32_t dir_ea = (uint32_t)(uintptr_t)dirName;   /* guest addrs */
-    uint32_t size_ea = (uint32_t)(uintptr_t)size;
-    if (dir_ea) {
-        size_t len = strlen(s_title_id);
+    uint32_t cip_ea = (uint32_t)(uintptr_t)tmp_contentInfoPath;
+    uint32_t usr_ea = (uint32_t)(uintptr_t)tmp_usrdirPath;
+    if (cip_ea) {
+        size_t len = strlen(path);
         if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
-        memcpy(vm_base + dir_ea, s_title_id, len);
-        vm_base[dir_ea + len] = '\0';
+        memcpy(vm_base + cip_ea, path, len);
+        vm_base[cip_ea + len] = '\0';
     }
-    if (size_ea) {
-        vm_write32(size_ea + 0, 1024 * 1024);
-        vm_write32(size_ea + 4, 0);
-        vm_write32(size_ea + 8, 0);
+    if (usr_ea) {
+        size_t len = strlen(usrdir);
+        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
+        memcpy(vm_base + usr_ea, usrdir, len);
+        vm_base[usr_ea + len] = '\0';
     }
 
     return CELL_OK;
