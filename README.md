@@ -339,6 +339,25 @@ for who did what — thank you, everyone.
 
 ## Changelog
 
+### v0.6.6 — *"Two Ports, One Toolkit"* (July 2026)
+*Two independent retail-game ports kept fuzzing the toolkit: [@canersaka](https://github.com/canersaka)'s **Yakuza: Dead Souls** and [@JonathanDC64](https://github.com/JonathanDC64)'s **Demon's Souls**. This release distills the title-agnostic correctness/robustness wins each surfaced — the port-specific scaffolding stays in the forks.*
+
+**PPU / SPU lift**
+- **`fsqrt`/`fsqrts` source-register decode** + **`vspltis`** printed as a signed immediate (`ppu_disasm`) — *[@canersaka](https://github.com/canersaka)* (#46)
+- **`addeo`/`subfeo`/`mulhwo`/`mulhwuo` overflow forms** (previously fell through to a no-op stub) + **`vupklsb`/`vupkhsb`/`vupklsh`** unpacks — *[@canersaka](https://github.com/canersaka)* (#52)
+- **Cross-function SPU tail calls forced with `musttail`** — a guest loop whose back-edge crosses a lifted-function boundary was nesting one host C frame per iteration and silently overflowing the stack (a stack-overflow SE runs no unhandled filter, so the process died with no log and exit code 0); now an O(1)-stack jump under clang — *[@JonathanDC64](https://github.com/JonathanDC64)*
+- **Mid-function / gap lifting sliced O(n²)→O(span)** — a ~40-minute no-output hang on 96k+ function titles is now bounded work — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**Runtime & lv2**
+- **Sub-millisecond `sys_timer` usleep** — was a single `SwitchToThread()`, so `usleep(<1000)` was a no-op; now paces to a QPC deadline — *[@canersaka](https://github.com/canersaka)* (#44)
+- **`sys_event_queue_receive` returns the event in r4–r7** (lv2 ABI), not just the guest memory buffer — callers reading the registers saw stale values — *[@JonathanDC64](https://github.com/JonathanDC64)*
+- **`sys_memory_get_page_attribute`** renumbered 358→**351** (0x15F) and implemented — *[@JonathanDC64](https://github.com/JonathanDC64)*
+- **`CellFsStat` runtime-side layout** corrected to the 52-byte / 4-byte-aligned ABI — fixes the `ppu_fs.cpp` / `sys_fs.c` stat writers the v0.6.5 libs-side packing fix didn't cover — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**HLE libs**
+- **`cellNetCtl`** integer out-params written big-endian — *[@canersaka](https://github.com/canersaka)* (#45)
+- **`cellAudio`** delivers real period events to the registered notify queues (games blocked on the audio event now wake) — *[@canersaka](https://github.com/canersaka)* (#54)
+
 ### v0.6.5 — *"The Fifteen-Millisecond Tax"* (July 2026)
 *Driving **You Don't Know Jack** (Scaleform UI + FMOD, 5,859 functions) from an instant crash to its running main loop surfaced one global performance bug worth more than any single lift fix — plus a batch of community lifter/HLE correctness PRs.*
 
