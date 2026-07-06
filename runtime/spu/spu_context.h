@@ -125,6 +125,12 @@ typedef struct spu_context {
     #define SPU_STATUS_STOPPED_BY_STOP  0x2
     #define SPU_STATUS_STOPPED_BY_HALT  0x4
     #define SPU_STATUS_WAITING_CHANNEL  0x8
+
+    /* 14-bit signal code of the most recent `stop`/`stopd`. SPURS leaf tasks
+     * invoke kernel syscalls via `stop <code>` (CELL_SPURS_TASK_SYSCALL_EXIT=0,
+     * YIELD=1, WAIT_SIGNAL=2, POLL=3, RECV_WKL_FLAG=4; |0x10 = the v2 form), so
+     * the taskset-PM emulation must read the code, not just halt. */
+    uint32_t stop_code;
     #define SPU_STATUS_SINGLE_STEP  0x10
 
     /* SPU thread identification */

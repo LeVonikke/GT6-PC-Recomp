@@ -364,7 +364,10 @@ class SPULifter:
         if mn == "fscrwr":
             return "/* fscrwr: FP status/control write (no-op in recomp) */;"
         if mn == "stop":
-            return "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;"
+            # Preserve the 14-bit stop-and-signal code: SPURS leaf tasks use
+            # `stop <code>` to invoke kernel syscalls (EXIT/YIELD/WAIT_SIGNAL/...).
+            return (f"ctx->stop_code = 0x{insn.raw & 0x3FFF:X}u; "
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
         # ---- immediate loaders ----
         if mn == "il":
@@ -391,7 +394,8 @@ class SPULifter:
         if mn in ("hgti", "hlgti", "heqi", "hgt", "hlgt", "heq"):
             return f"/* {mn}: halt-on-condition (no-op in recomp) */;"
         if mn == "stopd":
-            return "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;"
+            return ("ctx->stop_code = 0u; "
+                    "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
         # ---- integer arithmetic (register) ----
         rr_bin = {
