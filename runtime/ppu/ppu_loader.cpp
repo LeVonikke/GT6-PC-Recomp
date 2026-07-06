@@ -1181,10 +1181,15 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[13] = PPU_TLS_TP;
     ctx.cia     = code;
-    g_active_ctx = &ctx;
+    /* Save/restore g_active_ctx: this scratch ctx lives on the stack, so leaving
+     * g_active_ctx pointing at it after we return leaves a DANGLING pointer once the
+     * frame is reused -- corrupting the crash handler / any diagnostic that reads the
+     * current-thread ctx. Restore the caller's. */
+    ppu_context* saved_active = g_active_ctx;
     g_active_ctx = &ctx;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    g_active_ctx = saved_active;
     return ctx.gpr[3];
 }
 
@@ -1209,9 +1214,13 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[13] = PPU_TLS_TP;
     ctx.cia     = code;
+    /* Save/restore g_active_ctx (see ppu_guest_call): the scratch ctx is stack-local,
+     * so a dangling g_active_ctx after return corrupts the crash handler / diagnostics. */
+    ppu_context* saved_active = g_active_ctx;
     g_active_ctx = &ctx;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    g_active_ctx = saved_active;
     return ctx.gpr[3];
 }
 
