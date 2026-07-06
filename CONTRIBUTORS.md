@@ -79,6 +79,30 @@ relocating a decrypted PRX to lift a real firmware module (e.g. the libsre
 SPURS kernel) instead of HLE-ing it, under a bring-your-own-firmware model
 that ships nothing derived from firmware (#53).
 
+*Also incorporated (**v0.6.6** "Two Ports, One Toolkit")* — `fsqrt`/`fsqrts`
+source-register decode + `vspltis` signed-immediate printing (#46), the
+`addeo`/`subfeo`/`mulhwo`/`mulhwuo` overflow forms + `vupklsb`/`vupkhsb`/`vupklsh`
+unpacks (#52), sub-millisecond `sys_timer` usleep (#44), `cellNetCtl` big-endian
+out-params (#45), and `cellAudio` period-event delivery to notify queues (#54).
+
+### Jonathan Del Corpo — [@JonathanDC64](https://github.com/JonathanDC64)
+Correctness and robustness fixes distilled from a **Demon's Souls** port that
+stress-tested the toolkit against a ~106k-function title. The title-agnostic wins
+incorporated (**v0.6.6**):
+- **SPU cross-function tail calls forced with `musttail`** — a guest loop whose
+  back-edge crosses a lifted-function boundary was nesting one host C frame per
+  iteration and silently overflowing the stack (a stack-overflow SE runs no
+  unhandled filter, so the process died with no crash log and exit code 0); now an
+  O(1)-stack jump under clang, with a call+return fallback elsewhere.
+- **Mid-function / gap lifting sliced O(n²)→O(span)** — turned a ~40-minute
+  no-output hang on 96k+ function titles into bounded work.
+- **`sys_event_queue_receive` returns the event in r4–r7** (lv2 ABI) — callers
+  that read the registers instead of the `sys_event_t*` buffer saw stale values.
+- **`sys_memory_get_page_attribute`** renumbered 358→351 (0x15F) and implemented.
+- **`CellFsStat` runtime-side layout** corrected to the 52-byte / 4-byte-aligned
+  ABI, fixing the `ppu_fs.cpp` / `sys_fs.c` stat writers the v0.6.5 libs-side fix
+  didn't cover.
+
 ### sagemono — [@sagemono](https://github.com/sagemono)
 Real-controller correctness surfaced by a DualShock-as-XInput bring-up
 (**v0.6.5**):
