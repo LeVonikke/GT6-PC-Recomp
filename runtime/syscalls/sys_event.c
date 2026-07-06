@@ -370,7 +370,20 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     pthread_mutex_unlock(&q->lock);
 #endif
 
-    /* Write event to guest memory in big-endian */
+    /* lv2 sys_event_queue_receive returns the event in REGISTERS r4..r7
+     * (r3=rc, r4=source, r5=data1, r6=data2, r7=data3) -- this is the ABI the
+     * caller reads (e.g. the SPURS service func_00C5DAB0 checks r4==source key,
+     * extracts the selector from r6). We were only writing the (legacy) memory
+     * buffer, so callers that read the registers saw stale values -> the SPURS
+     * dispatch failed its source check and re-received forever, never dispatching
+     * handler B. Set the registers. */
+    ctx->gpr[4] = evt.source;
+    ctx->gpr[5] = evt.data1;
+    ctx->gpr[6] = evt.data2;
+    ctx->gpr[7] = evt.data3;
+
+    /* Also write the (legacy) guest memory buffer in big-endian, for callers that
+     * pass a real sys_event_t* and read from it. */
     if (event_addr != 0) {
         uint64_t* out = (uint64_t*)vm_to_host(event_addr);
         out[0] = bswap64(evt.source);
