@@ -20,6 +20,14 @@
 #include <stdint.h>
 #include <math.h>
 
+/* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
+ * rather than including sys_event.h to avoid pulling PPU context/syscall
+ * table types into the HLE audio module. */
+extern int      sys_event_queue_push_by_id(uint32_t queue_id,
+                                            uint64_t source, uint64_t data1,
+                                            uint64_t data2,  uint64_t data3);
+extern uint32_t sys_event_find_queue_by_key(uint64_t key);
+
 /* ---------------------------------------------------------------------------
  * Backend selection
  * -----------------------------------------------------------------------*/
@@ -417,13 +425,17 @@ static void audio_mix_one_block(void)
 
 static void audio_notify_event_queues(void)
 {
-    /*
-     * In a full emulator, this would send a sys_event to each registered
-     * event queue so the game knows it can write the next audio block.
-     * Here we just update state; the game-side event queue integration
-     * would be in the sys_event module.
-     */
-    (void)s_notify_queues; /* suppress unused warning */
+    /* Push the audio-period event (data1 = CELL_AUDIO_EVENT_MIX = 0) to each
+     * registered notify queue, so the game's audio loop (blocked on
+     * sys_event_queue_receive) wakes once per block and writes the next one.
+     * Resolve the queue by its ipc_key (set via cellAudioSetNotifyEventQueue). */
+    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
+        if (!s_notify_queues[i].in_use) continue;
+        uint32_t qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
+        if (qid)
+            sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
+                                       0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
+    }
 }
 
 #ifdef _WIN32
