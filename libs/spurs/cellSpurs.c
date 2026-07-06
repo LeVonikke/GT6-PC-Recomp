@@ -23,6 +23,7 @@
  * create path is sequential here). Gated by YDKJ_REAL_TASKSET in the dispatch. */
 uint32_t g_ydkj_real_taskset_ea = 0;
 uint32_t g_ydkj_real_taskid     = 0;
+uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the taskset-policy handoff) */
 
 /* Generic HLE adapter passes GUEST addresses; translate pointer args. CellSpurs
  * is treated opaquely by the game (passed back as a handle), so translating the
@@ -391,6 +392,7 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
                        (uint32_t)sizeof(CellSpursTaskset), /*evf1*/0, /*evf2*/0);
     g_ydkj_real_taskset_ea = taskset_ea;
 
+    g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
     printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
     return CELL_OK;
 }
