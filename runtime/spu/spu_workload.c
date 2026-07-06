@@ -264,8 +264,16 @@ static void spu_async_run(spu_async_job* j)
                 extern uint8_t* vm_base;
                 extern void tsp_spu_func_00000A00(spu_context*);
                 if (vm_base) memcpy(ls + 0xA00, vm_base + 0x30023680, 0x2200);
-                /* SpursKernelContext.spurs (LS[0x1C0]) = the CellSpurs instance EA. */
-                uint32_t inst = 0x40009D00u;
+                /* Build the REAL SpursTasksetContext at LS 0x2700 (taskset ptr @0x27B8,
+                 * TaskInfo @0x2780, syscallAddr @0x27C4) from the actual game taskset,
+                 * so the policy's DMAs read valid data instead of garbage. The instance
+                 * ptr (LS[0x1C0]) was a hardcoded 0x40009D00 that mismatched the game's
+                 * real 0x40009F00 -> policy DMA'd garbage -> null branches. */
+                extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                extern uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                if (g_ydkj_real_taskset_ea)
+                    spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+                uint32_t inst = g_ydkj_real_spurs_ea ? g_ydkj_real_spurs_ea : 0x40009D00u;
                 uint8_t* p = ls + 0x1C0;
                 p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
                 p[4]=(uint8_t)(inst>>24); p[5]=(uint8_t)(inst>>16);

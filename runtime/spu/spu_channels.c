@@ -475,12 +475,15 @@ void spu_indirect_branch(spu_context* ctx)
     if (ctx->image_id == 23 && !getenv("YDKJ_NO_CRI_R4")) {
         static int s_r4 = -1; if (s_r4 < 0) s_r4 = getenv("YDKJ_CRI_CHAIN") ? 1 : 0;
         if (s_r4) {
-            /* Force ctxt->taskset @LS 0x27B8 = taskset EA (u64 0x0F000000) on every
+            /* Force ctxt->taskset @LS 0x27B8 = the REAL game taskset EA on every
              * image-23 branch, so the policy's atomic reads + context-EA computation
-             * use MY taskset (the r4 handoff sets it to garbage 0x0000FFFF via a path
-             * we can't intercept). Bytes 0x27B8..0x27BF = 00 00 00 00 0F 00 00 00. */
+             * use the actual taskset (the r4 handoff sets it to garbage 0x0000FFFF via
+             * a path we can't intercept). Was hardcoded 0x0F000000, which mismatched
+             * the game's real taskset (0x45F1B000) -> policy DMA'd garbage. */
+            extern uint32_t g_ydkj_real_taskset_ea;
+            uint32_t ts = g_ydkj_real_taskset_ea ? g_ydkj_real_taskset_ea : 0x0F000000u;
             ctx->ls[0x27B8]=0x00; ctx->ls[0x27B9]=0x00; ctx->ls[0x27BA]=0x00; ctx->ls[0x27BB]=0x00;
-            ctx->ls[0x27BC]=0x0F; ctx->ls[0x27BD]=0x00; ctx->ls[0x27BE]=0x00; ctx->ls[0x27BF]=0x00;
+            ctx->ls[0x27BC]=(uint8_t)(ts>>24); ctx->ls[0x27BD]=(uint8_t)(ts>>16); ctx->ls[0x27BE]=(uint8_t)(ts>>8); ctx->ls[0x27BF]=(uint8_t)ts;
             if (ctx->pc == 0xA00u) { static int _n=0; if (_n++ < 4)
                 fprintf(stderr, "[cri-r4] policy entry pc=0xA00: forced ctxt->taskset LS[0x27B8]=0x0F000000\n"); }
         }
