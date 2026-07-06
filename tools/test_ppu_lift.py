@@ -28,6 +28,7 @@ need a vm stub harness).
 import argparse
 import os
 import random
+import struct
 import subprocess
 import sys
 
@@ -72,6 +73,9 @@ def cmp_form(xo, bf, l, ra, rb):
 
 def cmpi_form(op, bf, l, ra, imm):
     return (op << 26) | (bf << 23) | (l << 21) | (ra << 16) | (imm & 0xFFFF)
+
+def vx_form(xo, vd, va, vb):
+    return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | xo
 
 # ---------------------------------------------------------------------------
 # PowerISA reference semantics (independent of the lifter). 64-bit registers;
@@ -197,6 +201,31 @@ def ref_divdu(a, b):
         return None, None
     return (a // b) & MASK64, None
 
+# --- vupk*: AltiVec sign-extend unpacks. Element SELECTION (which half of
+# the 16 input bytes feeds the op) follows the AltiVec PEM (6-172..6-176):
+# high = storage bytes 0-7, low = storage bytes 8-15. But ppu_lifter.py's
+# vupk* handlers read/write vr[] through native (host, little-endian x86)
+# int16_t*/int32_t* casts rather than an explicit big-endian unpack -- e.g.
+# vupkhsh does `int16_t* b=(int16_t*)&ctx->vr[vb]; r[i]=(int32_t)b[i];
+# memcpy(vd, r, 16)`, so a 16-bit lane's bytes are read AND written in host
+# (LE) order, not swapped to/from the guest's big-endian element order. That
+# is this file's existing, already-upstream vupkhsh convention (matched here
+# for vupklsh/vupkhsb/vupklsb, not something this change invents), so these
+# references model that native-endian read/write exactly, using '<' (host
+# LE) struct formats -- NOT '>' -- to predict the lifter's actual output.
+def ref_vupkhsh(vb16):
+    halfs = struct.unpack("<4h", vb16[0:8])          # high 4 halfwords, host order
+    return struct.pack("<4i", *halfs)
+def ref_vupklsh(vb16):
+    halfs = struct.unpack("<4h", vb16[8:16])         # low 4 halfwords, host order
+    return struct.pack("<4i", *halfs)
+def ref_vupkhsb(vb16):
+    bytes8 = struct.unpack("<8b", vb16[0:8])         # high 8 bytes
+    return struct.pack("<8h", *bytes8)
+def ref_vupklsb(vb16):
+    bytes8 = struct.unpack("<8b", vb16[8:16])        # low 8 bytes
+    return struct.pack("<8h", *bytes8)
+
 def cr_nibble_signed(a, b):
     if s64(a) < s64(b): return 8
     if s64(a) > s64(b): return 4
@@ -226,6 +255,19 @@ CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, 
 def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
                       in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap))
+
+# VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
+# ctx->vr[] directly (no memory load/store instructions needed to exercise
+# it), so a case here just seeds one input vector register's 16 raw bytes
+# and checks one output vector register's 16 raw bytes. The byte contents
+# are opaque here (chosen only to span sign/lane patterns); the ref_vupk*
+# functions above are what predict the lifter's actual output for a given
+# input, including its native-endian element read/write convention.
+VCASES = []   # dicts: name, word, vb_reg, vb_bytes, vd_reg, exp_bytes
+
+def vcase(name, word, vb_reg, vb_bytes, vd_reg, exp_bytes):
+    VCASES.append(dict(name=name, word=word, vb_reg=vb_reg, vb_bytes=vb_bytes,
+                       vd_reg=vd_reg, exp_bytes=exp_bytes))
 
 def pairs(n=6):
     ps = []
@@ -262,6 +304,35 @@ def build_cases():
                 mask = MASK32 if name in ("mulhw", "mulhwu") else MASK64
                 case(f"{name} a={a:#x} b={b:#x} ca={ca}",
                      xo_form(xo, R[0], R[1], R[2]),
+                     {R[1]: a, R[2]: b}, [(R[0], v, mask)],
+                     in_ca=ca, exp_ca=(cout if sets_ca else None))
+
+    # --- OE-form (oe=1) encodings of adde/subfe/mulhw/mulhwu ---------------
+    # This lifter does not track XER[OV]/[SO] for ANY OE-form op (see add,
+    # subf, mullw, addc, subfc above and addme/subfme/subfze below, none of
+    # which write OV either) -- so the OE-form must be lifted identically to
+    # the plain form: same result, same XER[CA] behavior where applicable.
+    # These cases encode the o/o. mnemonics (oe=1 in the XO-form word, per
+    # ppu_disasm's "if oe: mne += 'o'") and reuse the plain-form reference
+    # functions, since the expected result does not change with OE.
+    # mulhw/mulhwu have no architected OE form at all (PowerISA gives OE only
+    # to mullw/mulld); XO=75/11 with OE=1 is a reserved encoding that
+    # ppu_disasm's shared decode still labels mulhwo/mulhwuo, so the case
+    # here is a guard against the lifter mishandling that reserved encoding
+    # (e.g. falling through to the unhandled-opcode TODO stub).
+    oe_ops = [
+        ("adde",   138, lambda a, b, ca: ref_adde(a, b, ca), True, True),
+        ("subfe",  136, lambda a, b, ca: ref_subfe(a, b, ca), True, True),
+        ("mulhw",   75, lambda a, b, ca: ref_mulhw(a, b), False, False),
+        ("mulhwu",  11, lambda a, b, ca: ref_mulhwu(a, b), False, False),
+    ]
+    for name, xo, ref, uses_ca, sets_ca in oe_ops:
+        for a, b in pairs():
+            for ca in ((0, 1) if uses_ca else (None,)):
+                v, cout = ref(a, b, ca or 0)
+                mask = MASK32 if name in ("mulhw", "mulhwu") else MASK64
+                case(f"{name}o a={a:#x} b={b:#x} ca={ca}",
+                     xo_form(xo, R[0], R[1], R[2], oe=1),
                      {R[1]: a, R[2]: b}, [(R[0], v, mask)],
                      in_ca=ca, exp_ca=(cout if sets_ca else None))
 
@@ -407,6 +478,29 @@ def build_cases():
 
 build_cases()
 
+def build_vcases():
+    VD, VB = 2, 5   # arbitrary distinct vector registers; VD != VB probes aliasing-free operation
+
+    # Input vectors span: all-positive, all-negative (top bit set in every
+    # lane), and a mixed-sign lane pattern, so each unpack's sign-extension
+    # is exercised on both a 0-extend and a 1-extend path per lane.
+    vb_h_pos = bytes(range(1, 17))                                    # 8 positive halfwords
+    vb_h_neg = bytes([0xFF, 0x80] * 8)                                 # 8 negative halfwords (-128)
+    vb_h_mix = struct.pack(">8h", 1, -1, 0x7FFF, -0x8000, 0, -2, 100, -100)
+    vb_b_pos = bytes(range(1, 17))                                     # 16 positive bytes
+    vb_b_neg = bytes([0x80] * 16)                                      # 16 negative bytes (-128)
+    vb_b_mix = bytes([1, 0xFF, 0x7F, 0x80, 0, 2, 0xFE, 3,
+                      0x81, 0x01, 0x7E, 0x00, 0xFF, 0x02, 0x80, 0x10])
+
+    for label, vb in [("pos", vb_h_pos), ("neg", vb_h_neg), ("mix", vb_h_mix)]:
+        vcase(f"vupkhsh {label}", vx_form(590, VD, 0, VB), VB, vb, VD, ref_vupkhsh(vb))
+        vcase(f"vupklsh {label}", vx_form(718, VD, 0, VB), VB, vb, VD, ref_vupklsh(vb))
+    for label, vb in [("pos", vb_b_pos), ("neg", vb_b_neg), ("mix", vb_b_mix)]:
+        vcase(f"vupkhsb {label}", vx_form(526, VD, 0, VB), VB, vb, VD, ref_vupkhsb(vb))
+        vcase(f"vupklsb {label}", vx_form(654, VD, 0, VB), VB, vb, VD, ref_vupklsb(vb))
+
+build_vcases()
+
 # ---------------------------------------------------------------------------
 # C driver generation
 # ---------------------------------------------------------------------------
@@ -443,6 +537,16 @@ static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
     /* only LT/GT/EQ (top 3 bits of the nibble); SO passthrough not asserted */
     if ((got & 0xE) != (nib & 0xE)) {
         printf("FAIL %s: CR nibble@%d = %X want %X\\n", name, shift, got, nib); g_fail++;
+    } else g_pass++;
+}
+static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) {
+    if (memcmp(got, want, 16) != 0) {
+        printf("FAIL %s: vr =", name);
+        for (int i = 0; i < 16; i++) printf(" %02X", got[i]);
+        printf(" want");
+        for (int i = 0; i < 16; i++) printf(" %02X", want[i]);
+        printf("\\n");
+        g_fail++;
     } else g_pass++;
 }
 """)
@@ -490,6 +594,32 @@ static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
         else:
             out.extend(body)
         out.append("    }")
+
+    for i, c in enumerate(VCASES):
+        insn = ppu_disasm.decode(c["word"], 0x20000 + i * 4)
+        exp_mn = c["name"].split()[0]
+        if insn.mnemonic != exp_mn:
+            print(f"ENCODING mismatch for {c['name']!r}: decoded as "
+                  f"{insn.mnemonic} {insn.operands} (word {c['word']:#010x}) -- case skipped")
+            n_encoding_skipped += 1
+            continue
+        code = lifter._translate(insn, dummy)
+        if code.startswith("/*"):
+            print(f"UNHANDLED by lifter: {c['name']!r} -> {code[:60]} -- case skipped")
+            n_encoding_skipped += 1
+            continue
+        nm = c["name"].replace('"', "'")
+        vb_hex = ", ".join(f"0x{b:02X}" for b in c["vb_bytes"])
+        want_hex = ", ".join(f"0x{b:02X}" for b in c["exp_bytes"])
+        out.append(f'    {{ /* vcase {i}: {nm} | {insn.mnemonic} {insn.operands} */')
+        out.append("      memset(ctx, 0, sizeof(*ctx));")
+        out.append(f"      {{ uint8_t _vb[16] = {{ {vb_hex} }}; "
+                    f"memcpy(&ctx->vr[{c['vb_reg']}], _vb, 16); }}")
+        out.append(f"      {code}")
+        out.append(f"      {{ uint8_t _want[16] = {{ {want_hex} }}; "
+                    f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')
+        out.append("    }")
+
     out.append("""
     printf("\\n[ppu-conformance] %d checks passed, %d FAILED, %d skipped\\n",
            g_pass, g_fail, g_skip);
@@ -498,7 +628,8 @@ static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
 """)
     with open(path, "w") as f:
         f.write("\n".join(out))
-    print(f"wrote {path}: {len(CASES) - n_encoding_skipped} cases "
+    n_total = len(CASES) + len(VCASES)
+    print(f"wrote {path}: {n_total - n_encoding_skipped} cases "
           f"({n_encoding_skipped} skipped at generation)")
 
 # ---------------------------------------------------------------------------
