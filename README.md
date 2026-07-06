@@ -339,6 +339,25 @@ for who did what — thank you, everyone.
 
 ## Changelog
 
+### v0.6.7 — *"Fine Print"* (July 2026)
+*The second half of the two-port review pass: [@canersaka](https://github.com/canersaka)'s remaining decode/ABI/timing fixes plus a lifter/HLE audit toolkit, and the title-agnostic robustness fixes from [@JonathanDC64](https://github.com/JonathanDC64)'s port that could be ported and build-verified cleanly.*
+
+**Lift & decode**
+- **NV40 VP/FP shader decompilers hardened** against retail-game shaders (LIT/SFL/STR/ARL/RCC/RSQ, relative constant addressing, all 16 ATTR inputs, viewport transform; FP masked-store fix) — *[@canersaka](https://github.com/canersaka)* (#47)
+- **`spu_disasm`**: channel field widened 5→7 bits (channels ≥32 no longer wrap), hbra/hbrr field layout, `bisl`/`brsl`/`brasl` link register shown, `ri7` sign-extension, stop-code preserved — *[@canersaka](https://github.com/canersaka)* (#49)
+- **SPU `stop` signal code preserved** to `ctx->stop_code` — SPURS leaf tasks invoke kernel syscalls via `stop <code>` (EXIT/YIELD/WAIT/…), which was being discarded — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**Runtime & lv2**
+- **Sub-millisecond timeouts extended** to `sys_event_flag`, `sys_semaphore`, and `sys_mutex` timed waits (the same 15.6 ms-granularity fix as v0.6.5's event-queue path) — *[@canersaka](https://github.com/canersaka)* (#50)
+- **`g_active_ctx` restored after guest callbacks** — it was left dangling at a stack-local scratch ctx, corrupting the crash handler / diagnostics; applied to both `ppu_guest_call` and `ppu_guest_call_ct` — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**HLE**
+- **Corrected ABI signatures** for cellPamf, cellSail, cellHttp/cellHttpUtil/cellHttps/cellSsl, cellNet/sysNet, sceNpTrophy, and cellGameData (arg order/count/width → correct register mapping) — *[@canersaka](https://github.com/canersaka)* (#55)
+- **`cellGameDataCheckCreate2`** (NID `0xC9645C41`) implemented — marshals StatGet/StatSet and fires the guest `funcStat` callback — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**Tooling**
+- **Lifter/HLE audit kit** — PPU/SPU decode cross-checks vs Capstone / an RPCS3-output oracle, HLE ABI + dispatch-classify audits, an endianness heuristic, a lift-structure census, and an lv2 sync stress test — *[@canersaka](https://github.com/canersaka)* (#56)
+
 ### v0.6.6 — *"Two Ports, One Toolkit"* (July 2026)
 *Two independent retail-game ports kept fuzzing the toolkit: [@canersaka](https://github.com/canersaka)'s **Yakuza: Dead Souls** and [@JonathanDC64](https://github.com/JonathanDC64)'s **Demon's Souls**. This release distills the title-agnostic correctness/robustness wins each surfaced — the port-specific scaffolding stays in the forks.*
 
