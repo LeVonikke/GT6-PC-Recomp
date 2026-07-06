@@ -73,8 +73,11 @@ mislift fix (#30), full SPU ISA coverage (#31), byte-correct quadword helpers
 
 *Also incorporated (**v0.6.5**)* — cellFs big-endian out-params + `CellFsStat`
 PS3 packing (#22), cellGame title id read from `PARAM.SFO` (#24), `sys_rwlock`
-`EDEADLK`/`EPERM` lv2 semantics (#25), and the `crnor`/`crnand` opcode-33/225
-disassembler fix (#40).
+`EDEADLK`/`EPERM` lv2 semantics (#25), the `crnor`/`crnand` opcode-33/225
+disassembler fix (#40), and **static firmware LLE** (`tools/lift_prx.py`) —
+relocating a decrypted PRX to lift a real firmware module (e.g. the libsre
+SPURS kernel) instead of HLE-ing it, under a bring-your-own-firmware model
+that ships nothing derived from firmware (#53).
 
 ### sagemono — [@sagemono](https://github.com/sagemono)
 Real-controller correctness surfaced by a DualShock-as-XInput bring-up
