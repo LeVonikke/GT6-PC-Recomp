@@ -85,6 +85,12 @@ source-register decode + `vspltis` signed-immediate printing (#46), the
 unpacks (#52), sub-millisecond `sys_timer` usleep (#44), `cellNetCtl` big-endian
 out-params (#45), and `cellAudio` period-event delivery to notify queues (#54).
 
+*Also incorporated (**v0.6.7** "Fine Print")* — NV40 VP/FP shader-decompiler
+hardening (#47), `spu_disasm` channel-width/hbr/`bisl`-link/`ri7` fixes (#49),
+sub-millisecond timeouts for event-flags/semaphores/mutexes (#50), corrected HLE
+ABI signatures across cellPamf/Sail/Http/Ssl/Net/sysNet/sceNpTrophy/cellGameData
+(#55), and a lifter/HLE audit toolkit + lv2 sync stress test (#56).
+
 ### Jonathan Del Corpo — [@JonathanDC64](https://github.com/JonathanDC64)
 Correctness and robustness fixes distilled from a **Demon's Souls** port that
 stress-tested the toolkit against a ~106k-function title. The title-agnostic wins
@@ -102,6 +108,22 @@ incorporated (**v0.6.6**):
 - **`CellFsStat` runtime-side layout** corrected to the 52-byte / 4-byte-aligned
   ABI, fixing the `ppu_fs.cpp` / `sys_fs.c` stat writers the v0.6.5 libs-side fix
   didn't cover.
+
+Further title-agnostic fixes incorporated (**v0.6.7**):
+- **`g_active_ctx` restored after guest callbacks** — it was left pointing at a
+  stack-local scratch ctx, so after any callback the current-thread ctx pointer
+  dangled and corrupted the crash handler / diagnostics; applied to both
+  `ppu_guest_call` and `ppu_guest_call_ct`.
+- **SPU `stop` signal code preserved** to a new `ctx->stop_code` — SPURS leaf
+  tasks invoke kernel syscalls via `stop <code>` (EXIT/YIELD/WAIT/POLL/…), which
+  the lifter was discarding.
+- **`cellGameDataCheckCreate2`** (NID `0xC9645C41`) implemented — marshals
+  StatGet/StatSet and fires the guest `funcStat` callback.
+
+*(The port's remaining fork-specific work — SPU/PPU jump-table discovery tuned to
+a different lifter architecture, and cellKb/Mouse/Rtc guest-pointer translation
+that needs a big-endian rewrite — is tracked for a follow-up with a re-lift/test
+loop rather than a blind port.)*
 
 ### sagemono — [@sagemono](https://github.com/sagemono)
 Real-controller correctness surfaced by a DualShock-as-XInput bring-up
