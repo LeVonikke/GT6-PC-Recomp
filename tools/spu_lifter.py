@@ -75,6 +75,19 @@ HEADER_PREAMBLE = """\
 extern "C" {
 #endif
 
+/* Cross-function branch/loop = a guest tail-jump to another lifted function's
+ * entry. It MUST reuse the current host frame, not nest one: SPURS task loops
+ * iterate via these, so nesting overflows the host stack and silently kills the
+ * process. clang's musttail guarantees the tail call (a jump); without it (or on
+ * a non-clang compiler) we fall back to call+return, which only stays bounded if
+ * the compiler happens to do sibling-call optimization. All lifted SPU functions
+ * share the signature `void f(spu_context*)`, so the tail call is always valid. */
+#if defined(__clang__)
+#  define SPU_TAILCALL(call) __attribute__((musttail)) return call
+#else
+#  define SPU_TAILCALL(call) do { call; return; } while (0)
+#endif
+
 /* Indirect branch dispatch (bi/bisl/bid...): PC has been set to the target
  * local-store address; the runtime resolves it to the matching lifted
  * function and continues execution. Implemented by the SPU program glue. */
@@ -293,7 +306,7 @@ class SPULifter:
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; {self.prefix}spu_func_{end:08X}(ctx); return; }}")
+                f"    {{ ctx->pc = 0x{end:X}; SPU_TAILCALL({self.prefix}spu_func_{end:08X}(ctx)); }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -590,7 +603,7 @@ class SPULifter:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
             return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"{self.prefix}spu_func_{tgt:08X}(ctx); return; }}")
+                    f"SPU_TAILCALL({self.prefix}spu_func_{tgt:08X}(ctx)); }}")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
             tgt_reg = _reg(ops[0])
@@ -665,7 +678,7 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        return f"{{ ctx->pc = 0x{tgt:X}; {self.prefix}spu_func_{tgt:08X}(ctx); return; }}"
+        return f"{{ ctx->pc = 0x{tgt:X}; SPU_TAILCALL({self.prefix}spu_func_{tgt:08X}(ctx)); }}"
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
