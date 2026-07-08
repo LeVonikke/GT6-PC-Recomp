@@ -1941,6 +1941,34 @@ class PPULifter:
                     f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
                     f"for (int i = 0; i < 16; i++) d[i] = ((uint32_t)i >= 16u - sh) ? m[i - (int)(16u - sh)] : 0; }}")
 
+        # Cell unaligned vector STORES -- the mirrors of lvlx/lvrx above (were
+        # previously undecoded by ppu_disasm, so any vector store using them
+        # fell through to the catch-all TODO no-op -- a silent memory
+        # non-write, not just a wrong value). stvlx stores vS bytes
+        # [0 .. 15-(EA&15)] to [EA .. align_up-1]; stvrx stores the TOP
+        # (EA&15) bytes of vS to [EA&~15 .. EA-1]. Raw-byte convention as the
+        # loads above (lvlx/lvrx). stvlxl/stvrxl are the cache-hint forms
+        # (same data).
+        if mn == "stvlx" or mn == "stvlxl":
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
+                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
+                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+                    f"uint8_t* s = (uint8_t*)&ctx->vr[{vs}]; "
+                    f"for (uint32_t i = sh; i < 16; i++) m[i] = s[i - sh]; }}")
+
+        if mn == "stvrx" or mn == "stvrxl":
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
+                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
+                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+                    f"uint8_t* s = (uint8_t*)&ctx->vr[{vs}]; "
+                    f"for (uint32_t i = 0; i < sh; i++) m[i] = s[16u - sh + i]; }}")
+
         if mn == "lvebx" or mn == "lvehx" or mn == "lvewx":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
