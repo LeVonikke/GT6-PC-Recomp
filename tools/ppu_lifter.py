@@ -246,6 +246,87 @@ static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
 
+/* PPU reservation atomics (lwarx/stwcx/ldarx/stdcx): value-verified CAS.
+ * PowerISA Book II 4.6.2/4.6.3: stwcx./stdcx. succeed only if the reservation
+ * granule still holds the value observed at the matching lwarx/ldarx -- any
+ * store to that granule by another processor between the two must be
+ * preserved, not silently reverted. The previous emission here was
+ * ADDRESS-ONLY: it matched ctx->reserve_addr against the store's EA and then
+ * did an unconditional plain vm_write, so a concurrent writer (another PPU
+ * thread, or an SPU PUTLLC) landing on the same word between the lwarx and
+ * the stwcx got its value clobbered by the stale one -- a lost-update race
+ * whose odds scale with traffic on the line (measured killing a real
+ * title's PPU-side readyCount CAS on a hot SPU-shared control word during
+ * boot). These helpers do a real host CAS against the raw guest bytes
+ * instead, keyed off ctx->reserve_valid/addr/value (already present in
+ * ppu_context for exactly this). Self-contained (only vm_base + the
+ * MSVC/portable split already used above for ppc_mulhd) so no game-project
+ * runtime file is required. Deliberately NOT merged with the
+ * value-correct ppu_lwarx/ppu_stwcx pair in runtime/ppu/ppu_memory.h --
+ * that header uses a different (uint32_t-address, macro-driven PPU_OPS
+ * interpreter) calling convention that nothing in this generator's
+ * direct-emission (uint64_t ea, extern vm_read/write) path currently
+ * references, so reusing it here would require a signature-incompatible
+ * redeclaration of vm_read32/vm_write32 in the same translation unit. */
+static inline uint32_t ppu_res_bswap32(uint32_t v) {
+    return (v >> 24) | ((v >> 8) & 0x0000FF00u) | ((v << 8) & 0x00FF0000u) | (v << 24);
+}
+static inline uint64_t ppu_res_bswap64(uint64_t v) {
+    return ((uint64_t)ppu_res_bswap32((uint32_t)v) << 32) | ppu_res_bswap32((uint32_t)(v >> 32));
+}
+static inline uint32_t ppu_res_lwarx(ppu_context* ctx, uint64_t ea) {
+    uint32_t raw;
+    memcpy(&raw, vm_base + (uint32_t)ea, 4);
+    ctx->reserve_addr  = (uint32_t)ea;
+    ctx->reserve_value = raw;              /* raw guest (big-endian) bytes */
+    ctx->reserve_valid = 1;
+    return ppu_res_bswap32(raw);
+}
+static inline void ppu_res_stwcx(ppu_context* ctx, uint64_t ea, uint32_t val) {
+    int ok = 0;
+    if (ctx->reserve_valid && ctx->reserve_addr == (uint32_t)ea) {
+        uint32_t expected = (uint32_t)ctx->reserve_value;
+        uint32_t desired  = ppu_res_bswap32(val);
+#ifdef _MSC_VER
+        ok = (_InterlockedCompareExchange((long*)(vm_base + (uint32_t)ea),
+                                           (long)desired, (long)expected) == (long)expected);
+#else
+        ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + (uint32_t)ea), &expected, desired,
+                                          0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+#endif
+    }
+    ctx->reserve_valid = 0;
+    ctx->reserve_addr  = 0;
+    ctx->cr = ok ? ((ctx->cr & ~(0xFu << 28)) | (2u << 28))
+                 :  (ctx->cr & ~(0xFu << 28));
+}
+static inline uint64_t ppu_res_ldarx(ppu_context* ctx, uint64_t ea) {
+    uint64_t raw;
+    memcpy(&raw, vm_base + (uint32_t)ea, 8);
+    ctx->reserve_addr  = (uint32_t)ea;
+    ctx->reserve_value = raw;
+    ctx->reserve_valid = 1;
+    return ppu_res_bswap64(raw);
+}
+static inline void ppu_res_stdcx(ppu_context* ctx, uint64_t ea, uint64_t val) {
+    int ok = 0;
+    if (ctx->reserve_valid && ctx->reserve_addr == (uint32_t)ea) {
+        uint64_t expected = ctx->reserve_value;
+        uint64_t desired  = ppu_res_bswap64(val);
+#ifdef _MSC_VER
+        ok = (_InterlockedCompareExchange64((__int64*)(vm_base + (uint32_t)ea),
+                                             (__int64)desired, (__int64)expected) == (__int64)expected);
+#else
+        ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + (uint32_t)ea), &expected, desired,
+                                          0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+#endif
+    }
+    ctx->reserve_valid = 0;
+    ctx->reserve_addr  = 0;
+    ctx->cr = ok ? ((ctx->cr & ~(0xFu << 28)) | (2u << 28))
+                 :  (ctx->cr & ~(0xFu << 28));
+}
+
 /* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
  * Looks up the guest address in CTR via a hash table and calls the
  * corresponding host function. Handles OPD resolution. */
@@ -1740,41 +1821,37 @@ class PPULifter:
         # (lwarx rD,0,rB; ...; stwcx. rS,0,rB) reuses r0 as scratch between the
         # lwarx and stwcx; emitting ctx->gpr[0] makes the two EAs diverge so the
         # reservation never matches and the loop spins forever.
+        #
+        # The store-conditional forms call the ppu_res_* helpers (defined in
+        # this file's preamble) instead of an address-only check + plain
+        # store: PowerISA requires stwcx./stdcx. to verify the reservation
+        # granule's VALUE is unchanged, not just that the address matches --
+        # an address-only check silently reverts any concurrent writer's
+        # store between the lwarx/ldarx and the stwcx/stdcx (lost-update
+        # race). See the preamble comment above ppu_res_lwarx for detail.
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read32(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->gpr[{rd}] = ppu_res_lwarx(ctx, ea); }}")
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
-                    f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "  # CR0 = EQ
-                    f"}} else {{ "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)); "  # CR0 = 0
-                    f"}} ctx->reserve_addr = 0; }}")
+                    f"ppu_res_stwcx(ctx, ea, (uint32_t)ctx->gpr[{rs}]); }}")
 
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read64(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->gpr[{rd}] = ppu_res_ldarx(ctx, ea); }}")
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
-                    f"vm_write64(ea, ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "
-                    f"}} else {{ "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)); "
-                    f"}} ctx->reserve_addr = 0; }}")
+                    f"ppu_res_stdcx(ctx, ea, ctx->gpr[{rs}]); }}")
 
         # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
         if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
