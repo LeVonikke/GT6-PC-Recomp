@@ -790,6 +790,27 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.operands = f"r{rd}, r{ra}, r{rb}"
             return result
 
+        # Cell unaligned vector STORES (were previously undecoded, so any
+        # vector store using them fell through to the op31_x fallback and got
+        # lifted as a TODO no-op -- a silent memory non-write, not just a
+        # wrong value).
+        if xo_full == 647:  # stvlx (Store Vector Left Indexed)
+            result.mnemonic = "stvlx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 679:  # stvrx (Store Vector Right Indexed)
+            result.mnemonic = "stvrx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 903:  # stvlxl
+            result.mnemonic = "stvlxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 935:  # stvrxl
+            result.mnemonic = "stvrxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+
         # Fall through – unknown ext opcode 31
         result.mnemonic = f"op31_x{xo_full}"
         result.operands = f"r{rd}, r{ra}, r{rb}"
