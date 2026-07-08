@@ -639,14 +639,20 @@ class SPULifter:
             return ("ctx->pc = ctx->srr0; "
                     "spu_indirect_branch(ctx); return;")
         if mn in ("bisl",):
-            link_rt = insn.raw & 0x7F            # link reg dropped from operands
-            tgt_reg = _reg(ops[0])
+            link_rt = insn.raw & 0x7F
+            # Same interface break as brsl: the disasm fix added the link
+            # register to bisl operand text ("bisl $r0, $r11"), so the TARGET
+            # register is now the LAST operand. ops[0] grabbed the LINK
+            # register, so the emitted indirect call dispatched to link
+            # (= addr+4) and the callee was silently skipped. ops[-1]
+            # handles both operand formats.
+            tgt_reg = _reg(ops[-1])
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx);")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F
-            tgt_reg = _reg(ops[0])
+            tgt_reg = _reg(ops[-1])   # last operand = target (see bisl above)
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; "
