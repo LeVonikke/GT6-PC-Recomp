@@ -719,14 +719,22 @@ class PPULifter:
         if mn.startswith("rlwinm"):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
             sh, mb, me = ops[2], ops[3], ops[4]
-            return (f"ctx->gpr[{ra}] = (int64_t)(int32_t)"
+            # rlwinm's mask MASK(MB+32, ME+32) covers only bits [32:63], so the
+            # 64-bit result is ZERO-extended (high 32 = 0). Sign-extending here
+            # (the old (int64_t)(int32_t) cast) corrupted every rlwinm whose bit
+            # 31 was set -- e.g. newlib dtoa's exponent-field extraction, which
+            # then fed __pow5mult a garbage exponent and spun forever.
+            return (f"ctx->gpr[{ra}] = (uint64_t)"
                     f"ppc_rlwinm((uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
 
         if mn.startswith("rlwimi"):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
             sh, mb, me = ops[2], ops[3], ops[4]
-            return (f"ctx->gpr[{ra}] = (int64_t)(int32_t)"
-                    f"ppc_rlwimi((uint32_t)ctx->gpr[{ra}], (uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
+            # RA = (ROTL32(RS,SH) & m) | (RA & ~m), m = MASK(MB+32,ME+32) which
+            # is confined to the low 32 bits -- so RA's HIGH 32 bits are always
+            # preserved, and the merged low word is zero-extended.
+            return (f"ctx->gpr[{ra}] = (ctx->gpr[{ra}] & 0xFFFFFFFF00000000ull) | "
+                    f"(uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[{ra}], (uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
 
         if mn in ("slw", "slw."):
             # PPC slw: shift amount is rB[58:63]; if bit 0x20 is set (>= 32) the
@@ -1259,8 +1267,17 @@ class PPULifter:
         if mn_base in ("fctiw", "fctiwz"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
-            return (f"{{ int32_t iv = (int32_t)ctx->fpr[{frb}]; uint64_t tmp; "
-                    f"memcpy(&tmp, &ctx->fpr[{frd}], 8); "
+            # PPC saturates the int32 conversion (a plain C double->int32 cast is
+            # UB out of range and yields 0x80000000 for BOTH overflow directions).
+            # PowerISA: +overflow -> 0x7FFFFFFF, -overflow / NaN -> 0x80000000.
+            # fctiwz truncates; fctiw uses round-to-nearest (default mode).
+            rnd = "__builtin_trunc" if mn_base == "fctiwz" else "__builtin_nearbyint"
+            return (f"{{ double _d = ctx->fpr[{frb}]; int32_t iv; "
+                    f"if (_d != _d) iv = (int32_t)0x80000000; "
+                    f"else {{ double _r = {rnd}(_d); "
+                    f"iv = (_r >= 2147483647.0) ? (int32_t)0x7FFFFFFF "
+                    f": (_r <= -2147483648.0) ? (int32_t)0x80000000 : (int32_t)_r; }} "
+                    f"uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frd}], 8); "
                     f"tmp = (tmp & 0xFFFFFFFF00000000ULL) | (uint32_t)iv; "
                     f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
 
