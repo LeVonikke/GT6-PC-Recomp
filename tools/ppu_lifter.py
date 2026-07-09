@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -239,6 +240,11 @@ _CS_SAVE_RE = re.compile(
     r'vm_write64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
 _CS_REST_RE = re.compile(
     r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+)\);')
+# Any frame-relative store (any width), capturing the offset. Used to tell a
+# spill/reload apart from a callee-save restore: a slot this body writes itself
+# is scratch, so a later load from it is NOT a callee-save restore.
+_CS_ANY_STORE_RE = re.compile(
+    r'vm_write(?:8|16|32|64)\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+),')
 # A primary stack-frame allocation (lifted `stdu r1,-N(r1)`); its presence means
 # the body is a real function/merge, not a pure mid-function tail-entry.
 _FRAME_ALLOC = "ctx->gpr[1] += -0x"
@@ -497,10 +503,25 @@ class PPULifter:
         # be memory-snapshotted (the snapshot would run before the stdu and read a
         # stale slot). Leave such restores reading the frame (pairing-only).
         _has_stdu = any(_FRAME_ALLOC in _l for _l in func.body_lines)
+        # A genuine callee-save slot is written EXACTLY ONCE (the prologue save)
+        # and holds that value untouched until the epilogue restore. Count every
+        # frame-relative store per offset: a slot written more than once is being
+        # reused as SCRATCH, so a `std rN,X` / `ld rN,X` there is an ordinary
+        # spill/reload, NOT a callee-save pair. Pairing them by (off,reg) alone
+        # (the old logic) matched newlib dtoa's `stfd f,0x98; ld r30,0x98`
+        # double-word-extract against an unrelated `std r30,0x98` spill elsewhere
+        # in the function, so the "restore" was rewritten to a register snapshot
+        # taken at entry -> r30 got a garbage word0 -> exponent wrong -> k=INT_MAX
+        # -> __pow5mult spun forever (vkcube's blank window / any printf("%f")).
+        _write_counts = Counter()
+        for _l in func.body_lines:
+            _wm = _CS_ANY_STORE_RE.search(_l)
+            if _wm:
+                _write_counts[_wm.group(1)] += 1
         _saved_slots = set()
         for _l in func.body_lines:
             _m = _CS_SAVE_RE.search(_l)
-            if _m:
+            if _m and _write_counts[_m.group(1)] == 1:
                 _saved_slots.add((_m.group(1), _m.group(2)))
         _reg_snap = set()        # regs to snapshot from the register at entry
         _mem_snap = {}           # reg -> offset, snapshot from memory at entry
@@ -511,7 +532,9 @@ class PPULifter:
                 if (_off, _m.group(1)) in _saved_slots:
                     _reg_snap.add(_reg)
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
-                elif not _has_stdu:
+                elif not _has_stdu and _write_counts[_off] == 0:
+                    # pure tail-entry: the save lives in the original function, so
+                    # this body never writes the slot; snapshot from memory at entry.
                     _mem_snap.setdefault(_reg, _off)
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
         if _reg_snap or _mem_snap:
