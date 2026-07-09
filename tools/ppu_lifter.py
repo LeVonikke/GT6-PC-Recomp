@@ -539,10 +539,27 @@ class PPULifter:
             _wm = _CS_ANY_STORE_RE.search(_l)
             if _wm:
                 _write_counts[_wm.group(1)] += 1
+        # A genuine callee-save SAVE stores the CALLER's register value, so it
+        # must happen before the body ever redefines that register. A single
+        # `std rN, X(r1)` AFTER rN was redefined is a SPILL of a live value --
+        # gcm/cube's userMain spills vertex-buffer pointers r18/r0 to unique
+        # stack slots exactly once each, and pairing those with their reloads
+        # rewrote the reload to the ENTRY value of r18, so 5 of 36 vertices'
+        # stores went through a stale pointer (missing/torn cube polygons).
+        # Track each callee-save register's first redefinition and only accept
+        # saves that precede it.
+        _first_def = {}
+        for _i, _l in enumerate(func.body_lines):
+            _dm = re.match(r'\s*ctx->gpr\[(\d+)\] = ', _l)
+            if _dm:
+                _r = int(_dm.group(1))
+                if _r not in _first_def:
+                    _first_def[_r] = _i
         _saved_slots = set()
-        for _l in func.body_lines:
+        for _i, _l in enumerate(func.body_lines):
             _m = _CS_SAVE_RE.search(_l)
-            if _m and _write_counts[_m.group(1)] == 1:
+            if (_m and _write_counts[_m.group(1)] == 1
+                    and _i <= _first_def.get(int(_m.group(2)), 1 << 30)):
                 _saved_slots.add((_m.group(1), _m.group(2)))
         _reg_snap = set()        # regs to snapshot from the register at entry
         _mem_snap = {}           # reg -> offset, snapshot from memory at entry
