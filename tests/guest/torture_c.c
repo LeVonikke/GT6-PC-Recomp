@@ -1,3 +1,13 @@
+/* C-level pattern tests: make the COMPILER generate the control-flow and
+ * libcall patterns that historically break lifters -- jump tables (dense,
+ * sparse, nested), function-pointer dispatch through OPD, deep/mutual
+ * recursion, varargs, 64-bit div/mod libcalls, string/mem builtins,
+ * setjmp/longjmp, struct-by-value ABI, and (last, because it can hang)
+ * the printf/dtoa machinery.
+ *
+ * Expected values are literals, verifiable by eye -- the point is whether
+ * the DISPATCH reaches the right case and the ABI carries the right bits.
+ */
 #include "torture.h"
 #include <stdarg.h>
 #include <setjmp.h>
@@ -9,8 +19,11 @@ typedef unsigned long long u64;
 typedef long long i64;
 typedef unsigned int u32;
 
+/* volatile launder: keep gcc from constant-folding test inputs */
 static volatile int vi;
 static int L(int x) { vi = x; return vi; }
+
+/* ---- switches: dense (jump table), sparse (compare tree), big ---------- */
 
 static int NOINLINE sw_dense16(int x)
 {
@@ -49,7 +62,7 @@ static int NOINLINE sw_sparse(int x)
 
 static int NOINLINE sw_dense33(int x)
 {
-    switch (x) {                       // 33 cases: forces a table at -O2
+    switch (x) {                       /* 33 cases: forces a table at -O2 */
     case 0: return 1000; case 1: return 1001; case 2: return 1002;
     case 3: return 1003; case 4: return 1004; case 5: return 1005;
     case 6: return 1006; case 7: return 1007; case 8: return 1008;
@@ -69,8 +82,8 @@ static int NOINLINE sw_fallthrough(int x)
 {
     int acc = 0;
     switch (x) {
-    case 0: acc += 1;
-    case 1: acc += 10;
+    case 0: acc += 1;   /* fallthrough */
+    case 1: acc += 10;  /* fallthrough */
     case 2: acc += 100; break;
     case 3: acc += 1000; break;
     default: acc = -1;
@@ -103,6 +116,8 @@ static void switches_run(void)
     t_kat("sw_fall", 3, (u64)(unsigned)sw_fallthrough(L(3)), 1000);
 }
 
+/* ---- function pointers (OPD indirection) -------------------------------- */
+
 static int fp_add(int a, int b) { return a + b; }
 static int fp_sub(int a, int b) { return a - b; }
 static int fp_mul(int a, int b) { return a * b; }
@@ -124,6 +139,8 @@ static void fnptr_run(void)
     t_kat("fnptr_arg", 1, (u64)(unsigned)apply(g_ops[L(1)], 100, 58), 42);
 }
 
+/* ---- recursion ---------------------------------------------------------- */
+
 static int NOINLINE fib(int n)
 {
     return n < 2 ? n : fib(n - 1) + fib(n - 2);
@@ -140,6 +157,8 @@ static void recursion_run(void)
     t_kat("mutual_even", 0, (u64)is_even(L(1000)), 1);
     t_kat("mutual_odd", 0, (u64)is_odd(L(999)), 1);
 }
+
+/* ---- varargs ------------------------------------------------------------ */
 
 static int NOINLINE sum_ints(int n, ...)
 {
@@ -191,6 +210,8 @@ static void varargs_run(void)
     t_kat("va_dbl", 0, (u64)(sum_doubles(L(3), 1.5, 2.25, 4.25) * 4.0), 32);
 }
 
+/* ---- 64-bit integer arithmetic (libcalls + inline sequences) ------------ */
+
 static void int64_run(void)
 {
     volatile i64 a, b;
@@ -208,9 +229,11 @@ static void int64_run(void)
     a = 0x100000000LL; b = 0x100000000LL;
     t_kat("i64_mul_hi", 0, (u64)(a * b), 0);           /* wraps to 0 */
     ua = 0xDEADBEEFCAFEBABEULL;
-    t_kat("u64_shr_var", 0, ua >> L(17), 0x6F56DF77E57FULL);
-    t_kat("u64_shl_var", 0, ua << L(17), 0x7DDF95FD757C0000ULL);
+    t_kat("u64_shr_var", 0, ua >> L(17), 0x6F56DF77E57ULL);
+    t_kat("u64_shl_var", 0, ua << L(17), 0x7DD95FD757C0000ULL);
 }
+
+/* ---- string/mem builtins ------------------------------------------------ */
 
 static void strings_run(void)
 {
@@ -222,13 +245,19 @@ static void strings_run(void)
     for (off = 0; off < 4; off++) {
         memset(dst, 0, sizeof dst);
         memcpy(dst + off, src + 1, 17);
-        t_kat("memcpy_off", off, (u64)(unsigned char)dst[off] | ((u64)(unsigned char)dst[off + 16] << 8), 0x1202ULL);
+        t_kat("memcpy_off", off,
+              (u64)(unsigned char)dst[off] |
+              ((u64)(unsigned char)dst[off + 16] << 8), 0x1202ULL);
     }
     memset(dst, 0x5A, 33);
-    t_kat("memset", 0, (u64)(unsigned char)dst[0] | ((u64)(unsigned char)dst[32] << 8) | ((u64)(unsigned char)dst[33] << 16), 0x5A5AULL | ((u64)(unsigned char)dst[33] << 16));
+    t_kat("memset", 0,
+          (u64)(unsigned char)dst[0] | ((u64)(unsigned char)dst[32] << 8) |
+          ((u64)(unsigned char)dst[33] << 16),
+          0x5A5AULL | ((u64)(unsigned char)dst[33] << 16));
 
     {
-        static const char* words[] = { "", "a", "ab", "abcdefg", "0123456789abcdef7" };
+        static const char* words[] = { "", "a", "ab", "abcdefg",
+                                       "0123456789abcdef7" };
         static const int lens[] = { 0, 1, 2, 7, 17 };
         for (i = 0; i < 5; i++)
             t_kat("strlen", i, (u64)strlen(words[i]), (u64)lens[i]);
@@ -250,6 +279,7 @@ static void strings_run(void)
           0x1304ULL);
 }
 
+/* ---- setjmp/longjmp ------------------------------------------------------ */
 
 static jmp_buf g_jb;
 
@@ -337,14 +367,8 @@ static void fconv_run(void)
     }
 }
 
-/* ---- double bit-decomposition + dtoa's decimal-exponent estimate ---------
- * Mirrors newlib _dtoa_r's front end EXACTLY: pull word0/word1 out of the
- * double (stfd + lwz on BE), extract the binary exponent, renormalize the
- * mantissa into [1,2), and compute the decimal-exponent estimate k = (int)ds.
- * vkcube hangs because dtoa("%f",1.0) computes k=INT_MAX -> __pow5mult loops
- * forever; if the lifter miscompiles any step here (word extraction endianness,
- * exponent field, fcfid/fmadd, the (int)ds saturating convert), THIS reproduces
- * it as a clean KAT instead of a newlib spelunk. */
+/* ---- double bit-layout: the exact stfd/ld/lwz + exponent/k math newlib's
+ * dtoa relies on (this is the machinery whose mis-lift caused the dtoa hang) - */
 
 typedef union { double d; struct { u32 w0, w1; } w; unsigned long long u; } DBits;
 
@@ -398,7 +422,9 @@ static void printf_int_run(void)
     t_section("printf_int");
     snprintf(buf, sizeof buf, "%d|%u|%x|%08X", -42, 42u, 0xbeef, 0xCAFE);
     t_check_str("snpf_int", 0, buf, "-42|42|beef|0000CAFE");
-    snprintf(buf, sizeof buf, "%lld|%llu|%llx", -1234567890123456789LL, 18446744073709551615ULL, 0xDEADBEEFCAFEBABEULL);
+    snprintf(buf, sizeof buf, "%lld|%llu|%llx",
+             -1234567890123456789LL, 18446744073709551615ULL,
+             0xDEADBEEFCAFEBABEULL);
     t_check_str("snpf_ll", 0, buf, "-1234567890123456789|18446744073709551615|deadbeefcafebabe");
     snprintf(buf, sizeof buf, "[%-6s][%6s][%.3s]", "ab", "cd", "abcdef");
     t_check_str("snpf_str", 0, buf, "[ab    ][    cd][abc]");
@@ -413,11 +439,11 @@ void torture_c_run(void)
     recursion_run();
     varargs_run();
     int64_run();
-    fbits_run();
     strings_run();
     setjmp_run();
     structs_run();
     fconv_run();
+    fbits_run();
     printf_int_run();
 }
 
