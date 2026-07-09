@@ -236,6 +236,10 @@ typedef struct rsx_state {
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
 
     /* Shader state */
+    /* RSX viewport transform (SET_VIEWPORT_OFFSET 0x0A20 / _SCALE 0x0A30,
+     * 4 floats each): window = ndc * scale + offset (pixels; z [0,1]). */
+    float viewport_offset[4];
+    float viewport_scale[4];
     u32 shader_program;       /* fragment program address (offset | location in bits [0:1]) */
     u32 fragment_program_addr;
     u32 vertex_attrib_output_mask;

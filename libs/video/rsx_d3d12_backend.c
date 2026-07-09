@@ -1376,8 +1376,32 @@ static void render_frame(void)
          * clip-space HPOS straight through -- exactly the pre-merge behaviour.
          * TODO: derive from NV4097_SET_VIEWPORT_SCALE/OFFSET for correct Z/Y. */
         float* vpx = (float*)((char*)s_d3d.vp_cb_mapped + RSX_MAX_VERTEX_CONSTANTS * 16);
-        vpx[0] = vpx[1] = vpx[2] = vpx[3] = 1.0f;   /* vp_posscale  */
-        vpx[4] = vpx[5] = vpx[6] = vpx[7] = 0.0f;   /* vp_posoffset */
+        {
+            /* Map the guest's RSX viewport transform (window = ndc*S + O,
+             * pixels, y-down, z in [0,1]) into an equivalent CLIP-space
+             * scale/offset for the VS epilogue
+             *   Out.pos = float4(p.xyz*posscale + p.w*posoffset, p.w)
+             * so D3D's own viewport reproduces the RSX result:
+             *   posscale.x =  Sx/(W/2)      posoffset.x = (Ox - W/2)/(W/2)
+             *   posscale.y = -Sy/(H/2)      posoffset.y = (H/2 - Oy)/(H/2)
+             *   posscale.z =  Sz            posoffset.z =  Oz
+             * The z lane is what remaps GL-convention clip z [-1,1] to D3D's
+             * [0,1] (typical guest sets Sz=Oz=0.5); identity when the guest
+             * never programs a viewport. */
+            const float* vs_ = s_d3d.current_rsx_state->viewport_scale;
+            const float* vo_ = s_d3d.current_rsx_state->viewport_offset;
+            /* Only the Z lane is taken from the guest viewport: Sz/Oz=0.5/0.5
+             * remaps GL-convention clip z [-1,1] into D3D's [0,1] (gcm/cube's
+             * near-camera triangles were clipped without it). X/Y stay identity:
+             * for standard viewports (Sx=W/2, Ox=W/2, Sy=-H/2, Oy=H/2) the
+             * derived x/y transform IS identity, and titles with non-standard
+             * conventions (tiny3d) break if we apply their pixel-space values
+             * naively. */
+            vpx[0] = vpx[1] = vpx[3] = 1.0f;
+            vpx[4] = vpx[5] = vpx[7] = 0.0f;
+            if (vs_[2] != 0.0f) { vpx[2] = vs_[2]; vpx[6] = vo_[2]; }
+            else                { vpx[2] = 1.0f;   vpx[6] = 0.0f;   }
+        }
         /* Fallback perspective when the guest's projection matrix (vp_c[0..3])
          * is garbage. vkcube's MatrixProjPerspective computes a broken x-scale
          * (M0[0][0]): ~1e7 before the lifter callee-save fixes, ~145 after --
@@ -2074,6 +2098,13 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped + s_d3d.vp_vb_offset);
     for (u32 k = 0; k < count; k++)
         read_vp_vertex(state, first + k, &out[k*16]);
+    if (getenv("VTX_DUMP")) { static int _n=0; if (_n++ < 1) {
+        FILE* f = fopen("vtx_dump.txt", "w");
+        if (f) { for (u32 k = 0; k < count; k++)
+            fprintf(f, "v%02u pos=(%.3f,%.3f,%.3f,%.3f) uv=(%.3f,%.3f)\n", k,
+                out[k*16].v[0],out[k*16].v[1],out[k*16].v[2],out[k*16].v[3],
+                out[k*16+2].v[0],out[k*16+2].v[1]);
+          fclose(f); } } }
     s_d3d.vp_vb_offset += count * VP_VERT_STRIDE;
     return count;
 }

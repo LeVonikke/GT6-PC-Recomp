@@ -304,6 +304,21 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return process_vertex_attrib_method(state, method, data);
 
     /* Viewport */
+    /* Viewport transform: window = ndc*scale + offset. The z lane is the
+     * GL->[0,1] depth remap (offset.z=0.5/scale.z=0.5); without honoring it,
+     * GL-convention projections (SDK gcm samples) get their near-camera
+     * geometry clipped by D3D's 0<=z<=w rule (gcm/cube: missing polygons). */
+    if (method >= 0x0A20 && method < 0x0A30) {
+        u32 f = data; float v; memcpy(&v, &f, 4);
+        state->viewport_offset[(method - 0x0A20) >> 2] = v;
+        return 0;
+    }
+    if (method >= 0x0A30 && method < 0x0A40) {
+        u32 f = data; float v; memcpy(&v, &f, 4);
+        state->viewport_scale[(method - 0x0A30) >> 2] = v;
+        return 0;
+    }
+
     if (method == NV4097_SET_VIEWPORT_HORIZONTAL) {
         state->viewport_x = data & 0xFFFF;
         state->viewport_w = (data >> 16) & 0xFFFF;
