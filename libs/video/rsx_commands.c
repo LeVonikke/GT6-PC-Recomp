@@ -506,6 +506,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         if (slot < RSX_MAX_VERTEX_CONSTANTS) {
             float f;
             memcpy(&f, &data, 4);
+            { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
+              static int _n=0; if(_en && _n++<64) fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); }
             state->vertex_constants[slot][lane] = f;
             if (!state->vertex_constants_dirty) {
                 state->vertex_constants_lo = slot;
