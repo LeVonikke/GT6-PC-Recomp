@@ -60,12 +60,42 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
             ctx.gpr[3]._u32[1] = args_ea;          /* eaContext (DMA'd first) */
             ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA           */
             ctx.gpr[3]._u32[3] = r3_override[3];
+        } else if (image_id == 22) {
+            /* cri_mpv leaf (func_00003E68) gate is `rotmai(r3.word0, 112) == 64`
+             * = an ARITHMETIC RIGHT-SHIFT BY 16 then ceqi 64, i.e. it wants
+             * (r3.word0 >> 16) == 0x40  ->  r3.word0 = 0x0040xxxx (0x40 in bits
+             * 16-23, low 16 = DMA tag). If it matches it takes the REAL decode
+             * path (func_00003ED8, which DMAs the video job); else it halts
+             * (func_00003ED0). NOTE: r3.word0 = 0x40 (my earlier misread) shifts
+             * to 0 and FAILS the gate -> no decode, no DMA. Use 0x00400000. */
+            ctx.gpr[3]._u32[0] = 0x00400000u;   /* >>16 == 64 -> cri real decode path */
+            ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
         } else {
             ctx.gpr[3]._u32[0] = 0x00400000u;   /* 0x40 marker (>>16==64), DMA tag 0 */
             ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
         }
     } else {
         ctx.gpr[3]._u32[0] = args_ea;                           /* simple-job arg -> r3 */
+    }
+    /* The r3_override path already carries the game's 0x0040xxxx marker (which
+     * passes the (r3.word0>>16)==0x40 gate), so do NOT clobber it. The earlier
+     * forced r3.word0=0x40 here was a misread of the gate (see above) and made
+     * the cri task halt at func_00003ED0 instead of decoding -- removed. */
+    /* SPURS leaf ABI: the real PM (spursTasksetStartTask) sets r4 = {taskset->args (d0),
+     * taskset->spurs EA (d1)}, read from the SpursTasksetContext at LS 0x2700+0x60/0x68
+     * (planted by spurs_pm_build_context). Without it the leaf reads a garbage SPURS base
+     * and DMAs from a bad address / bails at init. Set for image 22 (cri) when the context
+     * carries a non-zero spurs ptr. */
+    if (spurs_task_abi && image_id == 22) {
+        #define LB(o) (((uint32_t)ctx.ls[(o)]<<24)|((uint32_t)ctx.ls[(o)+1]<<16)|((uint32_t)ctx.ls[(o)+2]<<8)|ctx.ls[(o)+3])
+        uint32_t spurs_lo = LB(0x2764);
+        if (spurs_lo) {
+            ctx.gpr[4]._u32[0] = LB(0x2768);   /* args hi (d0) */
+            ctx.gpr[4]._u32[1] = LB(0x276C);   /* args lo      */
+            ctx.gpr[4]._u32[2] = LB(0x2760);   /* spurs hi (d1)*/
+            ctx.gpr[4]._u32[3] = spurs_lo;     /* spurs lo = CellSpurs EA */
+        }
+        #undef LB
     }
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
       spu_run_with_halt(entry, &ctx); }                         /* run with halt pad   */

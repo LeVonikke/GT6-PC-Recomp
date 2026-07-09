@@ -262,7 +262,24 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
-    /* Surface configuration */
+    { static int _rt=-1; if(_rt<0) _rt=getenv("YDKJ_RSXTRACE")?1:0;
+      if(_rt){ static int _m=0; if(_m++<250) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
+     * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
+     * buffering). Real hardware DOES this; without it the game's frame-fence
+     * loop (func_0006E6E0 polling label 0x41 @ 0x03000410) spins forever and
+     * never reaches render. NV4097_SET_SEMAPHORE_OFFSET(0x1D6C)=offset (index*0x10
+     * into the GCM label window @0x03000000); NV4097_BACK_END_WRITE_SEMAPHORE_
+     * RELEASE(0x1D70)=value. Also NV406E semaphore release (0x0010 offset/0x0014
+     * value) for the sub-channel path. */
+    { static u32 s_sem_off = 0;
+      if (method == 0x1D6C) { s_sem_off = data; return 0; }
+      if (method == 0x1D70) {
+        extern void vm_write32(uint32_t a, uint32_t v);
+        vm_write32(0x03000000u + (s_sem_off & 0x00FFFFFFu), data);
+        { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence)\n", 0x03000000u+(s_sem_off&0xFFFFFF), data); }
+        return 0;
+      } }
     if (method >= 0x200 && method <= 0x23C)
         return process_surface_method(state, method, data);
 
@@ -326,6 +343,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
+        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
             u8 stencil = state->zstencil_clear_value & 0xFF;
@@ -556,6 +574,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_DRAW_ARRAYS) {
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
+        { static int _d=0; if (_d++ < 32) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
         if (s_backend && s_backend->draw_arrays)
             s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
         return 0;
@@ -618,6 +637,7 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
     u32 pos = 0;
     u32 count = size / 4; /* size in dwords */
 
+    { static int _c=0; if (count && _c++ < 16) fprintf(stderr, "[RSX] process_cmd_buffer words=%u first_hdr=0x%08X\n", count, buf[0]); }
     while (pos < count) {
         u32 header = buf[pos++];
         u32 type = (header >> 29) & 0x7;

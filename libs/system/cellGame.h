@@ -80,12 +80,28 @@ typedef struct CellGameContentSize {
     s32 sysSizeKB;
 } CellGameContentSize;
 
+/* Mirrors RPCS3's CellGameSetInitParams (input to cellGameCreateGameData). */
+typedef struct CellGameSetInitParams {
+    char title[128];
+    char titleId[10];
+    char reserved0[2];
+    char version[6];
+    char reserved1[66];
+} CellGameSetInitParams;
+
 /* ---------------------------------------------------------------------------
  * Configuration (call before game boots)
  * -----------------------------------------------------------------------*/
 
 /* Set the game's title ID (e.g., "BLUS30443") */
 void cellGame_set_title_id(const char* title_id);
+
+/* Read TITLE_ID/TITLE/APP_VER from the game's PARAM.SFO at boot (robust title id
+ * for all path building). Falls back to defaults if the SFO can't be read. */
+void cellGame_init_from_paramsfo(const char* sfo_path);
+
+/* Central title-id accessor (so other modules don't hardcode placeholders). */
+const char* cellGame_get_title_id(void);
 
 /* Set the game's title string */
 void cellGame_set_title(const char* title);
@@ -104,11 +120,15 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath);
 
 s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size);
 
+s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
+                             void* funcStat, u32 container);
+
 s32 cellGameGetParamInt(s32 id, s32* value);
 
 s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize);
 
-s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName);
+s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
+                            char* tmp_usrdirPath);
 
 s32 cellGameDeleteGameData(const char* dirName);
 

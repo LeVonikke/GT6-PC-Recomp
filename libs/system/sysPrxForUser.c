@@ -156,13 +156,27 @@ static u32 s_next_heap_id = 1;
 void sys_process_exit(s32 exitcode)
 {
     printf("[sysPrxForUser] sys_process_exit(code=%d)\n", exitcode);
+#ifdef _WIN32
     /* The RSX present thread runs at ~60Hz; a title that finishes in a few ms
-     * would tear down before the first frame is ever presented. Give the
-     * present thread a moment (or hold indefinitely with CELLMARK_HOLD) so the
-     * last rendered frame is visible / capturable. */
-    {
-        __declspec(dllimport) void __stdcall Sleep(unsigned long);
-        if (getenv("CELLMARK_HOLD")) { for (;;) Sleep(1000); }
+     * would tear down before the first frame is ever presented. Hold
+     * indefinitely with CELLMARK_HOLD so the last rendered frame is
+     * visible / capturable. */
+    if (getenv("CELLMARK_HOLD")) { for (;;) Sleep(1000); }
+#endif
+    /* YDKJ_NOEXIT (diagnostic): the title self-exits after ~2 frames on a
+     * teardown assert triggered by incomplete SPU/SPURS state (a timing race).
+     * Ignoring the exit on the calling thread lets the render loop keep running
+     * so we can see whether sustained execution produces on-screen content. */
+    if (getenv("YDKJ_NOEXIT")) {
+        printf("[sysPrxForUser] sys_process_exit IGNORED (YDKJ_NOEXIT) -- parking thread\n");
+        fflush(stdout);
+        for (;;) {
+#ifdef _WIN32
+            Sleep(1000);
+#else
+            struct timespec ts = {1,0}; nanosleep(&ts,0);
+#endif
+        }
     }
     exit(exitcode);
 }
@@ -357,6 +371,8 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
 {
     printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s', guest=0x%08X)\n",
            attr ? attr->name : "???", YZ_GUEST_ADDR(lwmutex));
+    { extern char* getenv(const char*); static int _lt=-1; if(_lt<0)_lt=getenv("FLOW_LWMTRACE")?1:0;
+      if(_lt){ extern unsigned int ppu_active_lr(void); printf("[LWMTRACE] create guest=0x%08X caller_lr=0x%08X\n", YZ_GUEST_ADDR(lwmutex), ppu_active_lr()); } }
 
     if (!lwmutex)
         return CELL_EFAULT;
@@ -413,6 +429,8 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
                YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
                slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use");
 #endif
+        { extern char* getenv(const char*); static int _lk=-1; if(_lk<0)_lk=getenv("FLOW_LOCKOK")?1:0;
+          if(_lk) return CELL_OK; }   /* diag: treat uninit lwmutex as acquired, see if boot proceeds */
         return CELL_ESRCH;
     }
 

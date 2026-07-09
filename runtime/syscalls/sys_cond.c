@@ -5,6 +5,9 @@
 #include "sys_cond.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdlib.h>
+/* RtlCaptureStackBackTrace + GetModuleHandleA come from <windows.h> (pulled in
+ * by sys_cond.h for CRITICAL_SECTION) -- do not redeclare them. */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -147,7 +150,21 @@ int64_t sys_cond_wait(ppu_context* ctx)
 {
     uint32_t cond_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
-    fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu)\n", cond_id, (unsigned long long)timeout_us);
+    fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu) tid=%llu lr=0x%08X\n", cond_id, (unsigned long long)timeout_us,
+            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+#ifdef _WIN32
+    if (cond_id == 7) {
+        static int _n = 0;
+        if (_n++ < 1) {
+            void* bt[24]; unsigned short fr = RtlCaptureStackBackTrace(0, 24, bt, 0);
+            char* mb = (char*)GetModuleHandleA(0);
+            char line[640]; int p = snprintf(line, sizeof line, "[cond7-bt] fr=%u rva:", (unsigned)fr);
+            for (int i = 0; i < fr; i++)
+                p += snprintf(line+p, sizeof(line)-p, " %llX", (unsigned long long)((char*)bt[i]-mb));
+            fprintf(stderr, "%s\n", line); fflush(stderr);
+        }
+    }
+#endif
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -176,6 +193,11 @@ int64_t sys_cond_wait(ppu_context* ctx)
 #ifdef _WIN32
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
     if (ms == 0 && timeout_us > 0) ms = 1;
+    /* FLOW_CONDKICK (SPU-bring-up diagnostic): cond=7 is waited on but never
+     * signaled (its signaler is blocked on the dead SPU pipeline). Cap infinite
+     * waits and return CELL_OK so the engine can advance past spurious waits. */
+    static int s_kick = -1; if (s_kick < 0) s_kick = getenv("FLOW_CONDKICK") ? 1 : 0;
+    if (s_kick && ms == INFINITE) ms = 1500;
 
     BOOL ok = SleepConditionVariableCS(&c->cv, &m->cs, ms);
 
@@ -184,6 +206,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     m->lock_count = saved_count;
 
     if (!ok && GetLastError() == ERROR_TIMEOUT) {
+        if (s_kick) return CELL_OK;   /* pretend signaled so the guest re-checks/proceeds */
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
     }
 #else
@@ -226,6 +249,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
 int64_t sys_cond_signal(ppu_context* ctx)
 {
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
+    { static int n=0; if(n++<80) fprintf(stderr,"[SIGNAL] cond_signal(cond=%u) tid=%llu lr=0x%08X\n", cond_id,
+            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr); }
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -251,6 +276,7 @@ int64_t sys_cond_signal(ppu_context* ctx)
 int64_t sys_cond_signal_all(ppu_context* ctx)
 {
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
+    { static int n=0; if(n++<40) fprintf(stderr,"[SIGNAL] cond_signal_all(cond=%u)\n", cond_id); }
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;

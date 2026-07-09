@@ -62,6 +62,80 @@ wrong. Landed in **v0.6.1 "Many Hands"**:
 - **`tools/show_func.py`** — dump a single lifted function's C and/or its
   original PowerPC disassembly from the chunked output.
 
+*Also incorporated (**v0.6.4** "Carry the One")* — the PPU **XER[CA] carry/borrow
+bug class** (shift-algebraic `sraw`/`srad` forms + `mtcrf` mask, #21;
+`subfe`/`subfme`/`addme`, #26), `cntlzw(0) = 32` (#35), the **PPU lifter
+conformance suite** (#37), and the `vcmpgt*` handlers (#39); the SPU
+**computed-`bi $r0` tail-jump classifier** (#36), self-referential branch
+mislift fix (#30), full SPU ISA coverage (#31), byte-correct quadword helpers
+(#32), `il` double sign-extension (#33), and preferred-slot link register +
+`rchcnt` (#34); plus `mftb`/`mftbu` reading a real timebase (#38).
+
+*Also incorporated (**v0.6.5**)* — cellFs big-endian out-params + `CellFsStat`
+PS3 packing (#22), cellGame title id read from `PARAM.SFO` (#24), `sys_rwlock`
+`EDEADLK`/`EPERM` lv2 semantics (#25), the `crnor`/`crnand` opcode-33/225
+disassembler fix (#40), and **static firmware LLE** (`tools/lift_prx.py`) —
+relocating a decrypted PRX to lift a real firmware module (e.g. the libsre
+SPURS kernel) instead of HLE-ing it, under a bring-your-own-firmware model
+that ships nothing derived from firmware (#53).
+
+*Also incorporated (**v0.6.6** "Two Ports, One Toolkit")* — `fsqrt`/`fsqrts`
+source-register decode + `vspltis` signed-immediate printing (#46), the
+`addeo`/`subfeo`/`mulhwo`/`mulhwuo` overflow forms + `vupklsb`/`vupkhsb`/`vupklsh`
+unpacks (#52), sub-millisecond `sys_timer` usleep (#44), `cellNetCtl` big-endian
+out-params (#45), and `cellAudio` period-event delivery to notify queues (#54).
+
+*Also incorporated (**v0.6.7** "Fine Print")* — NV40 VP/FP shader-decompiler
+hardening (#47), `spu_disasm` channel-width/hbr/`bisl`-link/`ri7` fixes (#49),
+sub-millisecond timeouts for event-flags/semaphores/mutexes (#50), corrected HLE
+ABI signatures across cellPamf/Sail/Http/Ssl/Net/sysNet/sceNpTrophy/cellGameData
+(#55), and a lifter/HLE audit toolkit + lv2 sync stress test (#56).
+
+### Jonathan Del Corpo — [@JonathanDC64](https://github.com/JonathanDC64)
+Correctness and robustness fixes distilled from a **Demon's Souls** port that
+stress-tested the toolkit against a ~106k-function title. The title-agnostic wins
+incorporated (**v0.6.6**):
+- **SPU cross-function tail calls forced with `musttail`** — a guest loop whose
+  back-edge crosses a lifted-function boundary was nesting one host C frame per
+  iteration and silently overflowing the stack (a stack-overflow SE runs no
+  unhandled filter, so the process died with no crash log and exit code 0); now an
+  O(1)-stack jump under clang, with a call+return fallback elsewhere.
+- **Mid-function / gap lifting sliced O(n²)→O(span)** — turned a ~40-minute
+  no-output hang on 96k+ function titles into bounded work.
+- **`sys_event_queue_receive` returns the event in r4–r7** (lv2 ABI) — callers
+  that read the registers instead of the `sys_event_t*` buffer saw stale values.
+- **`sys_memory_get_page_attribute`** renumbered 358→351 (0x15F) and implemented.
+- **`CellFsStat` runtime-side layout** corrected to the 52-byte / 4-byte-aligned
+  ABI, fixing the `ppu_fs.cpp` / `sys_fs.c` stat writers the v0.6.5 libs-side fix
+  didn't cover.
+
+Further title-agnostic fixes incorporated (**v0.6.7**):
+- **`g_active_ctx` restored after guest callbacks** — it was left pointing at a
+  stack-local scratch ctx, so after any callback the current-thread ctx pointer
+  dangled and corrupted the crash handler / diagnostics; applied to both
+  `ppu_guest_call` and `ppu_guest_call_ct`.
+- **SPU `stop` signal code preserved** to a new `ctx->stop_code` — SPURS leaf
+  tasks invoke kernel syscalls via `stop <code>` (EXIT/YIELD/WAIT/POLL/…), which
+  the lifter was discarding.
+- **`cellGameDataCheckCreate2`** (NID `0xC9645C41`) implemented — marshals
+  StatGet/StatSet and fires the guest `funcStat` callback.
+
+*(The port's remaining fork-specific work — SPU/PPU jump-table discovery tuned to
+a different lifter architecture, and cellKb/Mouse/Rtc guest-pointer translation
+that needs a big-endian rewrite — is tracked for a follow-up with a re-lift/test
+loop rather than a blind port.)*
+
+### sagemono — [@sagemono](https://github.com/sagemono)
+Real-controller correctness surfaced by a DualShock-as-XInput bring-up
+(**v0.6.5**):
+- **cellPad DIGITAL2 packing** — `hs->buttons` carries DIGITAL1 in its low byte
+  and DIGITAL2 (the face buttons cross/circle/triangle/square + L1/L2/R1/R2) in
+  the high byte; the whole value was being written into DIGITAL1 with DIGITAL2
+  forced to 0, so every face button was dead. Split correctly (#42).
+- **analog-Y centering** — reflect the inverted Y about 128 (`256 - x`) instead
+  of `255 - x`, which turned a centered stick into 127 (`0x7F`, aliasing
+  SELECT+START self-exit + TRIANGLE).
+
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
 in **v0.6.2** — the SPU portions were superseded by the v0.6.0 SPU subsystem and
