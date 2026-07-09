@@ -1062,13 +1062,25 @@ class PPULifter:
         # ------- Indexed Stores -------
         idx_store_map = {
             "stbx": "vm_write8", "sthx": "vm_write16", "stwx": "vm_write32", "stdx": "vm_write64",
-            "stbux": "vm_write8", "sthux": "vm_write16", "stwux": "vm_write32",
         }
         if mn in idx_store_map:
             helper = idx_store_map[mn]
             rs_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             return f"{helper}({ea}, ctx->gpr[{rs_i}]);"
+
+        # stbux/sthux/sthwux were in the plain idx_store_map above, so their
+        # RA writeback never happened (this dedicated stwux handler further
+        # below was shadowed, dead code, since idx_store_map's `mn in` check
+        # runs first in the if-chain). Book I store-with-update: RA <- EA.
+        idx_store_update_map = {
+            "stbux": "vm_write8", "sthux": "vm_write16", "stwux": "vm_write32",
+        }
+        if mn in idx_store_update_map:
+            helper = idx_store_update_map[mn]
+            rs_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
+                    f"{helper}(ea, ctx->gpr[{rs_i}]); ctx->gpr[{ra_i}] = ea; }}")
 
         # ------- Indexed FP Loads/Stores -------
         if mn in ("lfsx", "lfdx"):
@@ -1709,10 +1721,8 @@ class PPULifter:
             return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
                     f"vm_write64(ea, ctx->gpr[{rs}]); ctx->gpr[{ra}] = ea; }}")
 
-        if mn == "stwux":
-            rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
-                    f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); ctx->gpr[{ra}] = ea; }}")
+        # stwux itself now lives in idx_store_update_map above (this is where
+        # the dead, shadowed duplicate used to sit).
 
         if mn == "ldux":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
