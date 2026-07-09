@@ -1110,6 +1110,41 @@ class PPULifter:
                 return line
             return f"/* {mn} unhandled operands: {insn.operands} */;"
 
+        # ------- Load/Store Multiple Word -------
+        # PowerISA_V2.03_Final_Public.pdf p.72 (Book I, section 3.3.5):
+        #   lmw RT,D(RA):  b = (RA=0) ? 0 : GPR[RA]; EA = b + EXTS(D);
+        #                  for r = RT..31: GPR(r) = 0x0..0 || MEM(EA,4); EA += 4
+        #     (n = 32-RT words load into the LOW-order 32 bits of GPRs RT..31,
+        #     high-order 32 bits zeroed -- same zero-extending 32-bit guest
+        #     load as lwz/vm_read32, just repeated for each register.)
+        #   stmw RS,D(RA): same EA; for r = RS..31: MEM(EA,4) = GPR(r)[32:63]; EA += 4
+        #     (store the low-order 32 bits of each GPR, same as stw/vm_write32.)
+        # RA=0 denotes a literal zero base (not GPR[0]), unlike the plain
+        # loads/stores above -- explicit here since the ISA calls it out.
+        if mn == "lmw":
+            rd_i = int(_reg_idx(ops[0]))
+            disp, base = _disp_base(ops[1])
+            if disp is not None:
+                stmts = [f"{{ uint64_t _ea = (({base}) ? ctx->gpr[{base}] : 0) + {disp};"]
+                for i, r in enumerate(range(rd_i, 32)):
+                    off = f" + {i * 4}" if i else ""
+                    stmts.append(f" ctx->gpr[{r}] = vm_read32(_ea{off});")
+                stmts.append(" }")
+                return "".join(stmts)
+            return f"/* {mn} unhandled operands: {insn.operands} */;"
+
+        if mn == "stmw":
+            rs_i = int(_reg_idx(ops[0]))
+            disp, base = _disp_base(ops[1])
+            if disp is not None:
+                stmts = [f"{{ uint64_t _ea = (({base}) ? ctx->gpr[{base}] : 0) + {disp};"]
+                for i, r in enumerate(range(rs_i, 32)):
+                    off = f" + {i * 4}" if i else ""
+                    stmts.append(f" vm_write32(_ea{off}, (uint32_t)ctx->gpr[{r}]);")
+                stmts.append(" }")
+                return "".join(stmts)
+            return f"/* {mn} unhandled operands: {insn.operands} */;"
+
         # ------- Indexed Loads -------
         idx_load_map = {
             "lbzx": "vm_read8", "lhzx": "vm_read16", "lwzx": "vm_read32", "ldx": "vm_read64",
