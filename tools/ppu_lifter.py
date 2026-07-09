@@ -1522,8 +1522,22 @@ class PPULifter:
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         # ------- 64-bit multiply / divide -------
-        if mn == "mulld":
+        # mulldo[.]: PowerISA_V2.03_Final_Public.pdf p.60/p.36 -- OE=1 sets
+        # XER[OV] = 1 iff the true 128-bit signed product does not fit in 64
+        # bits (the high 64 bits aren't just the sign-extension of the low),
+        # XER[SO] sticky-ORs with OV. Uses ppc_mulhd (already emitted for
+        # mulhd, above) for the exact high half, avoiding signed-multiply
+        # overflow UB. mulld/mulld. keep the existing plain low-64-bit form.
+        if mn in ("mulld", "mulld.", "mulldo", "mulldo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            if mn.startswith("mulldo"):
+                return (f"{{ int64_t _a = (int64_t)ctx->gpr[{ra}], _b = (int64_t)ctx->gpr[{rb}]; "
+                        f"uint64_t _lo = (uint64_t)_a * (uint64_t)_b; "
+                        f"int64_t _hi = ppc_mulhd(_a, _b); "
+                        f"uint32_t _ov = (_hi != ((int64_t)_lo >> 63)) ? 1u : 0u; "
+                        f"ctx->xer = (ctx->xer & ~(1u << 30)) | (_ov << 30); "
+                        f"if (_ov) ctx->xer |= (1u << 31); "
+                        f"ctx->gpr[{rd}] = _lo; }}")
             return f"ctx->gpr[{rd}] = (int64_t)ctx->gpr[{ra}] * (int64_t)ctx->gpr[{rb}];"
 
         if mn == "mullw":

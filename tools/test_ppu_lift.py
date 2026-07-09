@@ -110,6 +110,17 @@ def ref_mulhd(a, b):      return ((s64(a) * s64(b)) >> 64) & MASK64, None
 def ref_mulhdu(a, b):     return ((a * b) >> 64) & MASK64, None
 def ref_mulli(a, imm):    return (s64(a) * imm) & MASK64, None
 
+def ref_mulldo(a, b):
+    """mulldo[.]: low 64 bits (same as ref_mulld) plus XER[OV], set iff the
+    true 128-bit signed product's high half isn't the sign-extension of the
+    low half (Python's arithmetic >> on the full-precision product gives
+    that high half directly)."""
+    full = s64(a) * s64(b)
+    lo = full & MASK64
+    hi = full >> 64
+    sign_lo = -1 if (lo >> 63) & 1 else 0
+    return lo, (1 if hi != sign_lo else 0)
+
 def rotl32(v, n): v &= MASK32; n &= 31; return ((v << n) | (v >> (32 - n))) & MASK32 if n else v
 def rotl64(v, n): v &= MASK64; n &= 63; return ((v << n) | (v >> (64 - n))) & MASK64 if n else v
 
@@ -251,10 +262,11 @@ rng = random.Random(0x59414B5A)   # deterministic
 E64 += [rng.getrandbits(64) for _ in range(4)]
 
 CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
+             # exp_ov backs the mulldo cases below (XER[OV], the only OE-form op this suite tracks).
 
-def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False):
+def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False, exp_ov=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
-                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap))
+                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap, exp_ov=exp_ov))
 
 # VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
 # ctx->vr[] directly (no memory load/store instructions needed to exercise
@@ -500,6 +512,23 @@ def build_cases():
                      xo_form(xo, R[0], R[1], R[2], oe=1),
                      {R[1]: a, R[2]: b}, [(R[0], v, mask)],
                      in_ca=ca, exp_ca=(cout if sets_ca else None))
+
+    # --- mulldo/mulldo. (mulld's OE form) -----------------------------------
+    # Unlike the oe_ops group above, mulld's overflow condition is exactly
+    # computable (PowerISA p.60/p.36: OV = high half of the true 128-bit
+    # product isn't the sign-extension of the low half) and the lifter now
+    # computes it via ppc_mulhd, so these cases assert XER[OV] rather than
+    # reusing the plain-form no-OV convention.
+    for a, b, tag in (
+        (0x7FFFFFFFFFFFFFFF, 2, "positive overflow"),      # INT64_MAX * 2
+        (0x8000000000000000, 2, "negative overflow"),      # INT64_MIN * 2
+        (100, 200, "no overflow"),
+    ):
+        v, ov = ref_mulldo(a, b)
+        case(f"mulldo a={a:#x} b={b:#x} ({tag})", xo_form(233, R[0], R[1], R[2], oe=1),
+             {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_ov=ov)
+        case(f"mulldo. a={a:#x} b={b:#x} ({tag})", xo_form(233, R[0], R[1], R[2], oe=1, rc=1),
+             {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_ov=ov)
 
     for name, xo, ref in [("addme", 234, ref_addme), ("addze", 202, ref_addze),
                           ("subfme", 232, ref_subfme), ("subfze", 200, ref_subfze)]:
@@ -748,6 +777,11 @@ static void check_ca(const char* name, uint32_t xer, int want) {
     if (got != want) { printf("FAIL %s: XER[CA] = %d want %d\\n", name, got, want); g_fail++; }
     else g_pass++;
 }
+static void check_ov(const char* name, uint32_t xer, int want) {
+    int got = (xer >> 30) & 1;
+    if (got != want) { printf("FAIL %s: XER[OV] = %d want %d\\n", name, got, want); g_fail++; }
+    else g_pass++;
+}
 static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
     int got = (cr >> shift) & 0xF;
     /* only LT/GT/EQ (top 3 bits of the nibble); SO passthrough not asserted */
@@ -804,6 +838,8 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want, ui
                         f"0x{val:016X}ULL, 0x{mask:016X}ULL);")
         if c["exp_ca"] is not None:
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
+        if c["exp_ov"] is not None:
+            body.append(f'        check_ov("{nm}", ctx->xer, {int(bool(c["exp_ov"]))});')
         if c["exp_cr"] is not None:
             nib, shift = c["exp_cr"]
             body.append(f'        check_cr("{nm}", ctx->cr, {nib}, {shift});')
