@@ -67,13 +67,19 @@ s32 cellCameraInit(void);
 s32 cellCameraEnd(void);
 
 s32 cellCameraOpen(s32 devNum, CellCameraInfo* info);
+s32 cellCameraOpenEx(s32 devNum, void* infoEx);           /* CellCameraInfoEx */
+s32 cellCameraGetBufferSize(s32 devNum, void* infoEx);
 s32 cellCameraClose(s32 devNum);
+s32 cellCameraReset(s32 devNum);
 
 s32 cellCameraStart(s32 devNum);
 s32 cellCameraStop(s32 devNum);
 
-s32 cellCameraRead(s32 devNum, CellCameraReadInfo* info);
+/* 3-arg form (libcamera's real signature). */
+s32 cellCameraRead(s32 devNum, u32* frame_num, u32* bytes_read);
 s32 cellCameraReadEx(s32 devNum, CellCameraReadInfo* info);
+s32 cellCameraSetAttribute(s32 devNum, s32 attrib, u32 arg1, u32 arg2);
+s32 cellCameraGetAttribute(s32 devNum, s32 attrib, u32* arg1, u32* arg2);
 
 s32 cellCameraIsAvailable(s32 devNum);
 s32 cellCameraIsAttached(s32 devNum);
