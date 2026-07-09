@@ -3117,6 +3117,27 @@ def main() -> None:
         # prologue is still a distinct function and the first then tail-calls it
         # via fallthrough_to. (A genuine second stdu inside one function -- e.g.
         # dynamic alloca -- is rare; splitting it is harmless dead boundary.)
+        #
+        # But a function's OWN prologue can allocate its frame several insns in:
+        # newlib _vfprintf_r saves r15/r20/r22/r25 (and mfcr/std lr) BEFORE its
+        # `stdu`, and the entry walk-back above records an address a few insns
+        # ahead of that stdu. Cutting there splits the range INSIDE its own
+        # prologue -- orphaning the stdu and, fatally, the callee-save RESTORE
+        # into a second fragment, so the function returns without restoring
+        # r14-r31 (observed: printf clobbers the caller's r27 -> vkcube's
+        # rotation angle, read through a callee-saved reg, never advances). A
+        # merged SECOND function always begins past THIS function's first frame
+        # allocation, so never treat a prologue at/-before our own first
+        # `stdu r1,-N` as a boundary.
+        _first_alloc = None
+        _jj = _k
+        while _jj < len(_ordered) and _ordered[_jj] < _e:
+            _ai = _by_addr[_ordered[_jj]]
+            if _ai.mnemonic == "stdu":
+                _ao = _ai.operands.replace(" ", "")
+                if _ao.startswith("r1,-") and _ao.endswith("(r1)"):
+                    _first_alloc = _ordered[_jj]; break
+            _jj += 1
         _cuts = []
         _j = _k + 1
         while _j < len(_ordered) and _ordered[_j] < _e:
@@ -3127,7 +3148,8 @@ def main() -> None:
             # on libsre func_3000AF2C -> an infinite 2-fragment loop that hung
             # cellSpursInitialize). A genuinely merged second function's prologue is
             # always past the first function's body, well beyond start+8.
-            if _ordered[_j] in _func_entries and _ordered[_j] > _s + 8:
+            if (_ordered[_j] in _func_entries and _ordered[_j] > _s + 8
+                    and (_first_alloc is None or _ordered[_j] > _first_alloc)):
                 _cuts.append(_ordered[_j])
             _j += 1
         if not _cuts:
