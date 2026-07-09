@@ -297,15 +297,23 @@ static int64_t sys_spu_initialize_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_group_create(out_id_ea, num, name_ea, attr_ea) */
+/* sys_spu_thread_group_create(out_id_ea, num, prio, attr_ea)
+ *
+ * lv2 signature per RPCS3's sys_spu.h (oracle, no code copied): r5 is the
+ * group PRIORITY (an int), NOT a name pointer. The name lives inside the
+ * attribute struct, sys_spu_thread_group_attribute (BE):
+ *   +0 u32 nsize (name length incl. NUL), +4 u32 name ptr, +8 s32 type.
+ * The previous version read r5 directly as name_ea, so it could never
+ * read a real group name (it dereferenced the priority integer as a
+ * pointer) and never captured the priority at all. */
 static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 {
     extern uint8_t* vm_base;
     uint32_t out_ea   = (uint32_t)ctx->gpr[3];
     uint32_t num      = (uint32_t)ctx->gpr[4];
-    uint32_t name_ea  = (uint32_t)ctx->gpr[5];
-    fprintf(stderr, "[SPU] thread_group_create(num=%u)\n", num);
+    int32_t  prio     = (int32_t)ctx->gpr[5];
     uint32_t attr_ea  = (uint32_t)ctx->gpr[6];
+    fprintf(stderr, "[SPU] thread_group_create(num=%u prio=%d)\n", num, prio);
 
     spu_group_t* g = spu_alloc_group();
     if (!g) {
@@ -317,6 +325,14 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     if (num > 8) num = 8;
     g->num_threads = num;
 
+    int32_t  gtype   = 0;
+    uint32_t name_ea = 0;
+    if (attr_ea) {
+        uint32_t nsize = vm_read_be32(attr_ea + 0);
+        name_ea        = vm_read_be32(attr_ea + 4);
+        gtype          = (int32_t)vm_read_be32(attr_ea + 8);
+        if (!nsize) name_ea = 0;
+    }
     if (name_ea && vm_base) {
         const char* src = (const char*)(vm_base + name_ea);
         size_t i = 0;
@@ -327,8 +343,8 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 
     vm_write_be32(out_ea, g->id);
 
-    fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u name=%.31s attr=0x%08X\n",
-            g->id, num, g->name, attr_ea);
+    fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u prio=%d type=0x%X name=%.31s\n",
+            g->id, num, prio, gtype, g->name);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
