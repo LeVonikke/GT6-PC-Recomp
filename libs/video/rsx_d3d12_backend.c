@@ -59,7 +59,33 @@ typedef struct {
     u32 topology;       /* D3D_PRIMITIVE_TOPOLOGY_* */
     int textured;       /* 1 = sample the bound font/atlas texture (dbgfont) */
     int is_vp;          /* 1 = real VP path: vb_byte_offset indexes vp_vb (float4) */
+    /* VP path per-draw shader/texture state, captured at draw_arrays time. */
+    u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
+    u32 tex_off;        /* resolved vm offset of the bound texture (0 = none)   */
+    u32 tex_w, tex_h;
+    u32 tex_fmt;        /* RSX base format (0x81 B8, 0x85 A8R8G8B8)             */
+    int tex_slot;       /* per-frame VP texture slot; -1 = none (render_frame)  */
 } D3D12DrawRecord;
+
+/* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
+ * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
+ * memory). SRV lives at heap index 1+slot. */
+typedef struct {
+    ID3D12Resource* res;
+    ID3D12Resource* up;
+    u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
+    int used;           /* referenced this frame */
+} VPTexSlot;
+#define VP_TEX_SLOTS 4
+
+/* Compiled guest-FP pipeline cache: decompiled VS (current VP) + decompiled
+ * PS (fragment ucode at fp_addr). Invalidated when the VP recompiles (gen). */
+typedef struct {
+    u32 fp_addr;
+    u32 gen;
+    ID3D12PipelineState* pso;
+} VPFPEntry;
+#define VP_FP_CACHE 8
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -139,6 +165,14 @@ typedef struct {
     void*                 vp_cb_mapped;
     int                   vp_ready;             /* VS+PSO compiled ok            */
     u32                   vp_compiled_bytes;    /* ucode size when last compiled */
+    ID3DBlob*             vp_vs_blob;           /* kept for guest-FP PSO builds  */
+    u32                   vp_gen;               /* bumped per VP recompile       */
+    VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* per-frame VP texture slots    */
+    VPFPEntry             vp_fp[VP_FP_CACHE];   /* guest-FP PSO cache            */
+    int                   vp_fp_n;
+    u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
+    u32                   cur_tex_off;          /* VP path: latest bound texture */
+    u32                   cur_tex_w, cur_tex_h, cur_tex_fmt;
 
     /* Per-frame draw recording */
     int                   frame_recording; /* 1 if cmd list is open for recording */
@@ -700,15 +734,33 @@ static int init_d3d12(u32 width, u32 height)
             if (ptb) ptb->lpVtbl->Release(ptb);
         }
 
-        /* SRV descriptor heap (shader-visible) for the atlas texture. */
+        /* SRV descriptor heap (shader-visible). Layout: slot 0 = legacy atlas
+         * (dbgfont / textured 2D path), slots 1-4 = per-draw VP textures, 5-7
+         * spare. All slots start as null SRVs so any 4-wide table window (the
+         * root signature binds t0-t3) is valid on tier-1 hardware. */
         {
             D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
             hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            hd.NumDescriptors = 1;
+            hd.NumDescriptors = 8;
             hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
                 s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.srv_heap);
             if (FAILED(hr)) printf("[D3D12] SRV heap creation failed (0x%08lX)\n", hr);
+            else {
+                s_d3d.srv_inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+                    s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                D3D12_SHADER_RESOURCE_VIEW_DESC nv = {0};
+                nv.Format = DXGI_FORMAT_R8_UNORM;
+                nv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                nv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                nv.Texture2D.MipLevels = 1;
+                D3D12_CPU_DESCRIPTOR_HANDLE hh;
+                s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &hh);
+                for (int _i = 0; _i < 8; _i++) {
+                    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, NULL, &nv, hh);
+                    hh.ptr += s_d3d.srv_inc;
+                }
+            }
         }
     }
 
@@ -752,9 +804,12 @@ static int init_d3d12(u32 width, u32 height)
      * game uploads its VP microcode (render_frame).
      * ---------------------------------------------------------------*/
     {
+        /* 4-descriptor SRV table (t0-t3) so decompiled fragment programs can
+         * sample up to 4 texture units; the hardcoded atlas/colour PSs use only
+         * t0 and are unaffected. Matching 4 static samplers s0-s3. */
         D3D12_DESCRIPTOR_RANGE srv_range = {0};
         srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srv_range.NumDescriptors = 1;
+        srv_range.NumDescriptors = 4;
         srv_range.BaseShaderRegister = 0;
         srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -767,16 +822,22 @@ static int init_d3d12(u32 width, u32 height)
         rp[1].DescriptorTable.pDescriptorRanges = &srv_range;
         rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        D3D12_STATIC_SAMPLER_DESC samp = {0};
-        samp.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;   /* crisp text */
-        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samp.ShaderRegister = 0;
-        samp.MaxLOD = D3D12_FLOAT32_MAX;
-        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC samp[4] = {0};
+        for (int _s = 0; _s < 4; _s++) {
+            samp[_s].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            samp[_s].AddressU = samp[_s].AddressV = samp[_s].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            samp[_s].ShaderRegister = (UINT)_s;
+            samp[_s].MaxLOD = D3D12_FLOAT32_MAX;
+            samp[_s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        }
+        /* s0 keeps point/clamp: the dbgfont atlas PS samples glyph cells and
+         * linear filtering bleeds neighbouring glyphs. */
+        samp[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        samp[0].AddressU = samp[0].AddressV = samp[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
         D3D12_ROOT_SIGNATURE_DESC rd = {0};
         rd.NumParameters = 2; rd.pParameters = rp;
-        rd.NumStaticSamplers = 1; rd.pStaticSamplers = &samp;
+        rd.NumStaticSamplers = 4; rd.pStaticSamplers = samp;
         rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ID3DBlob* sig = NULL; ID3DBlob* err = NULL;
@@ -796,7 +857,12 @@ static int init_d3d12(u32 width, u32 height)
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_RANGE nr = {0,0};
 
-        bd.Width = MAX_VERTICES * 256;  /* generic VP vertex: 16 float4 attrib slots */
+        bd.Width = (u64)MAX_VERTICES * 256 * 2;  /* generic VP vertex: 16 float4 slots,
+                                          * DOUBLE-buffered by frame parity so a
+                                          * new frame's upload never overwrites
+                                          * vertices the in-flight GPU frame is
+                                          * still reading (was: torn/missing
+                                          * triangles mixing stale+new verts) */
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_vb)))
@@ -1024,7 +1090,12 @@ static void compile_vp(void)
         }
         if (ec) ec->lpVtbl->Release(ec);
     }
-    vb->lpVtbl->Release(vb); pb->lpVtbl->Release(pb);
+    /* Keep the VS bytecode for guest-FP PSO builds (vp_get_fp_pso); bump the
+     * generation so cached FP PSOs built against the old VS are rebuilt. */
+    if (s_d3d.vp_vs_blob) s_d3d.vp_vs_blob->lpVtbl->Release(s_d3d.vp_vs_blob);
+    s_d3d.vp_vs_blob = vb;
+    s_d3d.vp_gen++;
+    pb->lpVtbl->Release(pb);
     s_d3d.vp_compiled_bytes = st->vp_ucode_bytes;
     if (SUCCEEDED(hr)) { s_d3d.vp_ready = 1; printf("[VP] pipeline ready (%d instrs)\n", ni); }
     else {
@@ -1048,9 +1119,244 @@ static void compile_vp(void)
     }
 }
 
+/* Build (or fetch) a PSO pairing the current decompiled VS with the guest's
+ * FRAGMENT program at fp_addr: read the FP ucode from guest memory, decompile
+ * to HLSL (rsx_fp_decompiler), compile, and cache. This replaces the two
+ * hardcoded pixel shaders for draws whose FP we can translate -- e.g.
+ * gcm/cube's plasma FP `c = tex2D(t0, uv).x; out = (c, 0, c, 1)`. */
+#include "rsx_fp_decompiler.h"
+static ID3D12PipelineState* vp_get_fp_pso(u32 fp_addr)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveOffset(u32);
+    if (!fp_addr || !s_d3d.vp_vs_blob || !vm_base) return NULL;
+    for (int i = 0; i < s_d3d.vp_fp_n; i++)
+        if (s_d3d.vp_fp[i].fp_addr == fp_addr && s_d3d.vp_fp[i].gen == s_d3d.vp_gen)
+            return s_d3d.vp_fp[i].pso;
+
+    /* SET_SHADER_PROGRAM low bits = location+1 (same as textures): 1 = LOCAL
+     * (VRAM), 2 = MAIN (gcm/cube emits 0x00B90001 for its VRAM-resident FP). */
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    u32 off = cellGcmResolveLocated((fp_addr & 0x3u) == 1, fp_addr & ~0x3u);
+    if (off == 0xFFFFFFFFu) return NULL;
+    static char hlsl[32768];
+    int n = rsx_fp_decompile(vm_base + off, 4096, hlsl, sizeof(hlsl));
+    if (n <= 0) { static int _e=0; if(_e++<4) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
+    if (getenv("FP_DUMP")) { static int _d=0; if (_d++ < 4) {
+        FILE* f = fopen("fp_dump.hlsl", _d==1 ? "w" : "a");
+        if (f) {
+            const u8* uc = vm_base + off;
+            fprintf(f, "/* fp_addr=0x%08X vmoff=0x%08X raw:", fp_addr, off);
+            for (int _b = 0; _b < 32; _b++) fprintf(f, " %02X", uc[_b]);
+            fprintf(f, " */\n%s\n", hlsl); fclose(f);
+        } } }
+
+    /* FP_FORCE=1: replace the translated body with solid magenta -- isolates
+     * geometry/transform problems from texture/blend problems. */
+    if (getenv("FP_FORCE")) {
+        char* rp = strstr(hlsl, "return r[0];");
+        if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
+    }
+    ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
+    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
+                            "main", "ps_5_0", 0, 0, &pb, &e);
+    if (FAILED(hr) || !pb) {
+        static int _e2=0; if (_e2++<4)
+            printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
+                   e ? (const char*)e->lpVtbl->GetBufferPointer(e) : "?");
+        if (e) e->lpVtbl->Release(e);
+        return NULL;
+    }
+    if (e) e->lpVtbl->Release(e);
+
+    D3D12_INPUT_ELEMENT_DESC il[16];
+    for (int _i = 0; _i < 16; _i++) {
+        il[_i].SemanticName = "ATTR"; il[_i].SemanticIndex = _i;
+        il[_i].Format = DXGI_FORMAT_R32G32B32A32_FLOAT; il[_i].InputSlot = 0;
+        il[_i].AlignedByteOffset = (UINT)(_i * 16);
+        il[_i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        il[_i].InstanceDataStepRate = 0;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = s_d3d.vp_root_sig;
+    pd.VS.pShaderBytecode = s_d3d.vp_vs_blob->lpVtbl->GetBufferPointer(s_d3d.vp_vs_blob);
+    pd.VS.BytecodeLength  = s_d3d.vp_vs_blob->lpVtbl->GetBufferSize(s_d3d.vp_vs_blob);
+    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
+    pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
+    pd.InputLayout.pInputElementDescs = il; pd.InputLayout.NumElements = 16;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    /* Straight alpha blend: dbgfont text needs it; opaque geometry writes a=1. */
+    pd.BlendState.RenderTarget[0].BlendEnable    = TRUE;
+    pd.BlendState.RenderTarget[0].SrcBlend       = D3D12_BLEND_SRC_ALPHA;
+    pd.BlendState.RenderTarget[0].DestBlend      = D3D12_BLEND_INV_SRC_ALPHA;
+    pd.BlendState.RenderTarget[0].BlendOp        = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].SrcBlendAlpha  = D3D12_BLEND_ONE;
+    pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    pd.BlendState.RenderTarget[0].BlendOpAlpha   = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pd.DepthStencilState.StencilEnable = FALSE;
+    pd.SampleDesc.Count = 1;
+
+    ID3D12PipelineState* pso = NULL;
+    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+        s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    pb->lpVtbl->Release(pb);
+    if (FAILED(hr)) {
+        static int _e3=0; if (_e3++<4) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
+        return NULL;
+    }
+    { static int _ok=0; if (_ok++<8) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
+
+    /* insert (evict oldest when full) */
+    if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
+        if (s_d3d.vp_fp[0].pso) s_d3d.vp_fp[0].pso->lpVtbl->Release(s_d3d.vp_fp[0].pso);
+        memmove(&s_d3d.vp_fp[0], &s_d3d.vp_fp[1], sizeof(VPFPEntry) * (VP_FP_CACHE - 1));
+        s_d3d.vp_fp_n = VP_FP_CACHE - 1;
+    }
+    s_d3d.vp_fp[s_d3d.vp_fp_n].fp_addr = fp_addr;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].gen     = s_d3d.vp_gen;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
+    s_d3d.vp_fp_n++;
+    return pso;
+}
+
+/* Upload the guest texture for a VP draw into a per-frame texture slot
+ * (re-uploaded every frame: gcm/cube's plasma animates in guest memory).
+ * Returns the slot index (SRV at heap 1+slot) or -1. Must run while the
+ * command list is open, before the draw passes. */
+static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
+{
+    extern uint8_t* vm_base;
+    if (!off || !w || !h || !vm_base || !s_d3d.srv_heap) return -1;
+    int argb = (fmt == 0x85);                     /* A8R8G8B8 vs B8 */
+    u32 bpp = argb ? 4u : 1u;
+    DXGI_FORMAT dxfmt = argb ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8_UNORM;
+    int slot = -1, freeslot = -1;
+    for (int i = 0; i < VP_TEX_SLOTS; i++) {
+        if (s_d3d.vp_tex[i].used && s_d3d.vp_tex[i].off == off &&
+            s_d3d.vp_tex[i].w == w && s_d3d.vp_tex[i].h == h)
+            return i;                             /* already uploaded this frame */
+        if (!s_d3d.vp_tex[i].used && freeslot < 0) freeslot = i;
+    }
+    if (freeslot < 0) return -1;                  /* out of slots this frame */
+    slot = freeslot;
+    VPTexSlot* t = &s_d3d.vp_tex[slot];
+    u32 pitch = (w * bpp + 255) & ~255u;
+    int fresh = 0;
+
+    if (t->res && (t->w != w || t->h != h || t->fmt != fmt)) {
+        t->res->lpVtbl->Release(t->res); t->res = NULL;
+        if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
+    }
+    if (!t->res) {
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td = {0};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = dxfmt; td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                &IID_ID3D12Resource, (void**)&t->res)))
+            return -1;
+        D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd = {0};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = (u64)pitch * h; bd.Height = 1; bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
+                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                &IID_ID3D12Resource, (void**)&t->up))) {
+            t->res->lpVtbl->Release(t->res); t->res = NULL; return -1;
+        }
+        fresh = 1;
+    }
+
+    void* mapped = NULL; D3D12_RANGE nr = {0,0};
+    if (FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) return -1;
+    if (argb) {
+        /* guest big-endian A8R8G8B8 (bytes A,R,G,B) -> DXGI R8G8B8A8 (R,G,B,A) */
+        for (u32 y = 0; y < h; y++) {
+            const u8* srow = vm_base + off + (u64)y * w * 4;
+            u8* drow = (u8*)mapped + (u64)y * pitch;
+            for (u32 x = 0; x < w; x++) {
+                drow[x*4+0] = srow[x*4+1]; drow[x*4+1] = srow[x*4+2];
+                drow[x*4+2] = srow[x*4+3]; drow[x*4+3] = srow[x*4+0];
+            }
+        }
+    } else {
+        for (u32 y = 0; y < h; y++)
+            memcpy((u8*)mapped + (u64)y * pitch, vm_base + off + (u64)y * w, w);
+    }
+    t->up->lpVtbl->Unmap(t->up, 0, NULL);
+
+    if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
+        D3D12_RESOURCE_BARRIER b = {0};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = t->res;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    }
+    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+    dst.pResource = t->res; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = t->up;  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint.Format   = dxfmt;
+    src.PlacedFootprint.Footprint.Width    = w;
+    src.PlacedFootprint.Footprint.Height   = h;
+    src.PlacedFootprint.Footprint.Depth    = 1;
+    src.PlacedFootprint.Footprint.RowPitch = pitch;
+    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+    {
+        D3D12_RESOURCE_BARRIER b = {0};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = t->res;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    }
+    /* SRV at heap slot 1+slot */
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
+    sv.Format = dxfmt;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    /* RSX B8 replicates the byte into all four channels (dbgfont's FP reads
+     * coverage from .w); DXGI R8 defaults to (r,0,0,1), so swizzle (R,R,R,R)
+     * = encoded 0x1000 (component 0 in all lanes + always-set bit). ARGB8
+     * keeps the identity mapping. */
+    sv.Shader4ComponentMapping = argb ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING : 0x1000;
+    sv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE sh;
+    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
+    sh.ptr += (u64)(1 + slot) * s_d3d.srv_inc;
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, t->res, &sv, sh);
+
+    t->off = off; t->w = w; t->h = h; t->fmt = fmt; t->used = 1;
+    return slot;
+}
+
 static void render_frame(void)
 {
     u32 fi = s_d3d.frame_index;
+
+    /* Drain the GPU before touching shared upload resources (vp_vb vertices,
+     * vp_cb constants, per-frame texture staging): the previous frame's draws
+     * may still be reading them, and overwriting mid-flight tears geometry
+     * (gcm/cube: triangles mixing stale and new vertices -> missing/sliver
+     * polygons). These workloads are a few draws/frame, so full serialisation
+     * costs little. */
+    wait_for_gpu();
 
     /* Compile the real vertex program once its microcode is captured, and keep
      * the constant bank uploaded for the VS. */
@@ -1204,6 +1510,17 @@ static void render_frame(void)
         }
     }
 
+    /* Per-frame VP textures + guest-FP pipelines: for each VP draw, upload the
+     * texture it had bound at submit time into a slot (SRV heap 1+slot; plasma
+     * animates so contents re-upload every frame) and pre-build its FP PSO. */
+    for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
+    for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+        D3D12DrawRecord* dr = &s_d3d.draws[_d];
+        if (!dr->is_vp) continue;
+        dr->tex_slot = dr->tex_off ? vp_upload_tex_slot(dr->tex_off, dr->tex_w, dr->tex_h, dr->tex_fmt) : -1;
+        if (dr->fp_addr) vp_get_fp_pso(dr->fp_addr);   /* warm the cache */
+    }
+
     /* Transition render target to RENDER_TARGET state */
     D3D12_RESOURCE_BARRIER barrier = {0};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1339,12 +1656,25 @@ static void render_frame(void)
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
             D3D12_VERTEX_BUFFER_VIEW vbv;
             vbv.BufferLocation = s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb);
-            vbv.SizeInBytes    = MAX_VERTICES * 256;
+            vbv.SizeInBytes    = MAX_VERTICES * 256 * 2;
             vbv.StrideInBytes  = 256;   /* 16 float4 attrib slots */
             s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &vbv);
+            D3D12_GPU_DESCRIPTOR_HANDLE gh_base;
+            s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
+                /* Per-draw pipeline: prefer the guest's own compiled FP; fall
+                 * back to the hardcoded atlas/colour PS pair. */
+                ID3D12PipelineState* dpso =
+                    dr->fp_addr ? vp_get_fp_pso(dr->fp_addr) : NULL;
+                s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
+                                                         dpso ? dpso : vpso);
+                /* Per-draw texture: t0 = the draw's texture slot (heap 1+slot);
+                 * draws with no texture point at slot 0 (legacy atlas / null). */
+                D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
+                if (dr->tex_slot >= 0) gh.ptr += (u64)(1 + dr->tex_slot) * s_d3d.srv_inc;
+                s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                     dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
             }
@@ -1778,11 +2108,17 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             u32 rec = s_d3d.vp_vb_offset;
             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
             if (emitted && s_d3d.draw_count < MAX_DRAWS) {
-                s_d3d.draws[s_d3d.draw_count].vb_byte_offset = rec;
-                s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
-                s_d3d.draws[s_d3d.draw_count].topology       = D3D_TOPOLOGY_TRIANGLELIST;
-                s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
-                s_d3d.draws[s_d3d.draw_count].is_vp          = 1;
+                D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
+                dr->vb_byte_offset = rec;
+                dr->vertex_count   = emitted;
+                dr->topology       = D3D_TOPOLOGY_TRIANGLELIST;
+                dr->textured       = s_d3d.tex_bound;
+                dr->is_vp          = 1;
+                dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+                dr->tex_off = s_d3d.cur_tex_off;
+                dr->tex_w = s_d3d.cur_tex_w; dr->tex_h = s_d3d.cur_tex_h;
+                dr->tex_fmt = s_d3d.cur_tex_fmt;
+                dr->tex_slot = -1;
                 s_d3d.draw_count++;
             }
             return;
@@ -1810,11 +2146,17 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         u32 rec = s_d3d.vp_vb_offset;
         u32 emitted = upload_tris_vp(s_d3d.current_rsx_state, first, count);
         if (emitted && s_d3d.draw_count < MAX_DRAWS) {
-            s_d3d.draws[s_d3d.draw_count].vb_byte_offset = rec;
-            s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
-            s_d3d.draws[s_d3d.draw_count].topology       = D3D_TOPOLOGY_TRIANGLELIST;
-            s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
-            s_d3d.draws[s_d3d.draw_count].is_vp          = 1;
+            D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
+            dr->vb_byte_offset = rec;
+            dr->vertex_count   = emitted;
+            dr->topology       = D3D_TOPOLOGY_TRIANGLELIST;
+            dr->textured       = s_d3d.tex_bound;
+            dr->is_vp          = 1;
+            dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+            dr->tex_off = s_d3d.cur_tex_off;
+            dr->tex_w = s_d3d.cur_tex_w; dr->tex_h = s_d3d.cur_tex_h;
+            dr->tex_fmt = s_d3d.cur_tex_fmt;
+            dr->tex_slot = -1;
             s_d3d.draw_count++;
         }
         return;
@@ -1884,8 +2226,16 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * as-seen 0xA1 with the LN flag) is wired up so far; other formats fall
      * back to untextured. */
     u32 base_fmt = format & 0x9F;   /* strip LN(0x20)/UN(0x40) flags */
+    /* VP path: record the latest bound texture (any supported format) so draws
+     * can carry it per-draw. Location bits (format[1:0]): 1 = LOCAL, 2 = MAIN. */
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    if (base_fmt == 0x81 /* B8 */ || base_fmt == 0x85 /* A8R8G8B8 */) {
+        s_d3d.cur_tex_off = cellGcmResolveLocated((tex->format & 3) == 1, offset);
+        s_d3d.cur_tex_w = width; s_d3d.cur_tex_h = height;
+        s_d3d.cur_tex_fmt = base_fmt;
+    }
     if (base_fmt == 0x81 /* B8 */) {
-        s_d3d.tex_src_offset = cellGcmResolveOffset(offset);
+        s_d3d.tex_src_offset = cellGcmResolveLocated((tex->format & 3) == 1, offset);
         if (s_d3d.tex_w != width || s_d3d.tex_h != height) {
             /* dims changed -> resource must be (re)created in render_frame */
             s_d3d.tex_ready = 0;

@@ -88,6 +88,9 @@ static u32 s_current_display_buffer_id = 0;
 
 /* Configuration */
 static CellGcmConfig s_config;
+/* Offset pages (1MB) known to be LOCAL-memory-derived (set by
+ * cellGcmAddressToOffset when the guest converts a localAddress-range EA). */
+static u8 s_local_offset_page[1024];
 
 /* Command buffer control */
 static CellGcmControl s_control;
@@ -812,10 +815,17 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     if (!off_ea)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    /* Local memory: offset = address - localBase */
+    /* Local memory: offset = address - localBase. Record the offset page as
+     * LOCAL-derived so cellGcmResolveOffset can disambiguate it from an IO
+     * (main-memory) offset with the same page number -- the two offset spaces
+     * overlap, and a title with a large IO region (gcm/cube: 16MB) otherwise
+     * gets its VRAM vertex/texture/FP reads resolved into the empty command
+     * buffer. */
     if (address >= s_config.localAddress &&
         address < s_config.localAddress + s_config.localSize) {
-        vm_write32(off_ea, address - s_config.localAddress);
+        u32 loff = address - s_config.localAddress;
+        if ((loff >> 20) < sizeof(s_local_offset_page)) s_local_offset_page[loff >> 20] = 1;
+        vm_write32(off_ea, loff);
         return CELL_OK;
     }
 
@@ -991,12 +1001,31 @@ s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea)
 u32 cellGcmResolveOffset(u32 offset)
 {
     u32 page = offset >> 20;
+    /* A page the guest derived from a LOCAL EA resolves to VRAM even when the
+     * IO table also covers that page number (overlapping offset spaces). */
+    if (page < sizeof(s_local_offset_page) && s_local_offset_page[page])
+        return s_config.localAddress + offset;
     if (page < 65536) {
         u16 ea_page = s_ea_address_table[page];
         if (ea_page != 0 && ea_page != 0xFFFF)
             return ((u32)ea_page << 20) | (offset & 0xFFFFF);
     }
     return s_config.localAddress + offset;
+}
+
+/* Location-aware resolve. RSX offsets are TWO overlapping number spaces --
+ * LOCAL (VRAM, ea = localAddress + offset) and MAIN (IO-mapped, via the
+ * offset table). cellGcmResolveOffset guesses table-first, which breaks when
+ * a title's IO region is large enough to cover the same page numbers as its
+ * local allocations (gcm/cube: ioSize 16MB, FP ucode at local 0xB90000 --
+ * table hit returned the empty command-buffer EA instead of VRAM). Callers
+ * that KNOW the location (texture format bits, SET_SHADER_PROGRAM bits) must
+ * use this. `local` != 0 -> local memory. */
+u32 cellGcmResolveLocated(int local, u32 offset)
+{
+    if (local)
+        return s_config.localAddress + offset;
+    return cellGcmResolveOffset(offset);
 }
 
 /* ---------------------------------------------------------------------------

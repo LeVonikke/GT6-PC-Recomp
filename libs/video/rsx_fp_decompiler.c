@@ -220,8 +220,15 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
         "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
         "};\n"
-        "Texture2D    rsx_tex[16] : register(t0);\n"
-        "SamplerState rsx_samp[16] : register(s0);\n"
+        /* 4 discrete texture/sampler registers (t0-t3/s0-s3) rather than a [16]
+         * array: the backend's root signature binds a 4-descriptor SRV table +
+         * 4 static samplers, and an array declaration would require all 16
+         * registers valid on tier-1 hardware. RSX FPs in practice use units
+         * 0-3; higher units clamp to 3 in the TEX emission below. */
+        "Texture2D    rsx_tex0 : register(t0); Texture2D rsx_tex1 : register(t1);\n"
+        "Texture2D    rsx_tex2 : register(t2); Texture2D rsx_tex3 : register(t3);\n"
+        "SamplerState rsx_samp0 : register(s0); SamplerState rsx_samp1 : register(s1);\n"
+        "SamplerState rsx_samp2 : register(s2); SamplerState rsx_samp3 : register(s3);\n"
         "float4 main(PSInput input) : SV_TARGET {\n"
         "    float4 r[48]; float4 h[48];\n"
         /* Fully initialise both register files: RSX programs routinely read a
@@ -315,12 +322,13 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
             snprintf(rhs, sizeof(rhs),
-                     "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy)",
+                     tex_unit & 3u, tex_unit & 3u, a);
             break;
         case OP_TXP:
             snprintf(rhs, sizeof(rhs),
-                     "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
-                     tex_unit, tex_unit, a, a);
+                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy / (%s).w)",
+                     tex_unit & 3u, tex_unit & 3u, a, a);
             break;
         case OP_KIL:
             out_puts(&o, "    /* TODO: KIL (condition not modeled) */\n");
