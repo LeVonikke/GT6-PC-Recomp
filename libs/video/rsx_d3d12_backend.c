@@ -131,6 +131,7 @@ typedef struct {
      * approximation). Used for the 2D/dbgfont quad draws. */
     ID3D12RootSignature*  vp_root_sig;          /* CBV(b0) + SRV table + sampler */
     ID3D12PipelineState*  pipeline_state_vp;    /* decompiled VS + atlas PS      */
+    ID3D12PipelineState*  pipeline_state_vp_color; /* decompiled VS + colour PS (untextured 3D) */
     ID3D12Resource*       vp_vb;                /* raw float4 attrib0, per-frame */
     void*                 vp_vb_mapped;
     u32                   vp_vb_offset;
@@ -980,6 +981,31 @@ static void compile_vp(void)
     pd.DepthStencilState.DepthEnable = FALSE; pd.DepthStencilState.StencilEnable = FALSE;
     pd.SampleDesc.Count = 1;
     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_d3d.pipeline_state_vp);
+
+    /* Second PSO: same VS but a COLOUR-only PS (no texture sample, no alpha
+     * discard) for untextured 3D geometry (vkcube's cube). The atlas PS above
+     * samples a texture and discards where coverage<=0.5, which blanks any draw
+     * with no atlas bound. */
+    {
+        static const char ps_col[] =
+            "struct PSIn{ float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1; float4 fog:FOG;\n"
+            "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
+            "  float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7; };\n"
+            "float4 main(PSIn i):SV_TARGET{ return float4(i.col0.rgb, 1); }\n";
+        ID3DBlob *pcb=NULL,*ec=NULL;
+        if (SUCCEEDED(D3DCompile(ps_col, sizeof(ps_col)-1, "vppsc", NULL, NULL,
+                                 "main", "ps_5_0", 0, 0, &pcb, &ec)) && pcb) {
+            pd.PS.pShaderBytecode = pcb->lpVtbl->GetBufferPointer(pcb);
+            pd.PS.BytecodeLength  = pcb->lpVtbl->GetBufferSize(pcb);
+            HRESULT hr2 = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+                s_d3d.device, &pd, &IID_ID3D12PipelineState,
+                (void**)&s_d3d.pipeline_state_vp_color);
+            printf(SUCCEEDED(hr2) ? "[VP] colour pipeline ready\n"
+                                  : "[VP] colour PSO FAIL (0x%08lX)\n", hr2);
+            pcb->lpVtbl->Release(pcb);
+        }
+        if (ec) ec->lpVtbl->Release(ec);
+    }
     vb->lpVtbl->Release(vb); pb->lpVtbl->Release(pb);
     s_d3d.vp_compiled_bytes = st->vp_ucode_bytes;
     if (SUCCEEDED(hr)) { s_d3d.vp_ready = 1; printf("[VP] pipeline ready (%d instrs)\n", ni); }
@@ -1242,13 +1268,19 @@ static void render_frame(void)
 
     /* VP pass: real decompiled vertex program + atlas alpha-test PS. Feeds raw
      * float4 attrib0 from vp_vb and the vp_c[] constant bank. */
-    if (s_d3d.vp_ready && s_d3d.tex_ready && s_d3d.draw_count > 0) {
+    if (s_d3d.vp_ready && s_d3d.draw_count > 0) {
         int any = 0;
         for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++)
             if (s_d3d.draws[d].is_vp) { any = 1; break; }
-        if (any) {
+        /* Textured geometry (dbgfont atlas) uses the sampling PS; untextured 3D
+         * (vkcube) uses the colour-only PS. Fall back to whichever exists. */
+        ID3D12PipelineState* vpso =
+            (s_d3d.tex_ready && s_d3d.pipeline_state_vp) ? s_d3d.pipeline_state_vp
+                                                         : s_d3d.pipeline_state_vp_color;
+        if (!vpso) vpso = s_d3d.pipeline_state_vp;
+        if (any && vpso) {
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
-            s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, s_d3d.pipeline_state_vp);
+            s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, vpso);
             s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_TOPOLOGY_TRIANGLELIST);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                 s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb));
