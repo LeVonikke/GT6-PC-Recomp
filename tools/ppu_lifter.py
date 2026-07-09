@@ -338,6 +338,17 @@ class PPULifter:
         # callee's epilogue runs against the caller's frame (frame drift). Set by
         # main() from the disassembly; empty = legacy (range-based routing only).
         self.function_entries: set[int] = set()
+        # Jump-table dispatchers: {bctr_addr: sorted [case target addrs]}. A gcc
+        # switch reaches its cases via `mtctr; bctr` through a data table; those
+        # cases are INTERNAL blocks of the dispatcher's function (they fall
+        # through to a shared epilogue/continuation), not standalone functions.
+        # When the bctr and its cases live in one function we emit the bctr as a
+        # computed `switch(ctr){case: goto loc_}` so the cases stay in-range
+        # labels -- otherwise each case is a separate fragment and its `b
+        # <shared_block>` dead-ends, orphaning the callee-save epilogue (newlib
+        # _vfprintf_r: %f never restores r27). Set by main() from
+        # discover_jump_tables.
+        self.jump_tables: dict[int, list[int]] = {}
         # Optional executable-code window [code_lo, code_hi). When set, branch /
         # call targets that fall outside it are NOT promoted to func_X (they are
         # data the boundary detector mis-read as code -- e.g. .rodata living in
@@ -428,6 +439,16 @@ class PPULifter:
                                 internal_targets.add(target)
                         except ValueError:
                             pass
+
+        # Jump-table cases reached by a `bctr` inside this function are computed
+        # targets (invisible to the b/bc scan above) but ARE in-range blocks --
+        # register them so their `loc_X:` labels are emitted for the bctr's
+        # computed `switch...goto` to land on.
+        for _disp, _cases in self.jump_tables.items():
+            if start <= _disp < end:
+                for _c in _cases:
+                    if start <= _c < end:
+                        internal_targets.add(_c)
 
         emitted_labels: set[int] = set()
         for insn in range_insns:
@@ -1151,6 +1172,19 @@ class PPULifter:
                 return f"/* {mn} {insn.operands} */;"
 
         if mn == "bctr":
+            # Jump-table dispatcher: if the cases are in-range blocks of THIS
+            # function, dispatch via a computed goto to their labels so the
+            # switch stays one function (the cases share an epilogue/tail;
+            # splitting them out orphans the callee-save restore). CTR holds the
+            # resolved case address (base + table[idx]); match it to a case.
+            cases = self.jump_tables.get(insn.addr)
+            if cases:
+                arms = "".join(
+                    f"case 0x{c:08X}u: goto loc_{c:08X};"
+                    for c in cases if func.start_addr <= c < func.end_addr)
+                if arms:
+                    return ("switch ((uint32_t)ctx->ctr) { " + arms +
+                            " default: ps3_indirect_call(ctx); return; } return;")
             return "ps3_indirect_call(ctx); return;"
 
         if mn == "bctrl":
@@ -2847,12 +2881,21 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
 _WORKER_STATE: dict = {}
 
 
-def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None):
+def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
+                 function_entries=None, code_lo=0, code_hi=None, jump_tables=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
     _WORKER_STATE["prefix"] = prefix
     _WORKER_STATE["hle_stub_nids"] = hle_stub_nids or {}
+    # Branch-routing context the body lift needs -- previously omitted, so the
+    # parallel path lost the code-window filter (out-of-range branches became
+    # bogus func_XXXX trampolines that fail to link) and the function-entry
+    # tail-call detection. Now threaded through so workers match the serial lift.
+    _WORKER_STATE["function_entries"] = function_entries or set()
+    _WORKER_STATE["code_lo"] = code_lo
+    _WORKER_STATE["code_hi"] = code_hi
+    _WORKER_STATE["jump_tables"] = jump_tables or {}
 
 
 def _worker_lift(task):
@@ -2863,6 +2906,10 @@ def _worker_lift(task):
     # .lib.stub trampoline (which derefs an unpopulated import table) is lifted as
     # real code and bctrl's to garbage. (Single-threaded lift set this directly.)
     lifter.hle_stub_nids = _WORKER_STATE.get("hle_stub_nids", {})
+    lifter.function_entries = _WORKER_STATE.get("function_entries", set())
+    lifter.code_lo = _WORKER_STATE.get("code_lo", 0)
+    lifter.code_hi = _WORKER_STATE.get("code_hi", None)
+    lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     results = []
     for start, end in bounds:
         blob = b""
@@ -2895,7 +2942,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
     # close() (no new tasks) + join() (graceful worker exit) avoids the deadlock.
     pool = mp.Pool(processes=jobs, initializer=_worker_init,
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
-                             lifter.hle_stub_nids))
+                             lifter.hle_stub_nids, lifter.function_entries,
+                             lifter.code_lo, lifter.code_hi, lifter.jump_tables))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -3173,6 +3221,7 @@ def main() -> None:
     # extend the dispatcher function over the case block: the mid-entry tail
     # mechanism lifts target..func_end, so a far end explodes the output.)
     jt_targets = set()
+    jt_dispatchers: dict[int, list[int]] = {}   # {bctr_addr: [case targets]}
     if not args.raw:
         try:
             seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
@@ -3229,21 +3278,52 @@ def main() -> None:
             if len(toc_candidates) > 1:
                 print(f"  TOC candidates: {', '.join(hex(t) for t in toc_candidates)}")
             tables = discover_jump_tables(all_insns, _read_u32, toc_candidates, text_lo, text_hi)
+            jt_dispatchers = tables
             for ts in tables.values():
                 jt_targets.update(ts)
             import bisect
             fb = dict(func_bounds)
+            # A switch's cases + shared tail are ONE function. When a dispatcher
+            # lives inside a known function, EXTEND that function to span all its
+            # cases (they end at a shared epilogue past the function's first blr,
+            # which the by-blr boundary would otherwise cut off) and keep the
+            # cases as internal labels (see the bctr computed-goto in _translate).
+            # Only fall back to standalone case functions when no function
+            # encloses the dispatcher (e.g. a title whose switch host isn't in
+            # the symbol/OPD list). Extending is bounded by the next real start
+            # after the last case, so it never swallows a following function.
+            _starts0 = sorted(fb)
+            def _enclosing(addr):
+                k = bisect.bisect_right(_starts0, addr) - 1
+                if k >= 0 and fb[_starts0[k]] > addr:
+                    return _starts0[k]
+                return None
+            enclosed_cases = set()
+            for disp, cases in tables.items():
+                if not cases:
+                    continue
+                fs = _enclosing(disp)
+                if fs is None:
+                    continue
+                maxc = max(cases)
+                kk = bisect.bisect_right(_starts0, maxc)
+                new_end = _starts0[kk] if kk < len(_starts0) else text_hi
+                if new_end > fb[fs]:
+                    fb[fs] = new_end
+                enclosed_cases.update(c for c in cases if fs <= c < fb[fs])
+            # Standalone functions only for cases NOT absorbed into an enclosing
+            # function (and not already a known start).
             allstarts = sorted(set(fb) | jt_targets)
             added = 0
             for t in sorted(jt_targets):
-                if t in fb:
+                if t in fb or t in enclosed_cases:
                     continue
                 k = bisect.bisect_right(allstarts, t)
                 fb[t] = allstarts[k] if k < len(allstarts) else text_hi
                 added += 1
             func_bounds = sorted(fb.items())
             print(f"  jump tables: {len(tables)} dispatchers, {len(jt_targets)} case targets, "
-                  f"+{added} case funcs")
+                  f"{len(enclosed_cases)} kept internal, +{added} case funcs")
         except Exception as exc:
             print(f"  jump-table discovery skipped: {exc}", file=sys.stderr)
 
@@ -3285,6 +3365,7 @@ def main() -> None:
         lifter.code_hi = max(e for _, e in func_bounds)
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
+    lifter.jump_tables = jt_dispatchers
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.

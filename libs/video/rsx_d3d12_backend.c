@@ -1062,17 +1062,19 @@ static void render_frame(void)
         vpx[0] = vpx[1] = vpx[2] = vpx[3] = 1.0f;   /* vp_posscale  */
         vpx[4] = vpx[5] = vpx[6] = vpx[7] = 0.0f;   /* vp_posoffset */
         /* Fallback perspective when the guest's projection matrix (vp_c[0..3])
-         * is garbage. vkcube uploads a projection whose [0][0] is ~1e7 and grows
-         * every frame (a guest-side bug not yet root-caused), which blows the
-         * cube up into a screen-filling quad. When [0][0] is out of any sane
-         * range (or non-finite, or VP_FIXPROJ forces it), substitute a standard
-         * LH perspective (45deg, 16:9, zn=1 zf=100) so geometry is at least
-         * viewable. A sane guest projection passes through untouched. TODO: fix
-         * the guest projection computation instead. */
+         * is garbage. vkcube's MatrixProjPerspective computes a broken x-scale
+         * (M0[0][0]): ~1e7 before the lifter callee-save fixes, ~145 after --
+         * either way far from a real perspective's ~1.3, so the cube blows up
+         * to fill the screen. A genuine LH perspective x-scale = 1/(aspect*
+         * tan(fov/2)) lands well under ~8 for any sane FOV/aspect, so treat
+         * anything outside (0, 8] (or non-finite, or VP_FIXPROJ) as garbage and
+         * substitute a standard LH perspective (45deg, 16:9, zn=1 zf=100) so
+         * geometry is viewable. TODO: fix the guest projection (tanf /
+         * MatrixProjPerspective) instead of overriding it. */
         {
             float* c = (float*)s_d3d.vp_cb_mapped;
             float c00 = c[0];
-            int garbage = !(c00 > -1.0e4f && c00 < 1.0e4f);   /* NaN/inf/huge */
+            int garbage = !(c00 > 0.0f && c00 < 8.0f);   /* NaN/inf/huge/tiny-FOV */
             if (garbage || getenv("VP_FIXPROJ")) {
                 for (int _i = 0; _i < 16; _i++) c[_i] = 0.0f;
                 c[0]=1.358f; c[5]=2.414f; c[10]=1.0101f; c[11]=1.0f; c[14]=-1.0101f;
