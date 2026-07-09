@@ -206,28 +206,27 @@ def ref_divdu(a, b):
 
 # --- vupk*: AltiVec sign-extend unpacks. Element SELECTION (which half of
 # the 16 input bytes feeds the op) follows the AltiVec PEM (6-172..6-176):
-# high = storage bytes 0-7, low = storage bytes 8-15. But ppu_lifter.py's
-# vupk* handlers read/write vr[] through native (host, little-endian x86)
-# int16_t*/int32_t* casts rather than an explicit big-endian unpack -- e.g.
-# vupkhsh does `int16_t* b=(int16_t*)&ctx->vr[vb]; r[i]=(int32_t)b[i];
-# memcpy(vd, r, 16)`, so a 16-bit lane's bytes are read AND written in host
-# (LE) order, not swapped to/from the guest's big-endian element order. That
-# is this file's existing, already-upstream vupkhsh convention (matched here
-# for vupklsh/vupkhsb/vupklsb, not something this change invents), so these
-# references model that native-endian read/write exactly, using '<' (host
-# LE) struct formats -- NOT '>' -- to predict the lifter's actual output.
+# high = storage bytes 0-7, low = storage bytes 8-15. ppu_lifter.py's vupk*
+# handlers now route every multi-byte lane through the vrh/vsth (halfword
+# source of vupkhsh/vupklsh) and vsth (halfword result of vupkhsb/vupklsb)
+# big-endian accessors, matching every other multi-byte-lane VMX handler
+# (ppu: vmx element wise ops read big endian lanes fix). These references
+# therefore use '>' (true big-endian) struct formats to predict the lifter's
+# corrected output -- this used to be '<' (host LE), which modeled the
+# pre-fix byte-reversed behavior as "correct"; it wasn't, it was the same
+# class of bug this change fixes everywhere else.
 def ref_vupkhsh(vb16):
-    halfs = struct.unpack("<4h", vb16[0:8])          # high 4 halfwords, host order
-    return struct.pack("<4i", *halfs)
+    halfs = struct.unpack(">4h", vb16[0:8])          # high 4 halfwords, big-endian
+    return struct.pack(">4i", *halfs)
 def ref_vupklsh(vb16):
-    halfs = struct.unpack("<4h", vb16[8:16])         # low 4 halfwords, host order
-    return struct.pack("<4i", *halfs)
+    halfs = struct.unpack(">4h", vb16[8:16])         # low 4 halfwords, big-endian
+    return struct.pack(">4i", *halfs)
 def ref_vupkhsb(vb16):
-    bytes8 = struct.unpack("<8b", vb16[0:8])         # high 8 bytes
-    return struct.pack("<8h", *bytes8)
+    bytes8 = struct.unpack(">8b", vb16[0:8])         # high 8 bytes (byte lanes: order-agnostic)
+    return struct.pack(">8h", *bytes8)
 def ref_vupklsb(vb16):
-    bytes8 = struct.unpack("<8b", vb16[8:16])        # low 8 bytes
-    return struct.pack("<8h", *bytes8)
+    bytes8 = struct.unpack(">8b", vb16[8:16])        # low 8 bytes (byte lanes: order-agnostic)
+    return struct.pack(">8h", *bytes8)
 
 def cr_nibble_signed(a, b):
     if s64(a) < s64(b): return 8
@@ -272,12 +271,30 @@ def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may
 # and checks one output vector register's 16 raw bytes. The byte contents
 # are opaque here (chosen only to span sign/lane patterns); the ref_vupk*
 # functions above are what predict the lifter's actual output for a given
-# input, including its native-endian element read/write convention.
-VCASES = []   # dicts: name, word, vb_reg, vb_bytes, vd_reg, exp_bytes
+# input, including its big-endian element read/write convention.
+#
+# va_reg/va_bytes and vc_reg/vc_bytes are optional: the original harness only
+# covered unary vupk* (one input, vB); binary ops (vcmpgtsw, vadduwm, ...)
+# also seed vA, and the VA-form vmaddfp also seeds vC. Kept at the end of the
+# signature so the existing unary vcase(...) call sites above are untouched.
+VCASES = []   # dicts: name, word, vb_reg, vb_bytes, vd_reg, exp_bytes, va_reg, va_bytes, vc_reg, vc_bytes
 
-def vcase(name, word, vb_reg, vb_bytes, vd_reg, exp_bytes):
+def vcase(name, word, vb_reg, vb_bytes, vd_reg, exp_bytes,
+          va_reg=None, va_bytes=None, vc_reg=None, vc_bytes=None):
     VCASES.append(dict(name=name, word=word, vb_reg=vb_reg, vb_bytes=vb_bytes,
-                       vd_reg=vd_reg, exp_bytes=exp_bytes))
+                       vd_reg=vd_reg, exp_bytes=exp_bytes,
+                       va_reg=va_reg, va_bytes=va_bytes,
+                       vc_reg=vc_reg, vc_bytes=vc_bytes))
+
+def be_w(vals):    # N x uint32 (big-endian lane values) -> 4N raw bytes
+    return struct.pack(f">{len(vals)}I", *(v & 0xFFFFFFFF for v in vals))
+def be_h(vals):    # N x uint16 (big-endian lane values) -> 2N raw bytes
+    return struct.pack(f">{len(vals)}H", *(v & 0xFFFF for v in vals))
+def be_f(vals):    # N x float (big-endian lane values) -> 4N raw bytes
+    return struct.pack(f">{len(vals)}f", *vals)
+
+def va_form(xo6, vd, va, vb, vc):   # VA-form (vmaddfp/vnmsubfp/vsel/vperm/vsldoi/...)
+    return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | (vc << 6) | xo6
 
 def pairs(n=6):
     ps = []
@@ -555,6 +572,68 @@ def build_vcases():
         vcase(f"vupkhsb {label}", vx_form(526, VD, 0, VB), VB, vb, VD, ref_vupkhsb(vb))
         vcase(f"vupklsb {label}", vx_form(654, VD, 0, VB), VB, vb, VD, ref_vupklsb(vb))
 
+    # --- VMX per-lane byte-order discrimination cases -----------------------
+    # (ppu: vmx element wise ops read big endian lanes fix). Each pair below
+    # is chosen so the PRE-FIX (native-cast) lifter and the POST-FIX
+    # (vrh/vrw/vrf accessor) lifter compute DIFFERENT results -- i.e. these
+    # fail on a revert of just the lifter change (see the discrimination
+    # count in the PR description), unlike an equality compare or a splat,
+    # where a byte-swap is either invariant or cancels out.
+
+    # vcmpgtsw: true 256 > 2, but a native (unswapped) 32-bit read sees BE
+    # bytes 00 00 01 00 / 00 00 00 02 as 0x00010000 / 0x02000000 -- 65536 >
+    # 33554432 is false. This is the exact audit example. Lanes 1-3 are a
+    # sanity/equal-value check (not part of the discriminating lane). xo=902
+    # with Rc=0 (bit 10 of the 11-bit xo field clear) decodes as "vcmpgtsw"
+    # with no dot -- the case name below must match exactly.
+    vcase("vcmpgtsw mixed", vx_form(902, 2, 0, 1),
+          1, be_w([2, 10, 1, 7]), 2, be_w([0xFFFFFFFF, 0, 0, 0]),
+          va_reg=0, va_bytes=be_w([256, 10, 0, 7]))
+
+    # vcmpgtsh: same 256-vs-2 audit example at halfword width (native 16-bit
+    # read of BE bytes 01 00 / 00 02 sees 0x0001 / 0x0200 -- 1 > 512 is false).
+    vcase("vcmpgtsh mixed", vx_form(838, 2, 0, 1),
+          1, be_h([2, 10, 1, 7, 5, 5, 5, 5]), 2, be_h([0xFFFF, 0, 0, 0, 0, 0, 0, 0]),
+          va_reg=0, va_bytes=be_h([256, 10, 0, 7, 5, 5, 5, 5]))
+
+    # vadduwm: values straddling a byte boundary (0xFF + 0x01 = 0x100). A
+    # native (unswapped) add sees BE bytes 00 00 00 FF / 00 00 00 01 as
+    # 0xFF000000 / 0x01000000; that sum overflows 32 bits and wraps to 0,
+    # not 0x100. (0x100+0x100 alone does NOT discriminate here -- neither
+    # representation carries across a byte boundary for that pair, so it is
+    # included only as a non-discriminating sanity lane; 0xFFFFFFFF+1 is a
+    # second, stronger discriminating lane: true result 0, native-read result
+    # 0xFFFFFF00.)
+    vcase("vadduwm canary", vx_form(128, 2, 0, 1),
+          1, be_w([0x01, 0x100, 1, 0]), 2, be_w([0x100, 0x200, 0, 0]),
+          va_reg=0, va_bytes=be_w([0xFF, 0x100, 0xFFFFFFFF, 0]))
+
+    # vmaddfp: vD = vA*vC + vB with exact 2.0-family values (2.0*3.0+1.0=7.0).
+    # A native float* cast on raw-BE storage reinterprets 2.0's bytes
+    # (40 00 00 00) as a subnormal near zero, so the pre-fix product/sum is
+    # nowhere near 7.0. Raw encoding fields: RA=vA (mult. operand 1, "va"
+    # here), RB=vC (mult. operand 2 -- the mandatory vb_reg/vb_bytes below is
+    # actually the ADD operand vB; RC=vC is the optional vc_reg/vc_bytes),
+    # per ppu_lifter.py's vmaddfp comment ("operand order is vD, vA, vC, vB").
+    vcase("vmaddfp canary", va_form(46, 2, 0, 1, 3),
+          1, be_f([1.0, 1.0, 1.0, 1.0]), 2, be_f([7.0, 7.0, 7.0, 7.0]),
+          va_reg=0, va_bytes=be_f([2.0, 2.0, 2.0, 2.0]),
+          vc_reg=3, vc_bytes=be_f([3.0, 3.0, 3.0, 3.0]))
+
+    # vspltw/vsplth of a multi-byte value: included per the audit's requested
+    # coverage, but these do NOT discriminate the bug (see ppu_lifter.py's
+    # comment on vspltw) -- a splat only copies an existing lane's raw bytes
+    # to other lanes with no arithmetic in between, so reading and writing
+    # with the same (even wrong) reinterpretation cancels out and the
+    # transferred bytes are correct either way. Kept green across the
+    # revert-and-recount step as a deliberate non-discriminating control.
+    vcase("vspltw w=1 canary", vx_form(652, 2, 1, 5),
+          5, be_w([0x12345678, 0x9ABCDEF0, 0x11111111, 0x22222222]),
+          2, be_w([0x9ABCDEF0] * 4))
+    vcase("vsplth w=3 canary", vx_form(588, 2, 3, 5),
+          5, be_h([0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x1111, 0x2222, 0x3333, 0x4444]),
+          2, be_h([0xDEF0] * 8))
+
 build_vcases()
 
 # ---------------------------------------------------------------------------
@@ -715,6 +794,14 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); me
         out.append("      memset(ctx, 0, sizeof(*ctx));")
         out.append(f"      {{ uint8_t _vb[16] = {{ {vb_hex} }}; "
                     f"memcpy(&ctx->vr[{c['vb_reg']}], _vb, 16); }}")
+        if c.get("va_reg") is not None:
+            va_hex = ", ".join(f"0x{b:02X}" for b in c["va_bytes"])
+            out.append(f"      {{ uint8_t _va[16] = {{ {va_hex} }}; "
+                        f"memcpy(&ctx->vr[{c['va_reg']}], _va, 16); }}")
+        if c.get("vc_reg") is not None:
+            vc_hex = ", ".join(f"0x{b:02X}" for b in c["vc_bytes"])
+            out.append(f"      {{ uint8_t _vc[16] = {{ {vc_hex} }}; "
+                        f"memcpy(&ctx->vr[{c['vc_reg']}], _vc, 16); }}")
         out.append(f"      {code}")
         out.append(f"      {{ uint8_t _want[16] = {{ {want_hex} }}; "
                     f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')
