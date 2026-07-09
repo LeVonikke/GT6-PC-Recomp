@@ -166,7 +166,7 @@ s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
     if (!out_ea)
         return CELL_SYSUTIL_ERROR_VALUE;
 
-    s32 v;
+    s32 v = 0;
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
         v = CELL_SYSUTIL_LANG_ENGLISH_US;
@@ -174,23 +174,17 @@ s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
         v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
         break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:
-        v = 1; /* Has NP account */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:
-        v = 1; /* Rumble on */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:     /* YYYYMMDD */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:     /* 24-hour  */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:        /* UTC      */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:      /* no DST   */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT:
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:   /* 60Hz     */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:   /* US/101   */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:     /* disabled */
-        v = 0;
-        break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:    v = 0; break; /* YYYYMMDD */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:    v = 0; break; /* 24-hour */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:       v = 0; break; /* UTC */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:     v = 0; break; /* No DST */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:           v = 0; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT: v = 0; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:   v = 1; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:  v = 0; break; /* 60Hz */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:     v = 1; break; /* Rumble on */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:  v = 0; break; /* US/101 */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:    v = 0; break; /* Disabled */
     default:
         printf("[cellSysutil] GetSystemParamInt: unknown id 0x%04X\n", id);
         v = 0;
@@ -325,7 +319,10 @@ s32 cellDiscGameGetBootDiscInfo(u32* type, char* titleId, u32 titleIdSize)
         *type = CELL_DISCGAME_TYPE_HDD; /* pretend HDD game */
 
     if (titleId && titleIdSize > 0) {
-        strncpy(titleId, "GAME00000", titleIdSize - 1);
+        /* Use the real title id (from PARAM.SFO at boot) instead of a placeholder. */
+        extern const char* cellGame_get_title_id(void);
+        const char* tid = cellGame_get_title_id();
+        strncpy(titleId, tid && tid[0] ? tid : "GAME00000", titleIdSize - 1);
         titleId[titleIdSize - 1] = '\0';
     }
 

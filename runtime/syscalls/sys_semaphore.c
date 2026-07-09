@@ -3,6 +3,7 @@
  */
 
 #include "sys_semaphore.h"
+#include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 
@@ -173,10 +174,24 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
-    DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
-    if (ms == 0 && timeout_us > 0) ms = 1;
-
-    DWORD result = WaitForSingleObject(s->sem_handle, ms);
+    DWORD result;
+    if (timeout_us > 0 && timeout_us < 1000) {
+        /* Sub-ms timed wait: WaitForSingleObject floors to 1 ms and the OS
+         * rounds up to the timer tick; poll the handle (0-timeout try-acquire)
+         * to a QPC deadline instead. Safe to poll: the semaphore count lives
+         * in the Win32 kernel object, so a post between polls stays counted
+         * and is simply picked up by the next try-acquire. */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
+        for (;;) {
+            result = WaitForSingleObject(s->sem_handle, 0);
+            if (result != WAIT_TIMEOUT) break;
+            if (lv2_deadline_passed(deadline)) break;
+            SwitchToThread();
+        }
+    } else {
+        DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
+        result = WaitForSingleObject(s->sem_handle, ms);
+    }
     if (result == WAIT_TIMEOUT) {
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
     }

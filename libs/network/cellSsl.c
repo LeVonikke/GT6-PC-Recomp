@@ -6,6 +6,7 @@
  */
 
 #include "cellSsl.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 -- out-params are guest EAs */
 #include <stdio.h>
 #include <string.h>
 
@@ -53,10 +54,12 @@ s32 cellSslEnd(void)
     return CELL_OK;
 }
 
-s32 cellSslCertificateLoader(u32 flags)
+s32 cellSslCertificateLoader(u64 flags, char* buffer, u32 size, u32* required)
 {
-    (void)flags;
-    printf("[cellSsl] CertificateLoader(flags=0x%X)\n", flags);
+    (void)buffer; (void)size;
+    printf("[cellSsl] CertificateLoader(flags=0x%llX)\n", (unsigned long long)flags);
+    if (required)
+        vm_write32((uint32_t)(uintptr_t)required, 0);  /* required is a guest EA -> write guest mem, not host deref */
     return CELL_OK;
 }
 

@@ -195,19 +195,24 @@ static void cellFsLseek(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
-/* CellFsStat (big-endian, 0x38 bytes): mode(4) uid(4) gid(4) pad(4)
- * atime(8) mtime(8) ctime(8) size(8) blksize(8). */
+/* CellFsStat is 0x34 (52) bytes, 4-byte aligned -- the s64/u64 members are
+ * be_t<...,4> so there is NO 4-byte pad after gid (verified vs RPCS3:
+ * CHECK_SIZE_ALIGN(CellFsStat, 52, 4)). Laying it out 8-byte-aligned (0x38,
+ * pad@0x0C) shifts size/blksize +4 and overruns the struct by 4 bytes -- games
+ * that embed a CellFsStat inside a larger object (e.g. Dantelion's
+ * DLFileDeviceStream, stat@obj+0xD8) then have the trailing blksize clobber the
+ * field right after the stat (the fd at obj+0x10c), which later fails lseek.
+ * Layout: mode@0 uid@4 gid@8 atime@0x0C mtime@0x14 ctime@0x1C size@0x24 blksize@0x2C. */
 static void write_stat(uint32_t sb, uint32_t mode, uint64_t size)
 {
     vm_write32(sb + 0x00, mode);
     vm_write32(sb + 0x04, 0);            /* uid */
     vm_write32(sb + 0x08, 0);            /* gid */
-    vm_write32(sb + 0x0C, 0);            /* pad */
-    vm_write64(sb + 0x10, 0);            /* atime */
-    vm_write64(sb + 0x18, 0);            /* mtime */
-    vm_write64(sb + 0x20, 0);            /* ctime */
-    vm_write64(sb + 0x28, size);         /* size */
-    vm_write64(sb + 0x30, 0x200);        /* blksize */
+    vm_write64(sb + 0x0C, 0);            /* atime */
+    vm_write64(sb + 0x14, 0);            /* mtime */
+    vm_write64(sb + 0x1C, 0);            /* ctime */
+    vm_write64(sb + 0x24, size);         /* size */
+    vm_write64(sb + 0x2C, 0x200);        /* blksize */
 }
 
 static void cellFsStat(ppu_context* ctx)

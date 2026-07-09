@@ -300,6 +300,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
+    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -429,8 +430,24 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
     table_lock();
     ppu_thread_info* t = find_thread(tid);
     if (!t) {
+        /* The main thread (and any thread we didn't spawn via sys_ppu_thread_create)
+         * isn't in our table. Returning ESRCH here is fatal for engines that query
+         * their own priority at startup (PhyreEngine PApplication::PlatformInit ->
+         * "Error initializing PSSG"). Report a sane default priority + success. */
         table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
+        if (prio_addr != 0) {
+            int32_t prio = 1000;
+            int32_t* out = (int32_t*)vm_to_host(prio_addr);
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+            uint32_t u = (uint32_t)prio;
+            u = ((u >> 24) & 0xFF) | ((u >> 8) & 0xFF00) |
+                ((u <<  8) & 0xFF0000) | ((u << 24) & 0xFF000000u);
+            *out = (int32_t)u;
+#else
+            *out = prio;
+#endif
+        }
+        return CELL_OK;
     }
 
     if (prio_addr != 0) {

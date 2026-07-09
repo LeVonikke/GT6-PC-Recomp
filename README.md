@@ -285,6 +285,7 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 | **flOw** (thatgamecompany) | NPUA80001 | 92K functions, game reaches main() init, module loading + sysutil callbacks working, trampoline system for split-function chains, ~10K TODOs, D3D12 backend ready | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
 | **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 33K functions lifted, CRT init + HLE framework wired, indirect call dispatch | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
 | **The Simpsons Arcade Game** (Konami) | NPUB30563 | 14.7K functions; boots through CRT + GCM init with a live D3D12 window; a Konami arcade *emulator* EBOOT that routes rendering through CRI middleware on SPURS SPU tasks — drove the SPU recompilation work; blocked on the SPU-task pipeline | [sp00nznet/simpsonsarcade-ps3](https://github.com/sp00nznet/simpsonsarcade-ps3) |
+| **You Don't Know Jack** (Jellyvision/THQ) | BLUS30569 | 5,859 functions; **boots the full init stack to its main game loop** and runs a live D3D12 clear+flip at 60 Hz. Scaleform Flash UI + FMOD audio — a menu/UI-heavy title, an ideal recomp target. Frontier: GCM ring-wrap flush callback + a `0xC708C708` scene-dispatch poison gate the first real draws | [sp00nznet/youdontknowjack](https://github.com/sp00nznet/youdontknowjack) |
 
 Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
 
@@ -337,6 +338,108 @@ ps3recomp is built by a growing community. See **[CONTRIBUTORS.md](CONTRIBUTORS.
 for who did what — thank you, everyone.
 
 ## Changelog
+
+### v0.6.7 — *"Fine Print"* (July 2026)
+*The second half of the two-port review pass: [@canersaka](https://github.com/canersaka)'s remaining decode/ABI/timing fixes plus a lifter/HLE audit toolkit, and the title-agnostic robustness fixes from [@JonathanDC64](https://github.com/JonathanDC64)'s port that could be ported and build-verified cleanly.*
+
+**Lift & decode**
+- **NV40 VP/FP shader decompilers hardened** against retail-game shaders (LIT/SFL/STR/ARL/RCC/RSQ, relative constant addressing, all 16 ATTR inputs, viewport transform; FP masked-store fix) — *[@canersaka](https://github.com/canersaka)* (#47)
+- **`spu_disasm`**: channel field widened 5→7 bits (channels ≥32 no longer wrap), hbra/hbrr field layout, `bisl`/`brsl`/`brasl` link register shown, `ri7` sign-extension, stop-code preserved — *[@canersaka](https://github.com/canersaka)* (#49)
+- **SPU `stop` signal code preserved** to `ctx->stop_code` — SPURS leaf tasks invoke kernel syscalls via `stop <code>` (EXIT/YIELD/WAIT/…), which was being discarded — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**Runtime & lv2**
+- **Sub-millisecond timeouts extended** to `sys_event_flag`, `sys_semaphore`, and `sys_mutex` timed waits (the same 15.6 ms-granularity fix as v0.6.5's event-queue path) — *[@canersaka](https://github.com/canersaka)* (#50)
+- **`g_active_ctx` restored after guest callbacks** — it was left dangling at a stack-local scratch ctx, corrupting the crash handler / diagnostics; applied to both `ppu_guest_call` and `ppu_guest_call_ct` — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**HLE**
+- **Corrected ABI signatures** for cellPamf, cellSail, cellHttp/cellHttpUtil/cellHttps/cellSsl, cellNet/sysNet, sceNpTrophy, and cellGameData (arg order/count/width → correct register mapping) — *[@canersaka](https://github.com/canersaka)* (#55)
+- **`cellGameDataCheckCreate2`** (NID `0xC9645C41`) implemented — marshals StatGet/StatSet and fires the guest `funcStat` callback — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**Tooling**
+- **Lifter/HLE audit kit** — PPU/SPU decode cross-checks vs Capstone / an RPCS3-output oracle, HLE ABI + dispatch-classify audits, an endianness heuristic, a lift-structure census, and an lv2 sync stress test — *[@canersaka](https://github.com/canersaka)* (#56)
+
+### v0.6.6 — *"Two Ports, One Toolkit"* (July 2026)
+*Two independent retail-game ports kept fuzzing the toolkit: [@canersaka](https://github.com/canersaka)'s **Yakuza: Dead Souls** and [@JonathanDC64](https://github.com/JonathanDC64)'s **Demon's Souls**. This release distills the title-agnostic correctness/robustness wins each surfaced — the port-specific scaffolding stays in the forks.*
+
+**PPU / SPU lift**
+- **`fsqrt`/`fsqrts` source-register decode** + **`vspltis`** printed as a signed immediate (`ppu_disasm`) — *[@canersaka](https://github.com/canersaka)* (#46)
+- **`addeo`/`subfeo`/`mulhwo`/`mulhwuo` overflow forms** (previously fell through to a no-op stub) + **`vupklsb`/`vupkhsb`/`vupklsh`** unpacks — *[@canersaka](https://github.com/canersaka)* (#52)
+- **Cross-function SPU tail calls forced with `musttail`** — a guest loop whose back-edge crosses a lifted-function boundary was nesting one host C frame per iteration and silently overflowing the stack (a stack-overflow SE runs no unhandled filter, so the process died with no log and exit code 0); now an O(1)-stack jump under clang — *[@JonathanDC64](https://github.com/JonathanDC64)*
+- **Mid-function / gap lifting sliced O(n²)→O(span)** — a ~40-minute no-output hang on 96k+ function titles is now bounded work — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**Runtime & lv2**
+- **Sub-millisecond `sys_timer` usleep** — was a single `SwitchToThread()`, so `usleep(<1000)` was a no-op; now paces to a QPC deadline — *[@canersaka](https://github.com/canersaka)* (#44)
+- **`sys_event_queue_receive` returns the event in r4–r7** (lv2 ABI), not just the guest memory buffer — callers reading the registers saw stale values — *[@JonathanDC64](https://github.com/JonathanDC64)*
+- **`sys_memory_get_page_attribute`** renumbered 358→**351** (0x15F) and implemented — *[@JonathanDC64](https://github.com/JonathanDC64)*
+- **`CellFsStat` runtime-side layout** corrected to the 52-byte / 4-byte-aligned ABI — fixes the `ppu_fs.cpp` / `sys_fs.c` stat writers the v0.6.5 libs-side packing fix didn't cover — *[@JonathanDC64](https://github.com/JonathanDC64)*
+
+**HLE libs**
+- **`cellNetCtl`** integer out-params written big-endian — *[@canersaka](https://github.com/canersaka)* (#45)
+- **`cellAudio`** delivers real period events to the registered notify queues (games blocked on the audio event now wake) — *[@canersaka](https://github.com/canersaka)* (#54)
+
+### v0.6.5 — *"The Fifteen-Millisecond Tax"* (July 2026)
+*Driving **You Don't Know Jack** (Scaleform UI + FMOD, 5,859 functions) from an instant crash to its running main loop surfaced one global performance bug worth more than any single lift fix — plus a batch of community lifter/HLE correctness PRs.*
+
+**Runtime — the event-poll timer-resolution fix** (`sys_event.c`, `tests/boot_main.cpp`):
+- Titles that poll an event queue every frame with a **sub-millisecond timeout** (YDKJ uses 30 µs) were throttled ~**500× game-wide**. `sys_event_queue_receive` floored the timeout to a 1 ms `SleepConditionVariableCS`, but Windows' default ~15.6 ms timer granularity inflates *any* sub-15 ms wait to a full tick — a two-queue-per-frame poll loop burned ~30 ms/frame doing nothing. Sub-millisecond timeouts now do a true non-blocking check (immediate `ETIMEDOUT` when empty), and the harness calls `timeBeginPeriod(1)`. YDKJ went from ~0.5 fps effective to ~60 Hz, reaching online-init ~6× faster.
+- GCM FIFO drain moved into the 60 Hz vblank tick, so RSX sync-fence labels advance regardless of `present()` latency.
+
+**Community PRs incorporated** — thank you:
+- **cellFs big-endian out-params + `CellFsStat` PS3 packing** — *[@canersaka](https://github.com/canersaka)* (#22)
+- **cellGame reads the real title id from `PARAM.SFO`** — *[@canersaka](https://github.com/canersaka)* (#24)
+- **`sys_rwlock` → `EDEADLK`/`EPERM`** on writer self-relock / bad unlock — *[@canersaka](https://github.com/canersaka)* (#25)
+- **`ppu_disasm`: opcodes 33/225 are `crnor`/`crnand`** (were swapped) — *[@canersaka](https://github.com/canersaka)* (#40)
+- **Static firmware LLE** (`tools/lift_prx.py` + `docs/FIRMWARE_LLE.md`) — relocate a decrypted PRX and lift the real firmware module (e.g. the libsre SPURS kernel) instead of HLE-ing it; a bring-your-own-firmware method that ships no firmware — *[@canersaka](https://github.com/canersaka)* (#53)
+- **cellPad DIGITAL2 face-button packing + analog-Y reflect-about-128** — *[@sagemono](https://github.com/sagemono)* (#42)
+
+**You Don't Know Jack port** — now public at [sp00nznet/youdontknowjack](https://github.com/sp00nznet/youdontknowjack): boots the full init stack to its **main game loop** with a live D3D12 clear+flip at 60 Hz. Current frontier: the GCM command buffer's ring-wrap flush callback is `null` and a computed `0xC708C708` poison reaches the scene-graph dispatch — so only black clears render so far.
+
+### v0.6.4 — *"Carry the One"* (July 2026)
+*A pass of hard-won correctness fixes surfaced by driving flOw (PhyreEngine, ~104k functions) deep into its boot — plus the SPU-side plumbing to get a SPURS taskset actually dispatching. Most of these are silent-corruption bugs: the lift produced valid C for the *wrong* computation, so nothing crashed until a data structure quietly filled with garbage thousands of frames later.*
+
+**Community PRs incorporated** — thank you [@canersaka](https://github.com/canersaka), who found and fixed all of the below and sent them in as pull requests:
+
+*PPU lift*
+- **XER[CA] for the shift-algebraic ops** (`sraw`/`srad`/`srawi`/`sradi`) + `mtcrf` field mask — (#21)
+- **XER[CA] for `subfe`/`subfme`/`addme`** — (#26)
+- **`cntlzw(0)` is 32**, not undefined `__builtin_clz` garbage — (#35)
+- **PPU lifter conformance suite** + six emission fixes it found — (#37)
+- **`vcmpgtsb`/`sh`/`sw`/`ub`/`uh`/`uw` handlers** (dot forms set CR6) — (#39)
+
+*SPU lift*
+- **`bi $r0` reloaded via `lqa`/`lqr` is a computed tail jump**, not a return — (#36)
+- **self-referential SPU branch mislifts** — (#30)
+- **complete SPU ISA coverage** (all 199 ops + double-precision) — (#31)
+- **byte-correct SPU quadword helpers** (`shufb`, `cbd`/`chd`/`cwd`/`cdd`) — (#32)
+- **`il` negative-immediate double sign-extension** — (#33)
+- **preferred-slot-only link register + `rchcnt`** — (#34)
+
+*Runtime*
+- **`mftb`/`mftbu` read a real timebase** — (#38)
+
+**PPU lift — the carry/borrow bug class** (`ppu_lifter.py`):
+- **64-bit `add` never wrote XER[CA]** and truncated the carry-out to 32 bits. Any `adde`/`addze`/`subfe` consumer downstream (bignum math, 64-bit pointer arithmetic, the CRT's own `__eabi` helpers) then read a stale carry. Now sets CA from the true unsigned 64-bit carry-out.
+- **`subfic` computed a 32-bit result and dropped the borrow** — rewritten as `EXTS(SI) - RA` over the full 64 bits with `XER[CA] = NOT borrow` (`EXTS(SI) >= RA`).
+- **`subfme` was missing its XER[CA] update entirely**; `adde`/`addme` carry-out recomputed to match the PowerISA / RPCS3 `add64_flags` ADC semantics.
+- **`sraw`/`srad`/`srawi`/`sradi` now set XER[CA]** (was never written) via new `ppc_sraw`/`ppc_srad` helpers — CA = `rS<0 AND any 1-bits shifted out`, which feeds the same `adde`/`subfe` consumers.
+- **Fall-through tail-call / computed-`bctr` dispatch leaked the frame**: these were lifted as `ps3_indirect_call(ctx); return;` *without* the function epilogue, leaking `r1` and the callee-saved GPRs on every jump-table `switch` and tail call. Now emits the full epilogue before the tail jump.
+- **`ppu_disasm.py --va`**: disassemble a window at a *virtual* address, mapping va→file offset through the ELF's `PT_LOAD` segments — fixing the long-standing footgun where `--raw --offset <vaddr>` read the wrong bytes (off by the `.text` segment base).
+
+**SPU lift — computed jumps & wide ops** (`spu_lifter.py`, `spu_disasm.py`):
+- **`bi $r0` computed tail-jumps vs. returns**: a `bi $r0` whose `r0` was just reloaded via `lqa`/`lqr` is a *computed tail jump*, not a return. Treating them all as returns made the SPURS taskset launcher fall through and the dispatcher loop forever — the exact SPU analogue of the PPU tail-call bug above. `compute_bi_r0_jumps()` now classifies them by backward-scanning for the nearest `r0` writer.
+- **RRR 4-operand destination register** decoded from bits 21–27 (the low 7 bits are the `RC` *source*, not the dest) — every `selb`/`shufb`/`fma`-family op wrote the wrong register.
+- **Double-precision family**: `fesd`/`frds` single↔double convert, and the `dfma`/`dfms`/`dfnms`/`dfnma` double FMA ops (3-register, `RT` is the accumulator).
+- **`cgx` extended carry-generate** (RT is also a source), **`mpyhha`/`mpyhhau`** high-half multiply-accumulate, and a **`br .` self-loop trap** (target == self is a deliberate infinite-hang trap on real SPU, not forward progress).
+
+**Runtime robustness**:
+- **PPU function-hash table widened** (`ppu_loader.cpp`, `PPU_HASH_BITS` 16→18): the open-addressed registration table live-locked filling past 65,536 functions — flOw registers ~104k. Titles above ~50k functions now register in bounded time.
+- **`/app_home/` VFS mapping** (`sys_fs.c`): the install-dir prefix (opened as `/app_home/...`, `app_home/...`, `e:/app_home/...`) now maps to the USRDIR root instead of appending a literal `app_home` directory that isn't on disk.
+- **Page-guard watchpoint** (`ppu_guard_page()`, Windows): arm a guest EA and a VEH logs the faulting host RIP of any raw store into that 4 KB page — catches vector/`memcpy` stores that `vm_write*` instrumentation can't see. Env-gated; a diagnostic aid, off by default.
+- **`cellGcmGetTiledPitchSize` ABI fix** + real flip/vblank handler dispatch (see prior commits) — the wrong return convention was corrupting the caller's stack.
+
+**SPU SPURS plumbing**: new `libs/spurs/spurs_taskset.{c,h}` + `spurs_pm.c` (taskset descriptor + power-management scaffolding) and `runtime/spu/` workload-dispatch wiring toward running a real SPURS task kernel. Still in progress — the taskset dispatches but completion-event delivery back to the PPU isn't verified yet.
+
+**Tooling**: `tools/test_ppu_lift.py` (PPU lifter unit harness) and `tools/rpcs3_probe/` oracle-introspection scripts used to diff our lift against the running RPCS3 reference.
 
 ### v0.6.3 — *"Knowing the Names"* (June 2026)
 - **NID resolution, doubled+**: `nid_database` now auto-scans `libs/` + `runtime/` for every function the toolkit implements (`load_implemented()`), and ships 44 more curated names recovered by exact-NID brute-force against the harness corpus. Resolution went from 175 → 421 of the 660 distinct NIDs the sample titles import; the harness stub-prioritization ranking is now fully named through the high-frequency tiers.

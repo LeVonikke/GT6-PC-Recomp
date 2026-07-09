@@ -23,7 +23,53 @@ static void ensure_qpc_init(void)
         s_qpc_init = 1;
     }
 }
+
+int64_t lv2_usec_deadline(uint64_t usec)
+{
+    LARGE_INTEGER now;
+    ensure_qpc_init();
+    QueryPerformanceCounter(&now);
+    return now.QuadPart +
+        (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+}
+
+int lv2_deadline_passed(int64_t deadline)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart >= deadline;
+}
 #endif
+
+/* ---------------------------------------------------------------------------
+ * PPU timebase (mftb/mftbu) -- THE guest clock.
+ *
+ * One global monotonic counter scaled to the PS3 timebase (79.8 MHz),
+ * anchored at first use. The old lifter emission was a per-call-site
+ * static that advanced 16667 ticks PER READ -- not a clock at all: every
+ * guest timing loop (media pacers, throttles, profilers) computed garbage
+ * from it, and each call site had a PRIVATE counter that only moved when
+ * polled. Overflow-safe split multiply (rem < qpf, so
+ * rem * 79.8e6 < ~8e14 << 2^63).
+ * -----------------------------------------------------------------------*/
+uint64_t ppu_timebase_now(void)
+{
+#ifdef _WIN32
+    static LONGLONG t0 = 0;
+    ensure_qpc_init();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
+    uint64_t d = (uint64_t)(now.QuadPart - t0);
+    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
+    return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * PS3_TIMEBASE_FREQ +
+           (uint64_t)ts.tv_nsec * PS3_TIMEBASE_FREQ / 1000000000ull;
+#endif
+}
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -75,8 +121,23 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             Sleep((DWORD)(usec / 1000));
         }
     } else if (usec > 0) {
-        /* Very short sleep -- yield */
-        SwitchToThread();
+        /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
+         * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies
+         * on accurate microsecond pacing -- a short usleep() spin waiting on
+         * another thread to make progress otherwise collapses to a single yield
+         * and busy-spins at full speed (so the wait is effectively a no-op).
+         * Busy-wait to a precise QPC deadline, yielding inside the spin
+         * (SwitchToThread) so a sibling host thread the guest may be waiting on
+         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
+        ensure_qpc_init();
+        LARGE_INTEGER qpc_start, qpc_now;
+        QueryPerformanceCounter(&qpc_start);
+        const int64_t qpc_deadline = qpc_start.QuadPart +
+            (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        do {
+            SwitchToThread();
+            QueryPerformanceCounter(&qpc_now);
+        } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
     if (usec > 0) {

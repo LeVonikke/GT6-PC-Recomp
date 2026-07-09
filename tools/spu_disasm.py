@@ -342,17 +342,48 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
         mne = RI18_TABLE[op7]
         result.mnemonic = mne
 
-        if mne in ("br", "brsl"):
-            target = sign_extend(i18, 18) * 4 + addr
-            result.operands = f"0x{target & 0xFFFFFFFF:X}"
-        elif mne in ("bra", "brasl"):
-            target = i18 * 4
-            result.operands = f"0x{target & 0xFFFFFFFF:X}"
-        elif mne in ("brnz", "brz", "brhnz", "brhz"):
-            target = sign_extend(i16, 16) * 4 + addr
-            result.operands = f"$r{rt}, 0x{target & 0xFFFFFFFF:X}"
-        elif mne == "ila":
+        if mne == "ila":
             result.operands = f"$r{rt}, 0x{i18:X}"
+        elif mne == "hbra":
+            # hbra (a-form) is OP(7) R0H(2) I16(16) R0L(7) -- SPU ISA v1.2
+            # p.192 (Hint for Branch (a-form)). brinst (branch-INSTRUCTION
+            # address hint) = sign_extend(R0H||R0L,9)*4+PC (R0L occupies the
+            # RT bit-position, 25-31, per RPCS3's `(op.r0h<<7)|op.rt`
+            # composite -- cross-check oracle only, no code copied); brtarg
+            # (branch-TARGET address hint) = I16*4, ABSOLUTE (not
+            # PC-relative -- confirmed distinct from hbrr below). Was
+            # previously decoded through the generic RI18 fallback
+            # ($rt, 0x{i18:X}) -- wrong field boundaries entirely, not just
+            # wrong sign. DISPLAY-ONLY fix: tools/spu_lifter.py treats hbra
+            # as an unconditional no-op ("branch hint (ignored)") and never
+            # reads either operand, so lift output is unaffected.
+            r0h = (i18 >> 16) & 0x3
+            i16_field = i18 & 0xFFFF
+            brinst_raw = (r0h << 7) | rt
+            brinst = sign_extend(brinst_raw, 9) * 4 + addr
+            brtarg = i16_field * 4
+            result.operands = f"0x{brinst & 0xFFFFFFFF:X}, 0x{brtarg & 0xFFFFFFFF:X}"
+        elif mne == "hbrr":
+            # hbrr (relative form) is visually laid out like hbra in the ISA
+            # diagram (SPU ISA v1.2 p.193) but does NOT split its target
+            # field into a separate 2-bit R0H + 16-bit I16 the way hbra does:
+            # brtarg only matches the oracle when the FULL 18-bit i18 span is
+            # treated as one signed value (sign_extend(i18,18)*4+PC, masked
+            # to the 256KB local-store address space & 0x3FFFF). brinst (the
+            # branch-instruction address hint) is unaffected -- it still
+            # reads bits 16-17 of i18 as R0H composited with RT (matches
+            # RPCS3's `op.roh` field, cross-check oracle only, no code
+            # copied), which OVERLAPS the same physical bits used in
+            # brtarg's full-18-bit read; the two hint values are
+            # independently computed from overlapping bit ranges per the
+            # doc's own design, not a contradiction. DISPLAY-ONLY fix:
+            # tools/spu_lifter.py treats hbrr as an unconditional no-op and
+            # never reads either operand.
+            roh = (i18 >> 16) & 0x3
+            brinst_raw = (roh << 7) | rt
+            brinst = sign_extend(brinst_raw, 9) * 4 + addr
+            brtarg = (sign_extend(i18, 18) * 4 + addr) & 0x3FFFF
+            result.operands = f"0x{brinst & 0xFFFFFFFF:X}, 0x{brtarg:X}"
         elif mne in ("il",):
             result.operands = f"$r{rt}, {sign_extend(i18 & 0xFFFF, 16)}"
         elif mne in ("ilh", "ilhu"):
@@ -377,18 +408,34 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
         elif mne in ("hbra", "hbrr"):
             result.operands = f"0x{i16 & 0xFFFF:X}, $r{rt}"
         elif mne == "il":
-            result.operands = f"$r{rt}, {sign_extend(i16, 16)}"
+            # i16 is ALREADY sign-extended (top of spu_decode). Extending it
+            # again mapped every NEGATIVE il immediate to (imm - 0x10000):
+            # Python's -4 & 0x8000 is truthy, so sign_extend(-4,16) = -65540.
+            # Found live in gs_task @LS 0x5008 (il $r17,-4 lifted as -65540 ->
+            # the free-list restock store landed at LS 0x3BDC0 instead of
+            # 0xBDC0 -> allocator popped NULL -> the LS-0x44 crash).
+            result.operands = f"$r{rt}, {i16}"
         elif mne in ("iohl", "ilh", "ilhu"):
             result.operands = f"$r{rt}, 0x{i16 & 0xFFFF:X}"
         elif mne in ("brz", "brnz", "brhz", "brhnz"):
             target = i16 * 4 + addr
             result.operands = f"$r{rt}, 0x{target & 0x3FFFF:X}"
-        elif mne in ("br", "brsl"):       # relative; brsl sets link reg (RT, from raw word)
+        elif mne == "br":                 # relative, no link
             target = (i16 * 4 + addr) & 0x3FFFF
             result.operands = f"0x{target:X}"
-        elif mne in ("bra", "brasl"):     # absolute
+        elif mne == "brsl":                # relative + set link: RT is the
+            # link-destination register (holds PC+4 after the branch), a
+            # real encoded operand -- was silently dropped here (display-
+            # only omission; tools/spu_lifter.py already recovers it via
+            # `insn.raw & 0x7F` directly, so lift output is unaffected).
+            target = (i16 * 4 + addr) & 0x3FFFF
+            result.operands = f"$r{rt}, 0x{target:X}"
+        elif mne == "bra":                 # absolute, no link
             target = (i16 * 4) & 0x3FFFF
             result.operands = f"0x{target:X}"
+        elif mne == "brasl":               # absolute + set link (see brsl note)
+            target = (i16 * 4) & 0x3FFFF
+            result.operands = f"$r{rt}, 0x{target:X}"
         elif mne in ("lqr", "stqr"):
             # r-form: LSA = (pc + (I16 << 2)) & 0x3FFF0 (16-byte aligned, per
             # RPCS3 spu_ls_target(pc, i16)). I16 is sign-extended (relative).
@@ -400,9 +447,14 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
 
     # ---- Channel instructions (checked BEFORE RI10 to avoid wrch/shli clash) ----
     # wrch (op11=0x10D) shares op8=0x21 with shli; must be identified by op11.
-    # Format: op11(11) | zeros(2) | channel(5) | zeros(2) | RT(7)
-    # Channel address: bits 11-7 of instruction = (insn >> 7) & 0x1F
-    _ch_field = (insn >> 7) & 0x1F
+    # RDCH/WRCH/RCHCNT are RR-form per the SPU ISA: OP(11) RB(7) RA(7) RT(7) --
+    # the channel number is the FULL 7-bit RA field (bits 7-13), the same
+    # field every other RR instruction uses for its second register operand,
+    # NOT a narrower dedicated "channel" field. Was truncated to 5 bits here
+    # (insn>>7 & 0x1F, max 31), silently wrapping any channel number >= 32
+    # modulo 32. Confirmed against RPCS3's SPUDisAsm (op.ra into a channel-
+    # name table, cross-check oracle only, no code copied).
+    _ch_field = (insn >> 7) & 0x7F
     if op11 == 0b00000001101:   # rdch RT, CA    op11=0x00D=13
         _ch = CHANNEL_NAMES.get(_ch_field, f"ch{_ch_field}")
         result.mnemonic = "rdch"
@@ -450,18 +502,53 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
         result.mnemonic = mne
 
         # Branches
-        if mne in ("bi", "bisl"):
+        if mne == "bi":
             result.operands = f"$r{ra}"
+            return result
+        if mne == "bisl":
+            # bisl sets the link register (RT) as well as branching to RA --
+            # RT is a real encoded operand, was silently dropped here
+            # (display-only omission; tools/spu_lifter.py already recovers
+            # it via `insn.raw & 0x7F` directly, so lift output is
+            # unaffected).
+            result.operands = f"$r{rt}, $r{ra}"
             return result
         if mne in ("biz", "binz", "bihz", "bihnz"):
             result.operands = f"$r{rt}, $r{ra}"
             return result
         if mne == "hbr":
-            result.operands = f"$r{ra}, $r{rb}"
+            # hbr (r-form) is OP(12 incl P-bit) /// ROH RA ROL -- NOT a plain
+            # RR-format $ra,$rb pair (SPU ISA v1.2 p.191, Hint for Branch
+            # (r-form)). brinst = sign_extend(ROH||ROL,9)*4+PC, same
+            # composite-with-RT-position math as hbra/hbrr's brinst (ROL
+            # occupies the RT bit-position, 25-31); brtarg is the RUNTIME
+            # contents of RA's preferred slot -- a register reference, not a
+            # statically resolvable address, so it prints as a register like
+            # before, just previously in the WRONG position (the old code
+            # had "$ra, $rb" -- $rb doesn't exist in this format at all, its
+            # bits are actually ROH). ROH = bits 16-17 of the 32-bit word
+            # (our (insn>>14)&0x3, matching RPCS3's own `roh: bf_t<s32,14,2>`
+            # field declaration, cross-check only, no code copied).
+            roh = (insn >> 14) & 0x3
+            brinst_raw = (roh << 7) | rt
+            brinst = sign_extend(brinst_raw, 9) * 4 + addr
+            result.operands = f"0x{brinst & 0xFFFFFFFF:X}, $r{ra}"
             return result
 
-        # Stop/nop/sync
-        if mne in ("stop", "lnop", "nop", "sync", "dsync"):
+        # Stop: carries a real 14-bit stop-and-signal code in the low bits of
+        # the whole instruction word (CBEA v1.02 SPU_Status StopCode = insn
+        # bits 18:31; lv2's stop-code protocol dispatches on this: 0x0..0xFF
+        # user codes, 0x100-0x120 reserved OS syscalls e.g.
+        # SYS_SPU_THREAD_STOP_THREAD_EXIT=0x102). Was silently dropped here.
+        # DISPLAY-ONLY fix: tools/spu_lifter.py's `stop` codegen does not
+        # read this operand either (unconditional SPU_STATUS_STOPPED_BY_STOP),
+        # so lift output is unaffected by this decoder fix alone.
+        if mne == "stop":
+            code = insn & 0x3FFF
+            result.operands = f"0x{code:X}"
+            return result
+        # nop/sync/dsync: no real operand consumed by the ISA semantics.
+        if mne in ("lnop", "nop", "sync", "dsync"):
             return result
 
         # Single-operand
@@ -499,9 +586,35 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
         0b00111111101: "rotqmbyi",  # 0x1FD rotate & mask quadword by bytes immediate
         0b00111111111: "shlqbyi",   # 0x1FF shift left quadword by bytes immediate
     }
+    # I7-signedness per instruction, from SPU_Assembly_Language_Spec_1.5.pdf
+    # Table 2-6, "Valid Immediate Values": rothi/roti/rotqbyi/rotmai/rotmi/
+    # rothmi/rotmahi/rotqmbii/shli/shlhi/shlqbii/shlqbyi are all named under
+    # a SIGNED class (s7/s6/s3 -- all sub-ranges of the same signed 7-bit
+    # field per each row's "the 7 least significant bits...will be encoded"
+    # note); cbd/chd/cwd/cdd are explicitly named under u7 (UNSIGNED, 0-127)
+    # -- "No limits will be placed on the cbd, cdd, chd, and cwd
+    # instructions. The assembler will quietly encode the least significant
+    # bits...as the u7 parameter." rotqbii is named under u3 (0-7) but that
+    # is the sane-input-range warning threshold for a "rotate by BITS within
+    # a byte" operand, not a different bit-width or a disassembly-display
+    # difference -- RPCS3's SPUDisAsm (op.si7, cross-check oracle only, no
+    # code copied) treats it as signed like its siblings, so it stays
+    # signed here too.
+    RI7_UNSIGNED = {"cbd", "chd", "cwd", "cdd"}
     if op11 in ri7_table:
-        i7 = rb  # bits 14-20
-        result.mnemonic = ri7_table[op11]
+        # I7 was previously extracted UNSIGNED (0..127) for every RI7
+        # mnemonic here, which mis-displayed every SIGNED-class immediate
+        # with bit 6 set as +128 too high (e.g. roti $rt,$ra,64 instead of
+        # the correct -64). Confirmed against RPCS3's SPUDisAsm (op.si7,
+        # cross-check oracle only, no code copied) AND independently
+        # against SPU_Assembly_Language_Spec_1.5.pdf Table 2-6 (clean-room
+        # primary source).
+        mne = ri7_table[op11]
+        if mne in RI7_UNSIGNED:
+            i7 = rb  # bits 14-20, unsigned (u7 per Table 2-6)
+        else:
+            i7 = sign_extend(rb, 7)  # bits 14-20, signed (s-class per Table 2-6)
+        result.mnemonic = mne
         result.operands = f"$r{rt}, $r{ra}, {i7}"
         return result
 

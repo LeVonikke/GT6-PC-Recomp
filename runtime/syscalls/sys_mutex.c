@@ -3,6 +3,7 @@
  */
 
 #include "sys_mutex.h"
+#include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
@@ -179,6 +180,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
 {
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
+    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] mutex_lock(mutex=%u timeout=%llu)\n", mutex_id,(unsigned long long)timeout_us); }
 
     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -199,16 +201,20 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         /* Infinite wait */
         EnterCriticalSection(&m->cs);
     } else {
-        /* Timed lock via TryEnterCriticalSection + spin/sleep */
-        DWORD timeout_ms = (DWORD)(timeout_us / 1000);
-        if (timeout_ms == 0) timeout_ms = 1;
-        DWORD start = GetTickCount();
+        /* Timed lock via TryEnterCriticalSection to a QPC deadline. The old
+         * GetTickCount/Sleep(1) loop measured elapsed time in ~15.6 ms ticks
+         * and slept a full tick per retry, overshooting sub-ms timeouts by
+         * orders of magnitude. Yield (not Sleep) for sub-ms timeouts so the
+         * holder can run; Sleep(1) only for waits long enough to absorb it.
+         * Safe to poll: TryEnterCriticalSection's success IS the atomic
+         * acquire, so there's no separate signal to miss between polls. */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
         while (!TryEnterCriticalSection(&m->cs)) {
-            DWORD elapsed = GetTickCount() - start;
-            if (elapsed >= timeout_ms) {
+            if (lv2_deadline_passed(deadline)) {
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
-            Sleep(1);
+            if (timeout_us < 1000) SwitchToThread();
+            else                   Sleep(1);
         }
     }
 #else

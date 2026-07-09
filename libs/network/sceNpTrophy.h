@@ -120,9 +120,21 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context);
 s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle);
 s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle);
 
+/* Real ABI: (context, handle, statusCb, arg, options).  statusCb is a guest
+ * OPD for SceNpTrophyStatusCallback(context, status, completed, total, arg);
+ * the game blocks on registration-complete which is signalled via this cb. */
 s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
                                SceNpTrophyHandle handle,
+                               u32 statusCb,
+                               u32 arg,
                                u64 options);
+
+/* SceNpTrophyStatus values fired to the status callback */
+#define SCE_NP_TROPHY_STATUS_UNKNOWN            0
+#define SCE_NP_TROPHY_STATUS_NOT_INSTALLED      1
+#define SCE_NP_TROPHY_STATUS_DATA_CORRUPT       2
+#define SCE_NP_TROPHY_STATUS_INSTALLED          3
+#define SCE_NP_TROPHY_STATUS_REQUIRES_UPDATE    4
 
 s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
                                     SceNpTrophyHandle handle,
