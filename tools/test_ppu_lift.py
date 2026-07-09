@@ -22,9 +22,10 @@ scratch\\dobuild2.bat when cl is absent).
 Scope (tranche 1): integer ALU/rotate/shift/carry/compare classes -- the
 proven silent-miscompile territory. Memory ops, FP, and VMX are follow-on
 tranches (VMX semantics already have manual-verified handling; loads/stores
-need a vm stub harness). A first slice of that vm stub harness now backs the
-lmw/stmw cases below (CASES gained optional in_mem/exp_mem fields); it is
-minimal on purpose and can grow with later memory-op tranches.
+need a vm stub harness). A minimal vm stub now backs the FP D-form
+load/store-with-update RA writeback cases below (CASES gained optional
+in_mem/exp_mem/in_fpr/exp_fpr fields); it is self-contained on purpose and
+can grow with later memory-op tranches.
 """
 
 import argparse
@@ -253,13 +254,17 @@ rng = random.Random(0x59414B5A)   # deterministic
 E64 += [rng.getrandbits(64) for _ in range(4)]
 
 CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
-             # in_mem/exp_mem {addr: bytes} back the lmw/stmw memory-op cases below.
+             # in_mem/exp_mem {addr: bytes} and in_fpr {freg: raw64 bits} /
+             # exp_fpr [(freg, raw64 bits)] back the FP update-form cases below
+             # (ctx->fpr is a double[32]; bits are compared as the raw
+             # IEEE-754 pattern via memcpy, not value).
 
 def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
-         in_mem=None, exp_mem=None):
+         in_mem=None, exp_mem=None, in_fpr=None, exp_fpr=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
                       in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
-                      in_mem=in_mem or {}, exp_mem=exp_mem or {}))
+                      in_mem=in_mem or {}, exp_mem=exp_mem or {},
+                      in_fpr=in_fpr or {}, exp_fpr=exp_fpr or []))
 
 # VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
 # ctx->vr[] directly (no memory load/store instructions needed to exercise
@@ -481,32 +486,51 @@ def build_cases():
         case(f"add. a={a:#x} b={b:#x}", xo_form(266, R[0], R[1], R[2], rc=1),
              {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_cr=(nib, 28))
 
-    # --- lmw/stmw (load/store multiple word) -------------------------------
-    # PowerISA_V2.03_Final_Public.pdf p.72: EA = (RA=0 ? 0 : GPR[RA]) + D, then
-    # each word r..31 is loaded/stored 4 bytes at a time, big-endian, RA=0
-    # meaning a literal zero base rather than GPR[0]. Cover both a normal
-    # nonzero-base EA and the RA=0 literal-base rule, for both directions.
-    w29, w30, w31 = 0x11223344, 0xAABBCCDD, 0x00000001
-    ea = 0x2030
-    case("lmw r29..r31 base=r4", d_form(46, 29, R[1], 0x30), {R[1]: 0x2000},
-         [(29, w29, MASK64), (30, w30, MASK64), (31, w31, MASK64)],
-         in_mem={ea: struct.pack(">III", w29, w30, w31)})
+    # --- FP D-form load/store-with-update RA writeback ---------------------
+    # lfsu/lfdu/stfsu/stfdu (opcodes 49/51/53/55) sat in the plain lfs/lfd/
+    # stfs/stfd handling, so the access happened but RA never got EA written
+    # back. PowerISA_V2.03_Final_Public.pdf p.129 (Load Floating-Point Single
+    # with Update), p.130 (...Double with Update), p.132 (Store
+    # Floating-Point Single with Update) and p.133 (...Double with Update)
+    # all give RA <- EA as part of the update form and all four state RA=0
+    # is itself an invalid instruction on these forms, so no rA=0 guard
+    # belongs in the update handlers.
+    pi_bits = struct.unpack(">Q", struct.pack(">d", 3.14159265358979))[0]
+    fp_val = 2.5   # exactly representable in both float and double
+    fp_double_bits = struct.unpack(">Q", struct.pack(">d", fp_val))[0]
+    fp_float_bytes = struct.pack(">f", fp_val)
 
-    w29b, w30b, w31b = 0xDEADBEEF, 0x00000001, 0xFFFFFFFF
-    ea = 0x3040
-    case("stmw r29..r31 base=r4", d_form(47, 29, R[1], 0x40), {R[1]: 0x3000, 29: w29b, 30: w30b, 31: w31b},
-         [], exp_mem={ea: struct.pack(">III", w29b, w30b, w31b)})
+    # lfsu f7,0x10(r3): single-load-with-update -- checks the widened double
+    # bits AND the updated RA.
+    case("lfsu loaded single widened and ra writeback", d_form(49, 7, 3, 0x10),
+         {3: 0x4000}, [(3, 0x4010, MASK64)],
+         in_mem={0x4010: fp_float_bytes},
+         exp_fpr=[(7, fp_double_bits)])
 
-    w29c, w30c, w31c = 0x55667788, 0x99AABBCC, 0x0000002A
-    ea = 0x100
-    case("lmw r29..r31 base=0", d_form(46, 29, 0, 0x100), {},
-         [(29, w29c, MASK64), (30, w30c, MASK64), (31, w31c, MASK64)],
-         in_mem={ea: struct.pack(">III", w29c, w30c, w31c)})
+    # lfdu f8,0x40(r4): checks BOTH the loaded double bits and the updated RA.
+    case("lfdu loaded double and ra writeback", d_form(51, 8, 4, 0x40),
+         {4: 0x5000}, [(4, 0x5040, MASK64)],
+         in_mem={0x5040: struct.pack(">Q", pi_bits)},
+         exp_fpr=[(8, pi_bits)])
 
-    w29d, w30d, w31d = 0x01020304, 0xFFEEDDCC, 0x00000000
-    ea = 0x200
-    case("stmw r29..r31 base=0", d_form(47, 29, 0, 0x200), {29: w29d, 30: w30d, 31: w31d},
-         [], exp_mem={ea: struct.pack(">III", w29d, w30d, w31d)})
+    # stfsu f9,0x30(r5): checks BOTH the stored float bytes and the updated RA.
+    case("stfsu stored float and ra writeback", d_form(53, 9, 5, 0x30),
+         {5: 0x6000}, [(5, 0x6030, MASK64)],
+         in_fpr={9: fp_double_bits},
+         exp_mem={0x6030: fp_float_bytes})
+
+    # stfdu f11,0x20(r12): double-store-with-update -- checks BOTH the stored
+    # double bytes and the updated RA.
+    case("stfdu stored double and ra writeback", d_form(55, 11, 12, 0x20),
+         {12: 0x8000}, [(12, 0x8020, MASK64)],
+         in_fpr={11: pi_bits},
+         exp_mem={0x8020: struct.pack(">Q", pi_bits)})
+
+    # lfd f10,0x20(r6): non-update regression check -- RA must be left alone.
+    case("lfd non-update leaves ra untouched", d_form(50, 10, 6, 0x20),
+         {6: 0x7000}, [(6, 0x7000, MASK64)],
+         in_mem={0x7020: struct.pack(">Q", pi_bits)},
+         exp_fpr=[(10, pi_bits)])
 
 build_cases()
 
@@ -592,14 +616,24 @@ static void check_mem(const char* name, uint64_t addr, const uint8_t* got, const
     }
     g_pass++;
 }
-/* vm stub over a 64 KB scratch page for the memory-op cases (lmw/stmw); EAs
- * are masked into it. Only lmw/stmw exercise this today, so vm_read/write
- * beyond 8/16/32 bits aren't provided yet -- add as later tranches need them. */
+static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
+    if (got != want) {
+        printf("FAIL %s: f%d raw bits = 0x%016llX want 0x%016llX\\n",
+               name, reg, (unsigned long long)got, (unsigned long long)want);
+        g_fail++;
+    } else g_pass++;
+}
+/* vm stub over a 64 KB scratch page for the FP update-form load/store cases
+ * (RA writeback needs a real access to write RA back after); EAs are masked
+ * into it. Widths beyond what these cases need aren't provided -- add as
+ * later memory-op tranches need them. */
 #include <stdlib.h>   /* MSVC _byteswap_* */
 static uint8_t g_vm_stub[65536];
 #define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
 extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return _byteswap_ulong(v); }
 extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
+extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return _byteswap_uint64(v); }
+extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); memcpy(g_vm_stub + VMOFF(a), &v, 8); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
@@ -631,6 +665,8 @@ extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v); mem
             byts = ", ".join(f"0x{b:02X}" for b in blob)
             out.append(f"      {{ static const uint8_t _m[{len(blob)}] = {{ {byts} }}; "
                        f"memcpy(g_vm_stub + VMOFF(0x{addr:X}), _m, {len(blob)}); }}")
+        for reg, bits in c["in_fpr"].items():
+            out.append(f"      {{ uint64_t _b = 0x{bits:016X}ULL; memcpy(&ctx->fpr[{reg}], &_b, 8); }}")
         body = [f"        {code}"]
         for reg, val, mask in c["expects"]:
             body.append(f'        check_reg("{nm}", {reg}, ctx->gpr[{reg}], '
@@ -639,6 +675,9 @@ extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v); mem
             byts = ", ".join(f"0x{b:02X}" for b in blob)
             body.append(f'        {{ static const uint8_t _want[{len(blob)}] = {{ {byts} }}; '
                         f'check_mem("{nm}", 0x{addr:X}ULL, g_vm_stub + VMOFF(0x{addr:X}), _want, {len(blob)}); }}')
+        for reg, bits in c["exp_fpr"]:
+            body.append(f'        {{ uint64_t _got; memcpy(&_got, &ctx->fpr[{reg}], 8); '
+                        f'check_fpr("{nm}", {reg}, _got, 0x{bits:016X}ULL); }}')
         if c["exp_ca"] is not None:
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
         if c["exp_cr"] is not None:
