@@ -1510,7 +1510,26 @@ class PPULifter:
                     return (f"{{ uint64_t tmp = vm_read64((({base}) ? ctx->gpr[{base}] : 0) + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
 
-        if mn in ("stfs", "stfsu", "stfd", "stfdu"):
+        # lfsu/lfdu sat in the plain lfs/lfd handling above (alongside their
+        # non-update counterparts), so the load happened but RA never got
+        # written back. PowerISA_V2.03_Final_Public.pdf p.129 (Load
+        # Floating-Point Single with Update) and p.130 (...Double with
+        # Update): EA is computed, the load goes through EA, then RA <- EA;
+        # both pages state RA=0 on these forms is itself an invalid
+        # instruction, so unlike the plain D-form loads there is no rA=0
+        # literal-zero-base case to guard here.
+        if mn in ("lfsu", "lfdu"):
+            frd = _reg_idx(ops[0])
+            disp, base = _disp_base(ops[1])
+            if disp is not None:
+                if mn == "lfsu":
+                    return (f"{{ uint64_t ea = ctx->gpr[{base}] + {disp}; uint32_t tmp = vm_read32(ea); "
+                            f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; ctx->gpr[{base}] = ea; }}")
+                else:
+                    return (f"{{ uint64_t ea = ctx->gpr[{base}] + {disp}; uint64_t tmp = vm_read64(ea); "
+                            f"memcpy(&ctx->fpr[{frd}], &tmp, 8); ctx->gpr[{base}] = ea; }}")
+
+        if mn in ("stfs", "stfd"):
             frs = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
@@ -1519,12 +1538,30 @@ class PPULifter:
                 # mis-classified stfd/stfdu as single and emitted a lossy 4-byte
                 # store, corrupting the double (breaks fctidz+stfd+ld float->GPR
                 # idioms and any stored double). [ps3recomp fork JonathanDC64 eb5451b3]
-                if mn in ("stfs", "stfsu"):
+                if mn == "stfs":
                     return (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
                             f"memcpy(&tmp, &ftmp, 4); vm_write32((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
                 else:
                     return (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
                             f"vm_write64((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
+
+        # stfsu/stfdu: same RA<-EA update-form writeback fix as lfsu/lfdu
+        # above (they too sat in the plain stfs/stfd handling with no
+        # writeback). PowerISA_V2.03_Final_Public.pdf p.132 (Store
+        # Floating-Point Single with Update) and p.133 (...Double with
+        # Update) give the same RA <- EA rule and the same RA=0-invalid note;
+        # the single-vs-double explicit-mnemonic match above applies here for
+        # the same reason.
+        if mn in ("stfsu", "stfdu"):
+            frs = _reg_idx(ops[0])
+            disp, base = _disp_base(ops[1])
+            if disp is not None:
+                if mn == "stfsu":
+                    return (f"{{ uint64_t ea = ctx->gpr[{base}] + {disp}; float ftmp = (float)ctx->fpr[{frs}]; "
+                            f"uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32(ea, tmp); ctx->gpr[{base}] = ea; }}")
+                else:
+                    return (f"{{ uint64_t ea = ctx->gpr[{base}] + {disp}; uint64_t tmp; "
+                            f"memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64(ea, tmp); ctx->gpr[{base}] = ea; }}")
 
         # ------- FP arithmetic -------
         # PPC NaN semantics + default +QNaN via preamble helpers (a plain C
