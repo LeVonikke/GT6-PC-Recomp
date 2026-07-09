@@ -2626,11 +2626,17 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             return int(op.split('(')[0].strip(), 0)
         except ValueError:
             return None
+    import os as _os
+    _DBG = int(_os.environ.get("JT_DEBUG", "0"), 0)
+    def _dbg(addr, msg):
+        if _DBG and addr == _DBG:
+            print(f"  [JT_DEBUG 0x{addr:X}] {msg}")
     tables = {}
     n = len(all_insns)
     for i in range(n):
         if all_insns[i].mnemonic != 'bctr':
             continue
+        _dbg(all_insns[i].addr, "bctr found")
         win = all_insns[max(0, i - 30):i]
         # the ctr source register (last mtctr before the bctr)
         rC = None
@@ -2639,10 +2645,12 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 rC = w.operands.strip(); break
             if w.mnemonic in ('bctr', 'bctrl', 'blr', 'bl', 'blrl'):
                 break
+        _dbg(all_insns[i].addr, f"rC={rC}")
         if rC is None:
             continue
         # the indexed table load
         lwzx = next((w for w in reversed(win) if w.mnemonic == 'lwzx'), None)
+        _dbg(all_insns[i].addr, f"lwzx={'None' if lwzx is None else lwzx.operands}")
         if lwzx is None:
             continue
         p = [x.strip() for x in lwzx.operands.split(',')]
@@ -2656,19 +2664,28 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         r_val = p[0]
         disp = None; r_base = None; base_is_ld = False
         for cand in (p[1], p[2]):
+            # Walk backward to the NEAREST instruction that defines `cand`, and
+            # accept it as the table base only if that definition is a TOC load
+            # (`lwz`/`ld cand, disp(r2)`). Stopping at the first definition is
+            # essential: the 30-instruction window bleeds across the function
+            # boundary, and the index register (e.g. `rldic r9, r3, 2, 30`) often
+            # collides with a stale `lwz r9, disp(r2)` from the PRECEDING function.
+            # Blindly grabbing any matching lwz picked the index reg as the base,
+            # read an unrelated table, decoded 0 targets, and silently dropped the
+            # dispatcher (every dense switch in newlib dtoa fell through -> the
+            # guest's printf("%f") spun forever). gcc (PSL1GHT/newlib) loads the
+            # base with `ld` (64-bit ELFv1 TOC entry); SN uses `lwz`. Accept both.
             for w in reversed(win):
-                # gcc (PSL1GHT/newlib) loads the table base with `ld` -- TOC
-                # entries are 64-bit under ELFv1 -- while the SN toolchain uses
-                # `lwz`. Accept both; the 64-bit entry's low word carries the
-                # 32-bit table address (big-endian: at disp+4).
-                if w.mnemonic in ('lwz', 'ld'):
-                    a = [x.strip() for x in w.operands.split(',')]
-                    if len(a) == 2 and a[0] == cand and '(r2)' in a[1]:
-                        disp = mem_disp(a[1]); r_base = cand
-                        base_is_ld = (w.mnemonic == 'ld')
-                        break
+                a = [x.strip() for x in w.operands.split(',')]
+                if not a or a[0] != cand:
+                    continue                    # not a definition of cand
+                if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
+                    disp = mem_disp(a[1]); r_base = cand
+                    base_is_ld = (w.mnemonic == 'ld')
+                break                           # first definition of cand wins/loses
             if disp is not None:
                 break
+        _dbg(all_insns[i].addr, f"disp={disp} r_base={r_base} base_is_ld={base_is_ld} toc={toc}")
         if disp is None or not toc:
             continue
         toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
@@ -2706,6 +2723,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                     table_base = None
             else:
                 table_base = read_u32((cand + disp) & 0xFFFFFFFF)
+            _dbg(all_insns[i].addr, f"cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
             if table_base is None:
                 continue
             targets = []
@@ -2718,10 +2736,13 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                     t = (table_base + off) & 0xFFFFFFFF
                 else:
                     t = v
+                if k < 3:
+                    _dbg(all_insns[i].addr, f"  entry[{k}] raw=0x{v:X} -> target=0x{t:X} valid={text_lo <= t < text_hi and t % 4 == 0}")
                 if text_lo <= t < text_hi and t % 4 == 0:
                     targets.append(t)
                 else:
                     break
+            _dbg(all_insns[i].addr, f"decoded {len(targets)} targets")
             if len(targets) > len(best):
                 best = targets
         if best:
