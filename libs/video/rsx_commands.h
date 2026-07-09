@@ -257,7 +257,8 @@ typedef struct rsx_state {
     /* Captured RSX vertex program microcode (NV40 ISA), filled by
      * NV4097_SET_TRANSFORM_PROGRAM. Words are host-endian (as delivered by the
      * FIFO parser), i.e. RPCS3 order, ready for rsx_vp_decompile. */
-    u8  vp_ucode[128 * 16];   /* up to 128 instructions */
+    u8  vp_ucode[1024 * 16];  /* up to 1024 instructions (Tiny3D's VP exceeds 128;
+                               * truncation dropped the end bit + HPOS write) */
     u32 vp_ucode_write;       /* byte write cursor (from SET_TRANSFORM_PROGRAM_LOAD) */
     u32 vp_ucode_bytes;       /* highest byte written + 1 */
     int vp_dirty;             /* program changed since last translate */
