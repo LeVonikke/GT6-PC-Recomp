@@ -1061,6 +1061,23 @@ static void render_frame(void)
         float* vpx = (float*)((char*)s_d3d.vp_cb_mapped + RSX_MAX_VERTEX_CONSTANTS * 16);
         vpx[0] = vpx[1] = vpx[2] = vpx[3] = 1.0f;   /* vp_posscale  */
         vpx[4] = vpx[5] = vpx[6] = vpx[7] = 0.0f;   /* vp_posoffset */
+        /* Fallback perspective when the guest's projection matrix (vp_c[0..3])
+         * is garbage. vkcube uploads a projection whose [0][0] is ~1e7 and grows
+         * every frame (a guest-side bug not yet root-caused), which blows the
+         * cube up into a screen-filling quad. When [0][0] is out of any sane
+         * range (or non-finite, or VP_FIXPROJ forces it), substitute a standard
+         * LH perspective (45deg, 16:9, zn=1 zf=100) so geometry is at least
+         * viewable. A sane guest projection passes through untouched. TODO: fix
+         * the guest projection computation instead. */
+        {
+            float* c = (float*)s_d3d.vp_cb_mapped;
+            float c00 = c[0];
+            int garbage = !(c00 > -1.0e4f && c00 < 1.0e4f);   /* NaN/inf/huge */
+            if (garbage || getenv("VP_FIXPROJ")) {
+                for (int _i = 0; _i < 16; _i++) c[_i] = 0.0f;
+                c[0]=1.358f; c[5]=2.414f; c[10]=1.0101f; c[11]=1.0f; c[14]=-1.0101f;
+            }
+        }
         if (getenv("VP_DUMP")) { const float (*vc)[4]=s_d3d.current_rsx_state->vertex_constants;
           static int _m=0; if(_m++<2) fprintf(stderr,"[VPMVP] M0(c0-3)[0][0]=%.1f  M1(c4-7)=[%.1f %.1f %.1f %.1f / .. / %.1f %.1f %.1f %.1f]\n",
             vc[0][0], vc[4][0],vc[4][1],vc[4][2],vc[4][3], vc[7][0],vc[7][1],vc[7][2],vc[7][3]); }
