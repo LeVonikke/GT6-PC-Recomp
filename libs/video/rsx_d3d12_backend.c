@@ -927,6 +927,13 @@ static void compile_vp(void)
         FILE* vf = fopen("vp_dump.hlsl", "w");
         if (vf) { fwrite(hlsl, 1, strlen(hlsl), vf); fclose(vf);
                   printf("[VP] dumped vp_dump.hlsl (%d instrs)\n", ni); }
+        printf("[VPRAW] first 3 instrs (%u ucode bytes):\n", st->vp_ucode_bytes);
+        for (u32 _q = 0; _q < 48 && _q < st->vp_ucode_bytes; _q += 16)
+            printf("[VPRAW]  d0=%02X%02X%02X%02X d1=%02X%02X%02X%02X d2=%02X%02X%02X%02X d3=%02X%02X%02X%02X\n",
+                st->vp_ucode[_q+0],st->vp_ucode[_q+1],st->vp_ucode[_q+2],st->vp_ucode[_q+3],
+                st->vp_ucode[_q+4],st->vp_ucode[_q+5],st->vp_ucode[_q+6],st->vp_ucode[_q+7],
+                st->vp_ucode[_q+8],st->vp_ucode[_q+9],st->vp_ucode[_q+10],st->vp_ucode[_q+11],
+                st->vp_ucode[_q+12],st->vp_ucode[_q+13],st->vp_ucode[_q+14],st->vp_ucode[_q+15]);
     }
 
     /* Pixel shader mirrors dbgfont's FP: sample the atlas coverage at TEXCOORD0
