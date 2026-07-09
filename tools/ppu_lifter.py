@@ -1083,6 +1083,16 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             return f"ctx->gpr[{rd_i}] = ctx->cr;"
 
+        # VRSAVE is a hint register for AltiVec register allocation; nothing
+        # in the runtime models per-thread VRSAVE state, so treat the pair as
+        # a benign 0-read plus a discarded write rather than falling through
+        # to the unhandled-spr catch-all.
+        if mn == "mfspr" and ops and ops[-1].upper() == "VRSAVE":
+            rd_i = _reg_idx(ops[0])
+            return f"ctx->gpr[{rd_i}] = 0; /* VRSAVE unmodeled */"
+        if mn == "mtspr" and ops and ops[0].upper() == "VRSAVE":
+            return "/* mtspr VRSAVE: unmodeled */;"
+
         if mn == "mtcr":
             return f"ctx->cr = (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}];"
         if mn == "mtcrf":
@@ -1389,6 +1399,12 @@ class PPULifter:
         # mtfsf — move to FPSCR fields
         if mn == "mtfsf":
             return f"/* mtfsf: FPSCR update — ignored for now */;"
+
+        # mtfsb0, mtfsb1, mtfsfi: FPSCR bit set/clear/immediate-field
+        # updates. FPSCR is unmodeled, so these become a named no-op comment
+        # instead of falling through to the unhandled-instruction catch-all.
+        if mn.rstrip(".") in ("mtfsb0", "mtfsb1", "mtfsfi"):
+            return f"/* {mn} {insn.operands}: FPSCR bit update — FPSCR unmodeled */;"
 
         # ------- Store/load with update indexed -------
         if mn == "stdux":

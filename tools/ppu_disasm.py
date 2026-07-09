@@ -27,6 +27,7 @@ SPR_NAMES = {
     19: "DAR",
     22: "DEC",
     25: "SDR1",
+    256: "VRSAVE",
     26: "SRR0",
     27: "SRR1",
     268: "TBL",
@@ -834,6 +835,10 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             40: "fneg", 72: "fmr", 264: "fabs", 136: "fnabs",
             64: "mcrfs",
             583: "mffs", 711: "mtfsf",
+            # FPSCR bit ops. These previously fell through to the unknown-xo
+            # catch-all and emitted a raw .word, silently dropping the
+            # instruction from the lift.
+            70: "mtfsb0", 38: "mtfsb1", 134: "mtfsfi",
         }
         if xo_full in fp_x:
             mne = fp_x[xo_full]
