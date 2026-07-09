@@ -167,6 +167,7 @@ typedef struct {
     u32                   vp_compiled_bytes;    /* ucode size when last compiled */
     ID3DBlob*             vp_vs_blob;           /* kept for guest-FP PSO builds  */
     u32                   vp_gen;               /* bumped per VP recompile       */
+    int                   vp_uses_c03;          /* VS references vp_c[0..3]      */
     VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* per-frame VP texture slots    */
     VPFPEntry             vp_fp[VP_FP_CACHE];   /* guest-FP PSO cache            */
     int                   vp_fp_n;
@@ -988,6 +989,11 @@ static void compile_vp(void)
 
     static char hlsl[64 * 1024];
     int ni = rsx_vp_decompile(st->vp_ucode, st->vp_ucode_bytes, hlsl, sizeof hlsl);
+    /* Does this VP read vp_c[0..3]? Gates the garbage-projection fallback:
+     * programs keeping their MVP elsewhere (gcm/cube: c[256..259]) must not
+     * have c[0..3] stomped nor the viewport z-lane overridden. */
+    s_d3d.vp_uses_c03 = (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
+                         strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
     if (ni <= 0) { printf("[VP] decompile failed (%d)\n", ni); s_d3d.vp_compiled_bytes = st->vp_ucode_bytes; return; }
     if (getenv("VP_DUMP")) {
         FILE* vf = fopen("vp_dump.hlsl", "w");
@@ -1130,6 +1136,7 @@ static ID3D12PipelineState* vp_get_fp_pso(u32 fp_addr)
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveOffset(u32);
     if (!fp_addr || !s_d3d.vp_vs_blob || !vm_base) return NULL;
+    { static int _off=-1; if(_off<0)_off=getenv("FP_OFF")?1:0; if(_off) return NULL; }
     for (int i = 0; i < s_d3d.vp_fp_n; i++)
         if (s_d3d.vp_fp[i].fp_addr == fp_addr && s_d3d.vp_fp[i].gen == s_d3d.vp_gen)
             return s_d3d.vp_fp[i].pso;
@@ -1416,7 +1423,7 @@ static void render_frame(void)
             float* c = (float*)s_d3d.vp_cb_mapped;
             float c00 = c[0];
             int garbage = !(c00 > 0.0f && c00 < 8.0f);   /* NaN/inf/huge/tiny-FOV */
-            if (garbage || getenv("VP_FIXPROJ")) {
+            if ((garbage && s_d3d.vp_uses_c03) || getenv("VP_FIXPROJ")) {
                 for (int _i = 0; _i < 16; _i++) c[_i] = 0.0f;
                 /* c[0]/c[5] = x/y scale (45deg, 16:9). z-row: vkcube's VP does the
                  * RSX depth trick `o[0].z = HPOS.z * HPOS.w` so after D3D's /w the
@@ -1427,6 +1434,12 @@ static void render_frame(void)
                  * depth differentiation, back faces bled through the front.) */
                 c[0]=1.358f; c[5]=2.414f; c[11]=1.0f;
                 c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
+                /* The fallback projection already emits ndc z in [0,1]; a guest
+                 * viewport Sz/Oz (tiny3d emits one) would re-compress it to
+                 * [0.5,1] and halve depth precision -> back faces z-fight
+                 * through front edges (vkcube: stair-stepped silhouette).
+                 * Force the z lane back to identity when the fallback is live. */
+                vpx[2] = 1.0f; vpx[6] = 0.0f;
             }
         }
         if (getenv("VP_DUMP")) { const float (*vc)[4]=s_d3d.current_rsx_state->vertex_constants;
