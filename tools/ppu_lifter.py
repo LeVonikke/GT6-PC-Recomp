@@ -1130,6 +1130,29 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             return f"ctx->gpr[{rd_i}] = ctx->cr;"
 
+        if mn in ("mfspr", "mtspr"):
+            # Only the user-mode SPRs exist on the PPU from a title's point of
+            # view: XER(1), LR(8), CTR(9). The disassembler renders the SPR as
+            # a name or a raw number depending on the table. mfxer/mflr/mfctr
+            # aliases are handled above; this catches the raw mfspr/mtspr
+            # encodings (previously an unhandled TODO no-op, which made every
+            # guest read of XER[CA] see a stale register -- all 2855 of them
+            # in the torture guest).
+            spr_op = ops[1] if mn == "mfspr" else ops[0]
+            gpr_op = ops[0] if mn == "mfspr" else ops[1]
+            s = str(spr_op).strip().upper()
+            spr_field = {"XER": "xer", "1": "xer",
+                         "LR": "lr", "8": "lr",
+                         "CTR": "ctr", "9": "ctr"}.get(s)
+            g = _reg_idx(gpr_op)
+            if spr_field is None:
+                return f"/* {mn} {insn.operands}: unsupported SPR -- no-op */;"
+            if mn == "mfspr":
+                return f"ctx->gpr[{g}] = ctx->{spr_field};"
+            if spr_field == "ctr":
+                return f"ctx->ctr = (uint32_t)ctx->gpr[{g}];"
+            return f"ctx->{spr_field} = ctx->gpr[{g}];"
+
         if mn == "mtcr":
             return f"ctx->cr = (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}];"
         if mn == "mtcrf":
