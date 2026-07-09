@@ -259,8 +259,24 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
 
     uint64_t caller_tid = ctx->thread_id;
 
-    /* Recursive re-entry */
+    /* Recursive re-entry. MUST still acquire the host primitive: unlock
+     * calls LeaveCriticalSection unconditionally per guest unlock, so every
+     * guest lock (including a recursive re-entry) must Enter exactly once
+     * or the Enter/Leave pairing breaks: the paired unlock releases the CS
+     * while the guest logically still holds the mutex, and the final
+     * unlock calls Leave on a non-held CS (undefined behavior, corrupts
+     * the CS and causes random forever-blocks on later Enters).
+     * EnterCriticalSection by the current owner is itself recursive and
+     * never blocks, so this is safe and cheap. */
     if (m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+#ifdef _WIN32
+        EnterCriticalSection(&m->cs);
+#else
+        /* pthreads: the default mutex is non-recursive; an owner re-lock
+         * would deadlock. The pthread path needs a PTHREAD_MUTEX_RECURSIVE
+         * mutex for guest-recursive locks; pre-existing gap, not introduced
+         * by this fix. */
+#endif
         m->lock_count++;
         return CELL_OK;
     }
@@ -300,7 +316,12 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
     uint64_t caller_tid = ctx->thread_id;
 
     if (m->owner_tid != caller_tid) {
-        return (int64_t)(int32_t)CELL_EMUTEX_NOT_OWNED;
+        /* Real lv2 returns EPERM for a non-owner unlock (RPCS3
+         * sys_mutex.h's lv2_mutex::try_unlock, oracle, no code copied:
+         * "if (it.owner != cpu.id) return CELL_EPERM;"), not a made up
+         * CELL_EMUTEX_NOT_OWNED code that guest branches on this
+         * contract would never match. */
+        return (int64_t)(int32_t)CELL_EPERM;
     }
 
     m->lock_count--;
