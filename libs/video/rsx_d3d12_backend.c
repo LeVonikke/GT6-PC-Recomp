@@ -65,6 +65,7 @@ typedef struct {
     u32 tex_w, tex_h;
     u32 tex_fmt;        /* RSX base format (0x81 B8, 0x85 A8R8G8B8)             */
     int tex_slot;       /* per-frame VP texture slot; -1 = none (render_frame)  */
+    int vs_idx;         /* VPVSEntry slot for this draw's vertex program (-1 = primary) */
 } D3D12DrawRecord;
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
@@ -78,10 +79,23 @@ typedef struct {
 } VPTexSlot;
 #define VP_TEX_SLOTS 4
 
-/* Compiled guest-FP pipeline cache: decompiled VS (current VP) + decompiled
- * PS (fragment ucode at fp_addr). Invalidated when the VP recompiles (gen). */
+/* Decompiled-VS cache: one entry per distinct vertex-program ucode seen at
+ * draw time (hashed). Apps switch VPs between draws (gcm/cube: its MVP cube VP
+ * vs dbgfont-gcm's text VP); compiling only the first left later draws
+ * transformed by the wrong program (text offscreen). */
+typedef struct {
+    u32 hash;               /* FNV-1a of the ucode */
+    ID3DBlob* vs;
+    int uses_c03;
+} VPVSEntry;
+#define VP_VS_CACHE 4
+
+/* Compiled guest-FP pipeline cache: decompiled VS (by cache slot) + decompiled
+ * PS (fragment ucode at fp_addr). */
 typedef struct {
     u32 fp_addr;
+    int vs_idx;             /* VPVSEntry slot this PSO's VS came from */
+    u32 vs_hash;            /* validates the slot hasn't been evicted */
     u32 gen;
     ID3D12PipelineState* pso;
 } VPFPEntry;
@@ -169,6 +183,8 @@ typedef struct {
     u32                   vp_gen;               /* bumped per VP recompile       */
     int                   vp_uses_c03;          /* VS references vp_c[0..3]      */
     VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* per-frame VP texture slots    */
+    VPVSEntry             vp_vs[VP_VS_CACHE];   /* per-draw decompiled VS cache  */
+    int                   vp_vs_n;
     VPFPEntry             vp_fp[VP_FP_CACHE];   /* guest-FP PSO cache            */
     int                   vp_fp_n;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
@@ -1131,14 +1147,68 @@ static void compile_vp(void)
  * hardcoded pixel shaders for draws whose FP we can translate -- e.g.
  * gcm/cube's plasma FP `c = tex2D(t0, uv).x; out = (c, 0, c, 1)`. */
 #include "rsx_fp_decompiler.h"
-static ID3D12PipelineState* vp_get_fp_pso(u32 fp_addr)
+
+/* Hash + compile the CURRENT rsx_state vertex program into the VS cache;
+ * returns the cache slot (or -1). Called at draw-record time so each draw
+ * carries the VP that was loaded when it was submitted. */
+static u32 vp_hash_ucode(const u8* p, u32 n)
+{
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h ? h : 1u;
+}
+
+static int vp_get_vs(const rsx_state* st)
+{
+    extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+    if (!st || st->vp_ucode_bytes < 16) return -1;
+    u32 hash = vp_hash_ucode(st->vp_ucode, st->vp_ucode_bytes);
+    for (int i = 0; i < s_d3d.vp_vs_n; i++)
+        if (s_d3d.vp_vs[i].hash == hash) return i;
+
+    static char hlsl[262144];
+    int ni = rsx_vp_decompile(st->vp_ucode, st->vp_ucode_bytes, hlsl, sizeof hlsl);
+    if (ni <= 0) return -1;
+    ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
+    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
+                            "main", "vs_5_0", 0, 0, &vb, &e);
+    if (e) e->lpVtbl->Release(e);
+    if (FAILED(hr) || !vb) {
+        static int _e=0; if (_e++<4) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
+        return -1;
+    }
+    int slot;
+    if (s_d3d.vp_vs_n < VP_VS_CACHE) slot = s_d3d.vp_vs_n++;
+    else {  /* evict slot 0 */
+        if (s_d3d.vp_vs[0].vs) s_d3d.vp_vs[0].vs->lpVtbl->Release(s_d3d.vp_vs[0].vs);
+        memmove(&s_d3d.vp_vs[0], &s_d3d.vp_vs[1], sizeof(VPVSEntry)*(VP_VS_CACHE-1));
+        slot = VP_VS_CACHE - 1;
+    }
+    s_d3d.vp_vs[slot].hash = hash;
+    s_d3d.vp_vs[slot].vs   = vb;
+    s_d3d.vp_vs[slot].uses_c03 =
+        (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
+         strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
+    { static int _n=0; if (_n++<6) printf("[VP] per-draw VS cached (hash=0x%08X, %d instrs, slot %d)\n", hash, ni, slot); }
+    return slot;
+}
+
+static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr)
 {
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveOffset(u32);
-    if (!fp_addr || !s_d3d.vp_vs_blob || !vm_base) return NULL;
+    if (!fp_addr || !vm_base) return NULL;
     { static int _off=-1; if(_off<0)_off=getenv("FP_OFF")?1:0; if(_off) return NULL; }
+    /* Resolve the VS: the draw's cached per-VP blob, else the primary. */
+    ID3DBlob* vsb = NULL; u32 vs_hash = 0;
+    if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) {
+        vsb = s_d3d.vp_vs[vs_idx].vs; vs_hash = s_d3d.vp_vs[vs_idx].hash;
+    }
+    if (!vsb) { vsb = s_d3d.vp_vs_blob; vs_idx = -1; }
+    if (!vsb) return NULL;
     for (int i = 0; i < s_d3d.vp_fp_n; i++)
-        if (s_d3d.vp_fp[i].fp_addr == fp_addr && s_d3d.vp_fp[i].gen == s_d3d.vp_gen)
+        if (s_d3d.vp_fp[i].fp_addr == fp_addr && s_d3d.vp_fp[i].vs_idx == vs_idx &&
+            s_d3d.vp_fp[i].vs_hash == vs_hash && s_d3d.vp_fp[i].gen == s_d3d.vp_gen)
             return s_d3d.vp_fp[i].pso;
 
     /* SET_SHADER_PROGRAM low bits = location+1 (same as textures): 1 = LOCAL
@@ -1186,8 +1256,8 @@ static ID3D12PipelineState* vp_get_fp_pso(u32 fp_addr)
     }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
     pd.pRootSignature = s_d3d.vp_root_sig;
-    pd.VS.pShaderBytecode = s_d3d.vp_vs_blob->lpVtbl->GetBufferPointer(s_d3d.vp_vs_blob);
-    pd.VS.BytecodeLength  = s_d3d.vp_vs_blob->lpVtbl->GetBufferSize(s_d3d.vp_vs_blob);
+    pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb);
+    pd.VS.BytecodeLength  = vsb->lpVtbl->GetBufferSize(vsb);
     pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
     pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
     pd.InputLayout.pInputElementDescs = il; pd.InputLayout.NumElements = 16;
@@ -1229,6 +1299,8 @@ static ID3D12PipelineState* vp_get_fp_pso(u32 fp_addr)
         s_d3d.vp_fp_n = VP_FP_CACHE - 1;
     }
     s_d3d.vp_fp[s_d3d.vp_fp_n].fp_addr = fp_addr;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].vs_idx  = vs_idx;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].vs_hash = vs_hash;
     s_d3d.vp_fp[s_d3d.vp_fp_n].gen     = s_d3d.vp_gen;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp_n++;
@@ -1555,7 +1627,7 @@ static void render_frame(void)
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
         if (!dr->is_vp) continue;
         dr->tex_slot = dr->tex_off ? vp_upload_tex_slot(dr->tex_off, dr->tex_w, dr->tex_h, dr->tex_fmt) : -1;
-        if (dr->fp_addr) vp_get_fp_pso(dr->fp_addr);   /* warm the cache */
+        if (dr->fp_addr) vp_get_fp_pso(dr->vs_idx, dr->fp_addr);   /* warm the cache */
     }
 
     /* Transition render target to RENDER_TARGET state */
@@ -1704,7 +1776,7 @@ static void render_frame(void)
                 /* Per-draw pipeline: prefer the guest's own compiled FP; fall
                  * back to the hardcoded atlas/colour PS pair. */
                 ID3D12PipelineState* dpso =
-                    dr->fp_addr ? vp_get_fp_pso(dr->fp_addr) : NULL;
+                    dr->fp_addr ? vp_get_fp_pso(dr->vs_idx, dr->fp_addr) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 /* Per-draw texture: t0 = the draw's texture slot (heap 1+slot);
@@ -2163,6 +2235,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex_w = s_d3d.cur_tex_w; dr->tex_h = s_d3d.cur_tex_h;
                 dr->tex_fmt = s_d3d.cur_tex_fmt;
                 dr->tex_slot = -1;
+                dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
                 s_d3d.draw_count++;
             }
             return;
@@ -2201,6 +2274,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex_w = s_d3d.cur_tex_w; dr->tex_h = s_d3d.cur_tex_h;
             dr->tex_fmt = s_d3d.cur_tex_fmt;
             dr->tex_slot = -1;
+            dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
             s_d3d.draw_count++;
         }
         return;
