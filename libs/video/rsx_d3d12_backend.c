@@ -1054,6 +1054,9 @@ static void render_frame(void)
         float* vpx = (float*)((char*)s_d3d.vp_cb_mapped + RSX_MAX_VERTEX_CONSTANTS * 16);
         vpx[0] = vpx[1] = vpx[2] = vpx[3] = 1.0f;   /* vp_posscale  */
         vpx[4] = vpx[5] = vpx[6] = vpx[7] = 0.0f;   /* vp_posoffset */
+        if (getenv("VP_DUMP")) { const float (*vc)[4]=s_d3d.current_rsx_state->vertex_constants;
+          static int _m=0; if(_m++<2) fprintf(stderr,"[VPMVP] M0(c0-3)[0][0]=%.1f  M1(c4-7)=[%.1f %.1f %.1f %.1f / .. / %.1f %.1f %.1f %.1f]\n",
+            vc[0][0], vc[4][0],vc[4][1],vc[4][2],vc[4][3], vc[7][0],vc[7][1],vc[7][2],vc[7][3]); }
     }
 
     /* Lazily create the readback buffer the first time a dump is requested. */
@@ -1607,6 +1610,9 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
             u8* src = vm_base + cellGcmResolveOffset(pos->offset + (first + q*4 + k) * pos->stride);
             c[k].x = rd_bef(src); c[k].y = rd_bef(src+4); c[k].z = rd_bef(src+8); c[k].w = rd_bef(src+12);
         }
+        if (q == 0 && getenv("VP_DUMP")) { static int _n=0; if(_n++<3) fprintf(stderr,
+            "[VPVTX] v0=(%.3f,%.3f,%.3f,%.3f) off=0x%X stride=%u\n",
+            c[0].x,c[0].y,c[0].z,c[0].w, pos->offset, pos->stride); }
         out[o++]=c[0]; out[o++]=c[1]; out[o++]=c[2];
         out[o++]=c[0]; out[o++]=c[2]; out[o++]=c[3];
     }
@@ -1635,14 +1641,19 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * mark the draw is_vp; render_frame compiles the VP and draws it. Fall
      * back to the frac-approximation textured path if VP resources are absent. */
     if (primitive == 8 /* CELL_GCM_PRIMITIVE_QUADS */) {
-        if (s_d3d.vp_vb_mapped && s_d3d.vp_root_sig && s_d3d.tex_bound) {
+        /* Prefer the real vertex-program path whenever VP resources exist --
+         * NOT only when a texture is bound. Requiring tex_bound routed vkcube's
+         * UNtextured cube to the fixed-function fallback, which never applies the
+         * VP's MVP transform, so the cube was drawn in object space and clipped
+         * off-screen. Untextured VP draws now render via the colour PSO. */
+        if (s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
             u32 rec = s_d3d.vp_vb_offset;
             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
             if (emitted && s_d3d.draw_count < MAX_DRAWS) {
                 s_d3d.draws[s_d3d.draw_count].vb_byte_offset = rec;
                 s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
                 s_d3d.draws[s_d3d.draw_count].topology       = D3D_TOPOLOGY_TRIANGLELIST;
-                s_d3d.draws[s_d3d.draw_count].textured       = 1;
+                s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
                 s_d3d.draws[s_d3d.draw_count].is_vp          = 1;
                 s_d3d.draw_count++;
             }
