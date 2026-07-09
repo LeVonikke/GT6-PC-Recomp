@@ -183,7 +183,13 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; uint32_t v
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
     { static int64_t rw=-2; if (rw==-2) { const char* e=getenv("YDKJ_RWATCH"); rw=e?(int64_t)strtoul(e,0,0):-1; }
       if (rw>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)rw && ea<(uint32_t)rw+0x80) {
-        static int _n=0; if (_n++<40) fprintf(stderr,"[RWATCH] read32 0x%08X = 0x%08X  ra=%p\n", ea, __builtin_bswap32(v), __builtin_return_address(0)); } } }
+        static int _n=0; if (_n++<40) {
+          char ln[820]; int p=snprintf(ln,sizeof ln,"[RWATCH] read32 0x%08X = 0x%08X guest:", ea, __builtin_bswap32(v));
+          void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
+          for(int i=0;i<fr;i++){ uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
+            for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
+            if(bg&&(tgt-bh)<0x2000) p+=snprintf(ln+p,sizeof(ln)-p," func_%08X+0x%llX",bg,(unsigned long long)(tgt-bh)); }
+          fprintf(stderr,"%s\n",ln); } } } }
     /* FLOW_RVAL=<hex>: catch where a value is READ FROM memory (its source loc) —
      * the complement to FLOW_WVAL, to find the origin of the 0xC708C708 poison. */
     { static int64_t rv=-2; if (rv==-2){ const char* e=getenv("FLOW_RVAL"); rv=e?(int64_t)strtoul(e,0,16):-1; }
