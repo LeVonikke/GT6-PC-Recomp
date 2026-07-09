@@ -208,8 +208,8 @@ static void int64_run(void)
     a = 0x100000000LL; b = 0x100000000LL;
     t_kat("i64_mul_hi", 0, (u64)(a * b), 0);           /* wraps to 0 */
     ua = 0xDEADBEEFCAFEBABEULL;
-    t_kat("u64_shr_var", 0, ua >> L(17), 0x6F56DF77E57ULL);
-    t_kat("u64_shl_var", 0, ua << L(17), 0x7DD95FD757C0000ULL);
+    t_kat("u64_shr_var", 0, ua >> L(17), 0x6F56DF77E57FULL);
+    t_kat("u64_shl_var", 0, ua << L(17), 0x7DDF95FD757C0000ULL);
 }
 
 static void strings_run(void)
@@ -337,6 +337,59 @@ static void fconv_run(void)
     }
 }
 
+/* ---- double bit-decomposition + dtoa's decimal-exponent estimate ---------
+ * Mirrors newlib _dtoa_r's front end EXACTLY: pull word0/word1 out of the
+ * double (stfd + lwz on BE), extract the binary exponent, renormalize the
+ * mantissa into [1,2), and compute the decimal-exponent estimate k = (int)ds.
+ * vkcube hangs because dtoa("%f",1.0) computes k=INT_MAX -> __pow5mult loops
+ * forever; if the lifter miscompiles any step here (word extraction endianness,
+ * exponent field, fcfid/fmadd, the (int)ds saturating convert), THIS reproduces
+ * it as a clean KAT instead of a newlib spelunk. */
+
+typedef union { double d; struct { u32 w0, w1; } w; unsigned long long u; } DBits;
+
+static void NOINLINE fbits_run(void)
+{
+    static const struct { double d; unsigned long long bits; u32 w0hi; int i_exp; int k; }
+    C[] = {
+        /* d,      full IEEE bits,        word0,       binary exp, decimal-k */
+        { 1.0,    0x3FF0000000000000ULL, 0x3FF00000,   0,   0 },
+        { 2.0,    0x4000000000000000ULL, 0x40000000,   1,   0 },
+        { 0.5,    0x3FE0000000000000ULL, 0x3FE00000,  -1,  -1 },
+        { 100.0,  0x4059000000000000ULL, 0x40590000,   6,   2 },
+        { 1e10,   0x4202A05F20000000ULL, 0x4202A05F,  33,  10 },
+        { 1e-5,   0x3EE4F8B588E368F1ULL, 0x3EE4F8B5, -17,  -5 },
+    };
+    int n;
+    t_section("fbits");
+    for (n = 0; n < (int)(sizeof C / sizeof C[0]); n++) {
+        volatile double dv = C[n].d;
+        DBits u; u.d = dv;
+        /* 64-bit raw bits (stfd + ld) */
+        t_kat("fbits_u64", n, u.u, C[n].bits);
+        /* high word (word0) via the 32-bit struct member (stfd + lwz@0 on BE) */
+        t_kat("fbits_w0", n, u.w.w0, C[n].w0hi);
+        /* binary exponent, exactly newlib's ((word0>>20 & 0x7FF) - 1023) */
+        {
+            int i = (int)((u.w.w0 >> 20) & 0x7FFu) - 1023;
+            t_kat("fbits_iexp", n, (u64)(unsigned)i, (u64)(unsigned)C[n].i_exp);
+        }
+        /* renormalize mantissa to [1,2): word0 = (word0 & 0xFFFFF) | 0x3FF00000 */
+        {
+            DBits d2; d2.d = dv;
+            d2.w.w0 = (d2.w.w0 & 0x000FFFFFu) | 0x3FF00000u;
+            int i = (int)((u.w.w0 >> 20) & 0x7FFu) - 1023;
+            /* newlib's estimate (Book: 0.3010299957 = log10(2)) */
+            double ds = (d2.d - 1.5) * 0.289529654602168
+                      + 0.1760912590558
+                      + (double)i * 0.301029995663981;
+            int k = (int)ds;
+            if (ds < 0.0 && (double)k != ds) k--;
+            t_kat("fbits_k", n, (u64)(unsigned)k, (u64)(unsigned)C[n].k);
+        }
+    }
+}
+
 /* ---- printf/snprintf: integer formats only (dtoa comes later) ------------ */
 
 static void printf_int_run(void)
@@ -360,6 +413,7 @@ void torture_c_run(void)
     recursion_run();
     varargs_run();
     int64_run();
+    fbits_run();
     strings_run();
     setjmp_run();
     structs_run();
