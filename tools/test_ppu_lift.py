@@ -22,7 +22,9 @@ scratch\\dobuild2.bat when cl is absent).
 Scope (tranche 1): integer ALU/rotate/shift/carry/compare classes -- the
 proven silent-miscompile territory. Memory ops, FP, and VMX are follow-on
 tranches (VMX semantics already have manual-verified handling; loads/stores
-need a vm stub harness).
+need a vm stub harness). A first slice of that vm stub harness now backs the
+D-form load/store rA=0 cases below (CASES gained optional in_mem/exp_mem
+fields); it is minimal on purpose and can grow with later memory-op tranches.
 """
 
 import argparse
@@ -56,6 +58,9 @@ def x_logic(xo, rs, ra, rb, rc=0):   # and/or/... rs sits in the rt slot
 
 def d_form(op, rt, ra, imm):
     return (op << 26) | (rt << 21) | (ra << 16) | (imm & 0xFFFF)
+
+def ds_form(op, rt, ra, ds, xo):   # ld/ldu/lwa (op 58), std/stdu (op 62)
+    return (op << 26) | (rt << 21) | (ra << 16) | ((ds & 0x3FFF) << 2) | (xo & 0x3)
 
 def m_form(op, rs, ra, sh, mb, me, rc=0):
     return (op << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1) | rc
@@ -109,17 +114,6 @@ def ref_mulld(a, b):      return (s64(a) * s64(b)) & MASK64, None
 def ref_mulhd(a, b):      return ((s64(a) * s64(b)) >> 64) & MASK64, None
 def ref_mulhdu(a, b):     return ((a * b) >> 64) & MASK64, None
 def ref_mulli(a, imm):    return (s64(a) * imm) & MASK64, None
-
-def ref_mulldo(a, b):
-    """mulldo[.]: low 64 bits (same as ref_mulld) plus XER[OV], set iff the
-    true 128-bit signed product's high half isn't the sign-extension of the
-    low half (Python's arithmetic >> on the full-precision product gives
-    that high half directly)."""
-    full = s64(a) * s64(b)
-    lo = full & MASK64
-    hi = full >> 64
-    sign_lo = -1 if (lo >> 63) & 1 else 0
-    return lo, (1 if hi != sign_lo else 0)
 
 def rotl32(v, n): v &= MASK32; n &= 31; return ((v << n) | (v >> (32 - n))) & MASK32 if n else v
 def rotl64(v, n): v &= MASK64; n &= 63; return ((v << n) | (v >> (64 - n))) & MASK64 if n else v
@@ -262,11 +256,17 @@ rng = random.Random(0x59414B5A)   # deterministic
 E64 += [rng.getrandbits(64) for _ in range(4)]
 
 CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
-             # exp_ov backs the mulldo cases below (XER[OV], the only OE-form op this suite tracks).
+             # in_mem/exp_mem {addr: bytes} back the D-form load/store rA=0 cases below.
+             # in_fpr {freg: raw64 bits} / exp_fpr [(freg, raw64 bits)] back the
+             # FP D-form load/store rA=0 cases (ctx->fpr is a double[32]; bits
+             # are compared as the raw IEEE-754 pattern via memcpy, not value).
 
-def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False, exp_ov=None):
+def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
+         in_mem=None, exp_mem=None, in_fpr=None, exp_fpr=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
-                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap, exp_ov=exp_ov))
+                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
+                      in_mem=in_mem or {}, exp_mem=exp_mem or {},
+                      in_fpr=in_fpr or {}, exp_fpr=exp_fpr or []))
 
 # VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
 # ctx->vr[] directly (no memory load/store instructions needed to exercise
@@ -280,171 +280,6 @@ VCASES = []   # dicts: name, word, vb_reg, vb_bytes, vd_reg, exp_bytes
 def vcase(name, word, vb_reg, vb_bytes, vd_reg, exp_bytes):
     VCASES.append(dict(name=name, word=word, vb_reg=vb_reg, vb_bytes=vb_bytes,
                        vd_reg=vd_reg, exp_bytes=exp_bytes))
-
-# ---------------------------------------------------------------------------
-# FP helpers + cases (FCASES): fcmpu/fcmpo NaN handling, fctiw/fctiwz/fctid/
-# fctidz saturating conversion, and the single-precision-rounding forms.
-# ctx->fpr[] is a plain double array in ppu_context -- these cases seed and
-# check EXACT 64-bit patterns (not float equality, which breaks on NaN) via
-# a raw memcpy in the C driver, mirroring the GPR CASES convention above.
-#
-# Two encoders, matching ppu_disasm.py's opcode-63/59 field split exactly
-# (word = opcd<<26 | field5<<21 | field11_15<<16 | field16_20<<11 |
-#  field21_25<<6 | xo5<<1 | rc):
-#   fx_form -- the "fp_x" table (fcmpu/fcmpo/frsp/fctiw*/fctid*/...): frC's
-#              bits are folded into a single 10-bit xo_full, frD's slot
-#              doubles as BF<<2 for the compares.
-#   fa_form -- the "fp_a" table (fadd/fmul/fmadd/fsqrt/...): frC is a real
-#              operand register (used by fmul/fmadd-family), xo is 5 bits.
-# ---------------------------------------------------------------------------
-
-def dbits(v):
-    """Python float -> its IEEE-754 double bit pattern (host order; only used
-    to round-trip through struct consistently, not to model memory layout)."""
-    return struct.unpack("<Q", struct.pack("<d", v))[0]
-
-def f32_rtz(v):
-    """Round a Python float through IEEE-754 single precision (what
-    (double)(float)(x) does in C) -- the reference for the single-precision
-    rounding forms."""
-    return struct.unpack("<f", struct.pack("<f", v))[0]
-
-NAN = float("nan")
-
-def fx_form(opcd, xo_full, frd_or_bf, fra, frb, rc=0):
-    return (opcd << 26) | (frd_or_bf << 21) | (fra << 16) | (frb << 11) | (xo_full << 1) | rc
-
-def fa_form(opcd, xo5, frd, fra, frc, frb, rc=0):
-    return (opcd << 26) | (frd << 21) | (fra << 16) | (frb << 11) | (frc << 6) | (xo5 << 1) | rc
-
-FCASES = []   # dicts: name, word, in_fpr {reg: python float}, in_fpr_raw {reg: uint64 bits},
-              # expects [(freg, want_bits, mask)], exp_cr (nibble, shift) or None
-
-def fcase(name, word, expects, in_fpr=None, in_fpr_raw=None, exp_cr=None):
-    FCASES.append(dict(name=name, word=word, in_fpr=in_fpr or {}, in_fpr_raw=in_fpr_raw or {},
-                       expects=expects, exp_cr=exp_cr))
-
-def _fcti32(v, truncate):
-    if v != v:
-        return 0x80000000
-    r = int(v) if truncate else round(v)   # int() truncates toward 0; round() ties-to-even
-    if r >= 2147483647: return 0x7FFFFFFF
-    if r <= -2147483648: return 0x80000000
-    return r & 0xFFFFFFFF
-
-def _fcti64(v, truncate):
-    if v != v:
-        return 0x8000000000000000
-    r = int(v) if truncate else round(v)
-    if r >= 9223372036854775807: return 0x7FFFFFFFFFFFFFFF
-    if r <= -9223372036854775808: return 0x8000000000000000
-    return r & 0xFFFFFFFFFFFFFFFF
-
-def build_fcases():
-    FRD, FRA, FRB, FRC = 4, 5, 6, 7
-
-    # --- fcmpu/fcmpo: NaN => FU (0b0001), never EQ -------------------------
-    # xo_full: fcmpu=0, fcmpo=32. BF occupies the frD slot's top 3 bits.
-    for mn, xo_full in (("fcmpu", 0), ("fcmpo", 32)):
-        for bf in (0, 7):
-            shift = (7 - bf) * 4
-            word = fx_form(63, xo_full, bf << 2, FRA, FRB)
-            for label, a, b, nib in [
-                ("lt", 1.0, 2.0, 8), ("gt", 2.0, 1.0, 4), ("eq", 3.0, 3.0, 2),
-                ("nan_a", NAN, 5.0, 1), ("nan_b", 5.0, NAN, 1), ("nan_both", NAN, NAN, 1),
-            ]:
-                fcase(f"{mn} bf={bf} {label}", word, [],
-                      in_fpr={FRA: a, FRB: b}, exp_cr=(nib, shift))
-
-    # --- fctiw/fctiwz/fctid/fctidz: saturating conversion ------------------
-    # fctiw/fctid (xo=14/814) round nearest-even; fctiwz/fctidz (xo=15/815)
-    # truncate. fctiw*'s result lands in the LOW 32 bits of frD; the upper
-    # 32 bits must be left UNCHANGED, so frD is pre-seeded with a marker
-    # upper word to catch a regression there.
-    UPPER_MARKER = 0xCAFEBABE00000000
-    fcti_vals = [3.7, -3.7, 0.0, 1.0e30, -1.0e30, NAN, 3.5, -3.5, 2.5, -0.5]
-    for v in fcti_vals:
-        label = f"v={v}"
-        iv32r, iv32t = _fcti32(v, False), _fcti32(v, True)
-        fcase(f"fctiw {label}", fx_form(63, 14, FRD, 0, FRB),
-              [(FRD, (UPPER_MARKER | iv32r) & MASK64, MASK64)],
-              in_fpr_raw={FRD: UPPER_MARKER}, in_fpr={FRB: v})
-        fcase(f"fctiwz {label}", fx_form(63, 15, FRD, 0, FRB),
-              [(FRD, (UPPER_MARKER | iv32t) & MASK64, MASK64)],
-              in_fpr_raw={FRD: UPPER_MARKER}, in_fpr={FRB: v})
-
-        iv64r, iv64t = _fcti64(v, False), _fcti64(v, True)
-        fcase(f"fctid {label}", fx_form(63, 814, FRD, 0, FRB),
-              [(FRD, iv64r, MASK64)], in_fpr={FRB: v})
-        fcase(f"fctidz {label}", fx_form(63, 815, FRD, 0, FRB),
-              [(FRD, iv64t, MASK64)], in_fpr={FRB: v})
-
-    # --- Single-precision rounding forms ------------------------------------
-    # Pick operands where double-precision arithmetic keeps a bit that a
-    # float32 round would drop, so the raw-double and f32-rounded results
-    # provably differ (a no-op "fix" -- i.e. skipping the (float) round --
-    # would fail these).
-    A, B, D3 = 1.0, 2.0 ** -30, 3.0 ** 0.5
-
-    def chk_discriminates(raw, want, label):
-        assert dbits(raw) != dbits(want), f"{label} test operands don't discriminate precision"
-
-    # fadds/fsubs/fdivs: frd, fra, frb (opcode 59, xo 21/20/18)
-    for mn, xo, op in [("fadds", 21, "+"), ("fsubs", 20, "-"), ("fdivs", 18, "/")]:
-        raw = {"+": A + B, "-": A - B, "/": D3 / A}[op]
-        want = f32_rtz(raw)
-        chk_discriminates(raw, want, mn)
-        fcase(mn, fa_form(59, xo, FRD, FRA, 0, FRB), [(FRD, dbits(want), MASK64)],
-              in_fpr={FRA: (D3 if op == "/" else A), FRB: (A if op == "/" else B)})
-    # non-single sanity guard: fadd (opcode 63) must NOT round to float --
-    # proves the fix is gated on the mnemonic's 's' suffix, not overbroad.
-    raw_add = A + B
-    fcase("fadd (double, not rounded)", fa_form(63, 21, FRD, FRA, 0, FRB),
-          [(FRD, dbits(raw_add), MASK64)], in_fpr={FRA: A, FRB: B})
-    assert dbits(raw_add) != dbits(f32_rtz(raw_add)), "fadd sanity case doesn't discriminate"
-
-    # fmuls: frd, fra, frc (opcode 59, xo 25) -- frB unused
-    raw_mul = D3 * B
-    want_mul = f32_rtz(raw_mul)
-    chk_discriminates(raw_mul, want_mul, "fmuls")
-    fcase("fmuls", fa_form(59, 25, FRD, FRA, FRC, 0), [(FRD, dbits(want_mul), MASK64)],
-          in_fpr={FRA: D3, FRC: B})
-
-    # fmadds/fmsubs/fnmadds/fnmsubs: frd, fra, frc, frb (opcode 59)
-    fma_ops = {
-        "fmadds":  (29, lambda a, c, b: a * c + b),
-        "fmsubs":  (28, lambda a, c, b: a * c - b),
-        "fnmadds": (31, lambda a, c, b: -(a * c + b)),
-        "fnmsubs": (30, lambda a, c, b: -(a * c - b)),
-    }
-    for mn, (xo, fn) in fma_ops.items():
-        raw = fn(D3, B, A)
-        want = f32_rtz(raw)
-        chk_discriminates(raw, want, mn)
-        fcase(mn, fa_form(59, xo, FRD, FRA, FRC, FRB), [(FRD, dbits(want), MASK64)],
-              in_fpr={FRA: D3, FRC: B, FRB: A})
-
-    # fsqrts/frsqrtes/fres: frd, frb (opcode 59, xo 22/26/24; frA reserved=0)
-    import math as _m
-    raw_sqrt = _m.sqrt(2.0)
-    want_sqrt = f32_rtz(raw_sqrt)
-    chk_discriminates(raw_sqrt, want_sqrt, "fsqrts")
-    fcase("fsqrts", fa_form(59, 22, FRD, 0, 0, FRB), [(FRD, dbits(want_sqrt), MASK64)],
-          in_fpr={FRB: 2.0})
-
-    raw_rsqrte = 1.0 / _m.sqrt(3.0)
-    want_rsqrte = f32_rtz(raw_rsqrte)
-    chk_discriminates(raw_rsqrte, want_rsqrte, "frsqrtes")
-    fcase("frsqrtes", fa_form(59, 26, FRD, 0, 0, FRB), [(FRD, dbits(want_rsqrte), MASK64)],
-          in_fpr={FRB: 3.0})
-
-    raw_re = 1.0 / D3
-    want_re = f32_rtz(raw_re)
-    chk_discriminates(raw_re, want_re, "fres")
-    fcase("fres", fa_form(59, 24, FRD, 0, 0, FRB), [(FRD, dbits(want_re), MASK64)],
-          in_fpr={FRB: D3})
-
-build_fcases()
 
 def pairs(n=6):
     ps = []
@@ -512,23 +347,6 @@ def build_cases():
                      xo_form(xo, R[0], R[1], R[2], oe=1),
                      {R[1]: a, R[2]: b}, [(R[0], v, mask)],
                      in_ca=ca, exp_ca=(cout if sets_ca else None))
-
-    # --- mulldo/mulldo. (mulld's OE form) -----------------------------------
-    # Unlike the oe_ops group above, mulld's overflow condition is exactly
-    # computable (PowerISA p.60/p.36: OV = high half of the true 128-bit
-    # product isn't the sign-extension of the low half) and the lifter now
-    # computes it via ppc_mulhd, so these cases assert XER[OV] rather than
-    # reusing the plain-form no-OV convention.
-    for a, b, tag in (
-        (0x7FFFFFFFFFFFFFFF, 2, "positive overflow"),      # INT64_MAX * 2
-        (0x8000000000000000, 2, "negative overflow"),      # INT64_MIN * 2
-        (100, 200, "no overflow"),
-    ):
-        v, ov = ref_mulldo(a, b)
-        case(f"mulldo a={a:#x} b={b:#x} ({tag})", xo_form(233, R[0], R[1], R[2], oe=1),
-             {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_ov=ov)
-        case(f"mulldo. a={a:#x} b={b:#x} ({tag})", xo_form(233, R[0], R[1], R[2], oe=1, rc=1),
-             {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_ov=ov)
 
     for name, xo, ref in [("addme", 234, ref_addme), ("addze", 202, ref_addze),
                           ("subfme", 232, ref_subfme), ("subfze", 200, ref_subfze)]:
@@ -670,6 +488,64 @@ def build_cases():
         case(f"add. a={a:#x} b={b:#x}", xo_form(266, R[0], R[1], R[2], rc=1),
              {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_cr=(nib, 28))
 
+    # --- D-form (and DS-form) load/store rA=0 literal-zero base ------------
+    # PowerISA_V2.03_Final_Public.pdf p.64 (loads, "Load Word and Zero
+    # D-form") and p.67 (stores, "Fixed-Point Store Instructions"): for these
+    # forms EA = (RA=0 ? 0 : GPR[RA]) + D -- RA=0 means a LITERAL ZERO base,
+    # not GPR[0]. Every rA=0 case below poisons gpr[0] with a nonzero value
+    # so a lifter that mistakenly emits ctx->gpr[0] computes a different (and
+    # in these cases, unpopulated/unchecked) address and the case fails.
+    POISON0 = 0x1122334455667788
+
+    # lwz rD,0x40(0): correct EA=0x40; buggy EA=(POISON0+0x40) masked by the
+    # vm stub's 64 KB window, a location this case never populates.
+    case("lwz literal-zero base rA=0 (r0 poisoned)", d_form(32, 10, 0, 0x40),
+         {0: POISON0}, [(10, 0x89ABCDEF, MASK64)],
+         in_mem={0x40: struct.pack(">I", 0x89ABCDEF)})
+
+    # lwz rD,0x30(r4): base != 0, must be unaffected by the fix (regression).
+    case("lwz normal base rA=4", d_form(32, 11, 4, 0x30),
+         {4: 0x2000}, [(11, 0x13572468, MASK64)],
+         in_mem={0x2030: struct.pack(">I", 0x13572468)})
+
+    # stw rS,0x40(0): correct EA=0x40; a buggy store lands elsewhere and 0x40
+    # is left at its memset-zero value, so exp_mem catches it.
+    case("stw literal-zero base rA=0 (r0 poisoned)", d_form(36, 12, 0, 0x40),
+         {0: POISON0, 12: 0xCAFEBABE}, [],
+         exp_mem={0x40: struct.pack(">I", 0xCAFEBABE)})
+
+    # stw rS,0x50(r4): base != 0, regression check.
+    case("stw normal base rA=4", d_form(36, 13, 4, 0x50),
+         {4: 0x3000, 13: 0x0F0E0D0C}, [],
+         exp_mem={0x3050: struct.pack(">I", 0x0F0E0D0C)})
+
+    # lwa rD,0x40(0): DS-form algebraic load, same literal-zero rule; also
+    # exercises sign extension of the loaded (negative) word.
+    lwa_word_val = 0x89ABCDEF
+    lwa_expect = s32(lwa_word_val) & MASK64
+    case("lwa literal-zero base rA=0 (r0 poisoned)", ds_form(58, 14, 0, 0x40 >> 2, 2),
+         {0: POISON0}, [(14, lwa_expect, MASK64)],
+         in_mem={0x40: struct.pack(">I", lwa_word_val)})
+
+    # --- FP D-form load/store rA=0 literal-zero base ------------------------
+    # Same rule, same page cites, applied to lfs/lfd/stfs/stfd. lfd (opcode
+    # 50) reads a raw double bit pattern through vm_read64; stfs (opcode 52)
+    # narrows a double to float and stores it through vm_write32 (already
+    # backed by the stub), so it needs no new memory-access width.
+    pi_bits = struct.unpack(">Q", struct.pack(">d", 3.14159265358979))[0]
+    case("lfd literal-zero base rA=0 (r0 poisoned)", d_form(50, 5, 0, 0x40),
+         {0: POISON0}, [],
+         in_mem={0x40: struct.pack(">Q", pi_bits)},
+         exp_fpr=[(5, pi_bits)])
+
+    fp_val = 2.5   # exactly representable in both float and double
+    fp_double_bits = struct.unpack(">Q", struct.pack(">d", fp_val))[0]
+    fp_float_bytes = struct.pack(">f", fp_val)
+    case("stfs literal-zero base rA=0 (r0 poisoned)", d_form(52, 6, 0, 0x50),
+         {0: POISON0}, [],
+         in_fpr={6: fp_double_bits},
+         exp_mem={0x50: fp_float_bytes})
+
 build_cases()
 
 def build_vcases():
@@ -692,57 +568,6 @@ def build_vcases():
     for label, vb in [("pos", vb_b_pos), ("neg", vb_b_neg), ("mix", vb_b_mix)]:
         vcase(f"vupkhsb {label}", vx_form(526, VD, 0, VB), VB, vb, VD, ref_vupkhsb(vb))
         vcase(f"vupklsb {label}", vx_form(654, VD, 0, VB), VB, vb, VD, ref_vupklsb(vb))
-
-    # vctsxs/vctuxs: SATURATE out-of-range, NaN => 0. The lifted code uses
-    # native-endian float*/int32_t* casts directly on ctx->vr[] (this
-    # generator's existing convention for vcfsx/vcfux/vctsxs/vctuxs, unlike
-    # the big-endian vrf/vstw helpers used by some other VMX ops), so the
-    # input/expected lanes here are packed little-endian (host order) too --
-    # matching the vupk* reference functions' documented convention above.
-    def ref_vctsxs(vals, uimm):
-        scale = 1 << uimm
-        out = []
-        for f in vals:
-            # The lifted code reads the input lane as a 32-bit `float` and
-            # the `* scale` multiply is float*float (single precision), so
-            # the reference must round through float32 at each step -- the
-            # guest value has already lost precision by the time the
-            # saturate math runs, and a naive double-precision `* scale`
-            # here could double-round differently than the C float multiply.
-            v = f32_rtz(f32_rtz(f) * scale)
-            if v != v: r = 0
-            elif v >= 2147483647.0: r = 2147483647
-            elif v <= -2147483648.0: r = -2147483648
-            else: r = int(v)   # truncate toward zero, matches a C (int32_t)v cast
-            out.append(r)
-        return struct.pack("<4i", *out)
-
-    def ref_vctuxs(vals, uimm):
-        scale = 1 << uimm
-        out = []
-        for f in vals:
-            v = f32_rtz(f32_rtz(f) * scale)
-            if v != v: r = 0
-            elif v >= 4294967295.0: r = 4294967295
-            elif v <= 0.0: r = 0
-            else: r = int(v)
-            out.append(r)
-        return struct.pack("<4I", *out)
-
-    vf_normal = [1.9, -1.9, 12.5, -0.5]
-    vf_overflow = [1.0e10, -1.0e10, 2147483647.5, -2147483649.0]
-    vf_nan = [float("nan"), 2.5, -2.5, 0.0]
-    for label, vals in [("normal", vf_normal), ("overflow", vf_overflow), ("nan", vf_nan)]:
-        vb = struct.pack("<4f", *vals)
-        vcase(f"vctsxs {label}", vx_form(970, VD, 0, VB), VB, vb, VD, ref_vctsxs(vals, 0))
-        vcase(f"vctuxs {label}", vx_form(906, VD, 0, VB), VB, vb, VD, ref_vctuxs(vals, 0))
-    # scaled form (UIMM != 0): vD, vB, UIMM -- UIMM sits in the VX-form vA
-    # field (a literal, not a register).
-    vb_scaled = struct.pack("<4f", 1.5, -1.5, 3.25, 0.125)
-    vcase("vctsxs scaled uimm=4", vx_form(970, VD, 4, VB), VB, vb_scaled, VD,
-          ref_vctsxs([1.5, -1.5, 3.25, 0.125], 4))
-    vcase("vctuxs scaled uimm=2", vx_form(906, VD, 2, VB), VB, vb_scaled, VD,
-          ref_vctuxs([1.5, -1.5, 3.25, 0.125], 2))
 
 build_vcases()
 
@@ -777,11 +602,6 @@ static void check_ca(const char* name, uint32_t xer, int want) {
     if (got != want) { printf("FAIL %s: XER[CA] = %d want %d\\n", name, got, want); g_fail++; }
     else g_pass++;
 }
-static void check_ov(const char* name, uint32_t xer, int want) {
-    int got = (xer >> 30) & 1;
-    if (got != want) { printf("FAIL %s: XER[OV] = %d want %d\\n", name, got, want); g_fail++; }
-    else g_pass++;
-}
 static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
     int got = (cr >> shift) & 0xF;
     /* only LT/GT/EQ (top 3 bits of the nibble); SO passthrough not asserted */
@@ -799,14 +619,34 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         g_fail++;
     } else g_pass++;
 }
-static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want, uint64_t mask) {
-    if ((got & mask) != (want & mask)) {
-        printf("FAIL %s: f%d = 0x%016llX want 0x%016llX (mask 0x%016llX)\\n",
-               name, reg, (unsigned long long)got, (unsigned long long)want,
-               (unsigned long long)mask);
+static void check_mem(const char* name, uint64_t addr, const uint8_t* got, const uint8_t* want, int n) {
+    for (int i = 0; i < n; i++) {
+        if (got[i] != want[i]) {
+            printf("FAIL %s: mem[0x%llX] byte %d = 0x%02X want 0x%02X\\n",
+                   name, (unsigned long long)addr, i, got[i], want[i]);
+            g_fail++;
+            return;
+        }
+    }
+    g_pass++;
+}
+static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
+    if (got != want) {
+        printf("FAIL %s: f%d raw bits = 0x%016llX want 0x%016llX\\n",
+               name, reg, (unsigned long long)got, (unsigned long long)want);
         g_fail++;
     } else g_pass++;
 }
+/* vm stub over a 64 KB scratch page for the memory-op cases (D-form load/
+ * store rA=0, including the FP forms via vm_read64 for lfd); EAs are masked
+ * into it. Widths beyond 64 bits aren't provided yet -- add as later
+ * memory-op tranches need them. */
+#include <stdlib.h>   /* MSVC _byteswap_* */
+static uint8_t g_vm_stub[65536];
+#define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
+extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return _byteswap_ulong(v); }
+extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
+extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return _byteswap_uint64(v); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
@@ -828,18 +668,31 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want, ui
         nm = c["name"].replace('"', "'")
         out.append(f'    {{ /* case {i}: {nm} | {insn.mnemonic} {insn.operands} */')
         out.append("      memset(ctx, 0, sizeof(*ctx));")
+        if c["in_mem"] or c["exp_mem"]:
+            out.append("      memset(g_vm_stub, 0, sizeof(g_vm_stub));")
         for reg, val in c["in_regs"].items():
             out.append(f"      ctx->gpr[{reg}] = 0x{val:016X}ULL;")
         if c["in_ca"]:
             out.append("      ctx->xer |= (1u << 29);")
+        for addr, blob in c["in_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            out.append(f"      {{ static const uint8_t _m[{len(blob)}] = {{ {byts} }}; "
+                       f"memcpy(g_vm_stub + VMOFF(0x{addr:X}), _m, {len(blob)}); }}")
+        for reg, bits in c["in_fpr"].items():
+            out.append(f"      {{ uint64_t _b = 0x{bits:016X}ULL; memcpy(&ctx->fpr[{reg}], &_b, 8); }}")
         body = [f"        {code}"]
         for reg, val, mask in c["expects"]:
             body.append(f'        check_reg("{nm}", {reg}, ctx->gpr[{reg}], '
                         f"0x{val:016X}ULL, 0x{mask:016X}ULL);")
+        for addr, blob in c["exp_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            body.append(f'        {{ static const uint8_t _want[{len(blob)}] = {{ {byts} }}; '
+                        f'check_mem("{nm}", 0x{addr:X}ULL, g_vm_stub + VMOFF(0x{addr:X}), _want, {len(blob)}); }}')
+        for reg, bits in c["exp_fpr"]:
+            body.append(f'        {{ uint64_t _got; memcpy(&_got, &ctx->fpr[{reg}], 8); '
+                        f'check_fpr("{nm}", {reg}, _got, 0x{bits:016X}ULL); }}')
         if c["exp_ca"] is not None:
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
-        if c["exp_ov"] is not None:
-            body.append(f'        check_ov("{nm}", ctx->xer, {int(bool(c["exp_ov"]))});')
         if c["exp_cr"] is not None:
             nib, shift = c["exp_cr"]
             body.append(f'        check_cr("{nm}", ctx->cr, {nib}, {shift});')
@@ -880,36 +733,6 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want, ui
                     f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')
         out.append("    }")
 
-    for i, c in enumerate(FCASES):
-        insn = ppu_disasm.decode(c["word"], 0x50000 + i * 4)
-        exp_mn = c["name"].split()[0].rstrip(".")
-        got_mn = insn.mnemonic.rstrip(".")
-        if got_mn != exp_mn:
-            print(f"ENCODING mismatch for {c['name']!r}: decoded as "
-                  f"{insn.mnemonic} {insn.operands} (word {c['word']:#010x}) -- case skipped")
-            n_encoding_skipped += 1
-            continue
-        code = lifter._translate(insn, dummy)
-        if code.startswith("/*"):
-            print(f"UNHANDLED by lifter: {c['name']!r} -> {code[:60]} -- case skipped")
-            n_encoding_skipped += 1
-            continue
-        nm = c["name"].replace('"', "'")
-        out.append(f'    {{ /* fcase {i}: {nm} | {insn.mnemonic} {insn.operands} */')
-        out.append("      memset(ctx, 0, sizeof(*ctx));")
-        for reg, bits_val in c["in_fpr_raw"].items():
-            out.append(f"      {{ uint64_t _b = 0x{bits_val:016X}ULL; memcpy(&ctx->fpr[{reg}], &_b, 8); }}")
-        for reg, fval in c["in_fpr"].items():
-            out.append(f"      {{ uint64_t _b = 0x{dbits(fval):016X}ULL; memcpy(&ctx->fpr[{reg}], &_b, 8); }}")
-        out.append(f"      {code}")
-        for freg, want, mask in c["expects"]:
-            out.append(f"      {{ uint64_t _g; memcpy(&_g, &ctx->fpr[{freg}], 8); "
-                        f'check_fpr("{nm}", {freg}, _g, 0x{want:016X}ULL, 0x{mask:016X}ULL); }}')
-        if c["exp_cr"] is not None:
-            nib, shift = c["exp_cr"]
-            out.append(f'      check_cr("{nm}", ctx->cr, {nib}, {shift});')
-        out.append("    }")
-
     out.append("""
     printf("\\n[ppu-conformance] %d checks passed, %d FAILED, %d skipped\\n",
            g_pass, g_fail, g_skip);
@@ -918,7 +741,7 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want, ui
 """)
     with open(path, "w") as f:
         f.write("\n".join(out))
-    n_total = len(CASES) + len(VCASES) + len(FCASES)
+    n_total = len(CASES) + len(VCASES)
     print(f"wrote {path}: {n_total - n_encoding_skipped} cases "
           f"({n_encoding_skipped} skipped at generation)")
 

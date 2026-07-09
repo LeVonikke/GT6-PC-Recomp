@@ -954,6 +954,12 @@ class PPULifter:
             return f"ctx->gpr[{ra}] = (uint64_t)ppc_srad(&ctx->xer, (int64_t)ctx->gpr[{rs}], {_imm(ops[2])});"
 
         # ------- Loads -------
+        # PowerISA_V2.03_Final_Public.pdf p.64 (Book I, section 3.3.2, "Load
+        # Word and Zero D-form"): for a D-form load, EA = (RA=0 ? 0 : GPR[RA])
+        # + D -- RA=0 is a LITERAL ZERO base, not GPR[0]. Update forms (lwzu
+        # etc.) are excluded from the rule: p.62 spells out "If RA=0 ... the
+        # instruction form is invalid" for the update forms, so no guard is
+        # needed for the base += disp below.
         load_map = {
             "lbz": ("vm_read8", False), "lbzu": ("vm_read8", False),
             "lhz": ("vm_read16", False), "lhzu": ("vm_read16", False),
@@ -966,7 +972,7 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                expr = f"{helper}(ctx->gpr[{base}] + {disp})"
+                expr = f"{helper}((({base}) ? ctx->gpr[{base}] : 0) + {disp})"
                 if signed and "16" in helper:
                     expr = f"(int64_t)(int16_t){expr}"
                 line = f"ctx->gpr[{rd_i}] = {expr};"
@@ -1001,6 +1007,10 @@ class PPULifter:
             return f"/* {mn} unhandled operands: {insn.operands} */;"
 
         # ------- Stores -------
+        # Same D-form rA=0 literal-zero-base rule as the loads above
+        # (PowerISA_V2.03_Final_Public.pdf p.67, section 3.3.3, "Fixed-Point
+        # Store Instructions"); update forms excluded for the same
+        # invalid-form reason ("If RA=0, the instruction form is invalid").
         store_map = {
             "stb": "vm_write8", "stbu": "vm_write8",
             "sth": "vm_write16", "sthu": "vm_write16",
@@ -1012,7 +1022,7 @@ class PPULifter:
             rs_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                line = f"{helper}(ctx->gpr[{base}] + {disp}, ctx->gpr[{rs_i}]);"
+                line = f"{helper}((({base}) ? ctx->gpr[{base}] : 0) + {disp}, ctx->gpr[{rs_i}]);"
                 # Handle update forms
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
@@ -1043,10 +1053,11 @@ class PPULifter:
             return f"ctx->gpr[{rd_i}] = {expr};"
 
         if mn == "lwa":
+            # DS-form; the same rA=0 literal-zero-base rule applies (p.64).
             rd_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32(ctx->gpr[{base}] + {disp});"
+                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32((({base}) ? ctx->gpr[{base}] : 0) + {disp});"
 
         # ------- Indexed Stores -------
         idx_store_map = {
@@ -1356,15 +1367,19 @@ class PPULifter:
             return "lv2_syscall(ctx);"
 
         # ------- Floating-point loads/stores -------
+        # Same D-form rA=0 literal-zero-base rule as the integer loads/stores
+        # above (PowerISA_V2.03_Final_Public.pdf p.64/p.67): these are D-form
+        # too (lfs/lfd/stfs/stfd), so EA = (RA=0 ? 0 : GPR[RA]) + D applies
+        # here as well.
         if mn in ("lfs", "lfsu", "lfd", "lfdu"):
             frd = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 if "s" in mn:
-                    return (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
+                    return (f"{{ uint32_t tmp = vm_read32((({base}) ? ctx->gpr[{base}] : 0) + {disp}); "
                             f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
                 else:
-                    return (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
+                    return (f"{{ uint64_t tmp = vm_read64((({base}) ? ctx->gpr[{base}] : 0) + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
 
         if mn in ("stfs", "stfsu", "stfd", "stfdu"):
@@ -1378,10 +1393,10 @@ class PPULifter:
                 # idioms and any stored double). [ps3recomp fork JonathanDC64 eb5451b3]
                 if mn in ("stfs", "stfsu"):
                     return (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
-                            f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
+                            f"memcpy(&tmp, &ftmp, 4); vm_write32((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
                 else:
                     return (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
-                            f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
+                            f"vm_write64((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
 
         # ------- FP arithmetic -------
         # PPC NaN semantics + default +QNaN via preamble helpers (a plain C
