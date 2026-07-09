@@ -64,8 +64,8 @@ extern "C" {
 #define NV4097_SET_SCISSOR_VERTICAL            0x000008C4
 
 /* Clear */
-#define NV4097_SET_COLOR_CLEAR_VALUE           0x000001D0
-#define NV4097_SET_ZSTENCIL_CLEAR_VALUE        0x000001D8
+#define NV4097_SET_COLOR_CLEAR_VALUE           0x00001D90
+#define NV4097_SET_ZSTENCIL_CLEAR_VALUE        0x00001D8C
 #define NV4097_CLEAR_SURFACE                   0x00001D94
 
 /* Draw commands */

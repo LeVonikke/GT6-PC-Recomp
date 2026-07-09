@@ -796,7 +796,7 @@ static int init_d3d12(u32 width, u32 height)
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_RANGE nr = {0,0};
 
-        bd.Width = MAX_VERTICES * 16;
+        bd.Width = MAX_VERTICES * 32;   /* 32-byte VP vertex: pos(a0) + colour(a3) */
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_vb)))
@@ -969,7 +969,9 @@ static void compile_vp(void)
         il[_e].SemanticIndex = _e;
         il[_e].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         il[_e].InputSlot = 0;
-        il[_e].AlignedByteOffset = 0;
+        /* 32-byte vertex: ATTR0 = position @0, ATTR3 = colour @16 (upload_quads_vp
+         * interleaves them). Other slots alias position @0 (unread by the VS). */
+        il[_e].AlignedByteOffset = (_e == 3) ? 16 : 0;
         il[_e].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
         il[_e].InstanceDataStepRate = 0;
     }
@@ -985,7 +987,14 @@ static void compile_vp(void)
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    pd.DepthStencilState.DepthEnable = FALSE; pd.DepthStencilState.StencilEnable = FALSE;
+    /* Depth test ON (LESS_EQUAL, matching the guest's rsxtiny_DepthTestFunc 515 /
+     * CELL_GCM_LEQUAL). Without it the cube's faces drew in submission order and
+     * back faces overwrote the front -> you saw through the near face to the
+     * darker interior. The depth buffer is bound + cleared to 1.0 each frame. */
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pd.DepthStencilState.StencilEnable = FALSE;
     pd.SampleDesc.Count = 1;
     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_d3d.pipeline_state_vp);
 
@@ -1077,7 +1086,15 @@ static void render_frame(void)
             int garbage = !(c00 > 0.0f && c00 < 8.0f);   /* NaN/inf/huge/tiny-FOV */
             if (garbage || getenv("VP_FIXPROJ")) {
                 for (int _i = 0; _i < 16; _i++) c[_i] = 0.0f;
-                c[0]=1.358f; c[5]=2.414f; c[10]=1.0101f; c[11]=1.0f; c[14]=-1.0101f;
+                /* c[0]/c[5] = x/y scale (45deg, 16:9). z-row: vkcube's VP does the
+                 * RSX depth trick `o[0].z = HPOS.z * HPOS.w` so after D3D's /w the
+                 * final ndc.z == HPOS.z directly -- so HPOS.z must ALREADY be the
+                 * [0,1] ndc depth, NOT clip depth. Use a LINEAR map z_view->[0,1]
+                 * over [near=1,far=100]: HPOS.z = (r0.z - 1)/99. (Clip-style
+                 * 1.0101*(z-1) gave HPOS.z~4 -> clamped to 1.0 everywhere -> no
+                 * depth differentiation, back faces bled through the front.) */
+                c[0]=1.358f; c[5]=2.414f; c[11]=1.0f;
+                c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
             }
         }
         if (getenv("VP_DUMP")) { const float (*vc)[4]=s_d3d.current_rsx_state->vertex_constants;
@@ -1320,14 +1337,14 @@ static void render_frame(void)
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
             D3D12_VERTEX_BUFFER_VIEW vbv;
             vbv.BufferLocation = s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb);
-            vbv.SizeInBytes    = MAX_VERTICES * 16;
-            vbv.StrideInBytes  = 16;
+            vbv.SizeInBytes    = MAX_VERTICES * 32;
+            vbv.StrideInBytes  = 32;   /* pos(a0) + colour(a3) */
             s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &vbv);
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
-                    dr->vertex_count, 1, dr->vb_byte_offset / 16, 0);
+                    dr->vertex_count, 1, dr->vb_byte_offset / 32, 0);
             }
         }
     }
@@ -1622,27 +1639,43 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveOffset(u32);
     typedef struct { float x, y, z, w; } V4;
+    /* 32-byte VP vertex: attrib0 (position) then attrib3 (colour), matching the
+     * input layout (ATTR0@0, ATTR3@16). tiny3d interleaves pos+colour in one
+     * 32-byte stride (a0 off 0xF01100, a3 off 0xF01110). Reading only a0 aliased
+     * the colour to the position -> HSV rainbow instead of the guest's colour. */
+    typedef struct { V4 pos; V4 col; } VPVert;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
+    const rsx_vertex_attrib* col = &state->vertex_attribs[3];
     if (!pos->enabled) return 0;
+    if (getenv("VP_ATTRS")) { static int _a=0; if(_a++<2) {
+        for (int _i=0;_i<16;_i++){ const rsx_vertex_attrib* a=&state->vertex_attribs[_i];
+            if(a->enabled) fprintf(stderr,"[VPATTR] a%d off=0x%X stride=%u size=%u type=%u\n",_i,a->offset,a->stride,a->size,a->type); } } }
     u32 quads = count / 4;
-    u32 maxv = (MAX_VERTICES * 16 - s_d3d.vp_vb_offset) / 16;
+    u32 maxv = (MAX_VERTICES * 32 - s_d3d.vp_vb_offset) / 32;
     if (quads * 6 > maxv) quads = maxv / 6;
-    V4* out = (V4*)((u8*)s_d3d.vp_vb_mapped + s_d3d.vp_vb_offset);
+    VPVert* out = (VPVert*)((u8*)s_d3d.vp_vb_mapped + s_d3d.vp_vb_offset);
     u32 o = 0;
     for (u32 q = 0; q < quads; q++) {
-        V4 c[4];
+        VPVert c[4];
         for (u32 k = 0; k < 4; k++) {
-            u8* src = vm_base + cellGcmResolveOffset(pos->offset + (first + q*4 + k) * pos->stride);
-            c[k].x = rd_bef(src); c[k].y = rd_bef(src+4); c[k].z = rd_bef(src+8); c[k].w = rd_bef(src+12);
+            u32 vi = first + q*4 + k;
+            u8* ps = vm_base + cellGcmResolveOffset(pos->offset + vi * pos->stride);
+            c[k].pos.x = rd_bef(ps); c[k].pos.y = rd_bef(ps+4); c[k].pos.z = rd_bef(ps+8); c[k].pos.w = rd_bef(ps+12);
+            if (col->enabled && col->type == 2 /* CELL_GCM_VERTEX_F */) {
+                u8* cs = vm_base + cellGcmResolveOffset(col->offset + vi * col->stride);
+                c[k].col.x = rd_bef(cs); c[k].col.y = rd_bef(cs+4); c[k].col.z = rd_bef(cs+8); c[k].col.w = rd_bef(cs+12);
+            } else {
+                c[k].col.x = c[k].col.y = c[k].col.z = c[k].col.w = 1.0f;
+            }
         }
         if (q == 0 && getenv("VP_DUMP")) { static int _n=0; if(_n++<3) fprintf(stderr,
-            "[VPVTX] v0=(%.3f,%.3f,%.3f,%.3f) off=0x%X stride=%u\n",
-            c[0].x,c[0].y,c[0].z,c[0].w, pos->offset, pos->stride); }
+            "[VPVTX] v0 pos=(%.3f,%.3f,%.3f,%.3f) col=(%.3f,%.3f,%.3f,%.3f)\n",
+            c[0].pos.x,c[0].pos.y,c[0].pos.z,c[0].pos.w, c[0].col.x,c[0].col.y,c[0].col.z,c[0].col.w); }
         out[o++]=c[0]; out[o++]=c[1]; out[o++]=c[2];
         out[o++]=c[0]; out[o++]=c[2]; out[o++]=c[3];
     }
-    s_d3d.vp_vb_offset += o * 16;
+    s_d3d.vp_vb_offset += o * 32;
     return o;
 }
 
