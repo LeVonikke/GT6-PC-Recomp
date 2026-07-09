@@ -1142,25 +1142,25 @@ s32 cellGcmUnbindZcull(u8 index)
  * Misc
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x107BF789 */
-s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch)
+/* NID: 0x107BF789
+ * SDK prototype (cell/gcm.h): uint32_t cellGcmGetTiledPitchSize(const uint32_t size)
+ * -- returns the pitch BY VALUE in r3 (no out-pointer!). The old signature here
+ * took (size, u32* pitch-out) and returned a status code, so every caller got 0
+ * / an error code as its "pitch" -- gcm/cube's `bne` on the result then skipped
+ * its entire config+framebuffer-alloc block (GetConfiguration never ran, local
+ * memory base stayed 0, AddressToOffset(0) auto-mapped a bogus IO alias, and the
+ * FIFO teleported into it). Returns 0 only for size > max, like hardware. */
+u32 cellGcmGetTiledPitchSize(u32 size)
 {
-    /* `pitch` is a GUEST address (the generic HLE adapter passes r4 raw). Write
-     * through vm_write32 so it's byte-swapped to BE and bounds-checked -- a raw
-     * *pitch faults when the game hands us a null-object-derived low pointer. */
-    uint32_t pitch_ea = (uint32_t)(uintptr_t)pitch;
-    if (!pitch_ea)
-        return CELL_GCM_ERROR_INVALID_VALUE;
-
+    u32 r = 0;
     /* Smallest valid tiled pitch >= size (RSX supports only specific pitches). */
-    for (int i = 0; i < s_valid_pitch_count; i++) {
-        if (s_valid_pitches[i] >= size) {
-            vm_write32(pitch_ea, s_valid_pitches[i]);
-            return CELL_OK;
+    if (size) {
+        for (int i = 0; i < s_valid_pitch_count; i++) {
+            if (s_valid_pitches[i] >= size) { r = s_valid_pitches[i]; break; }
         }
     }
-    vm_write32(pitch_ea, s_valid_pitches[s_valid_pitch_count - 1]);
-    return CELL_OK;
+    { static int _n=0; if (_n++<4) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
+    return r;
 }
 
 /* NID: 0xBC982946 */
