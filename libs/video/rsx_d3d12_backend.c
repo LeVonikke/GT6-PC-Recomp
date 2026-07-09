@@ -796,7 +796,7 @@ static int init_d3d12(u32 width, u32 height)
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_RANGE nr = {0,0};
 
-        bd.Width = MAX_VERTICES * 32;   /* 32-byte VP vertex: pos(a0) + colour(a3) */
+        bd.Width = MAX_VERTICES * 256;  /* generic VP vertex: 16 float4 attrib slots */
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_vb)))
@@ -969,9 +969,11 @@ static void compile_vp(void)
         il[_e].SemanticIndex = _e;
         il[_e].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         il[_e].InputSlot = 0;
-        /* 32-byte vertex: ATTR0 = position @0, ATTR3 = colour @16 (upload_quads_vp
-         * interleaves them). Other slots alias position @0 (unread by the VS). */
-        il[_e].AlignedByteOffset = (_e == 3) ? 16 : 0;
+        /* 256-byte generic VP vertex: every ATTRi is a float4 slot at i*16
+         * (read_vp_vertex converts each enabled RSX attrib by type; disabled
+         * slots hold (0,0,0,1)). Covers tiny3d (a0/a3/a8), SDK gcm samples
+         * (a0/a1/a2), dbgfont -- no aliasing. */
+        il[_e].AlignedByteOffset = (UINT)(_e * 16);
         il[_e].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
         il[_e].InstanceDataStepRate = 0;
     }
@@ -1337,14 +1339,14 @@ static void render_frame(void)
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
             D3D12_VERTEX_BUFFER_VIEW vbv;
             vbv.BufferLocation = s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb);
-            vbv.SizeInBytes    = MAX_VERTICES * 32;
-            vbv.StrideInBytes  = 32;   /* pos(a0) + colour(a3) */
+            vbv.SizeInBytes    = MAX_VERTICES * 256;
+            vbv.StrideInBytes  = 256;   /* 16 float4 attrib slots */
             s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &vbv);
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
-                    dr->vertex_count, 1, dr->vb_byte_offset / 32, 0);
+                    dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
             }
         }
     }
@@ -1634,49 +1636,116 @@ static u32 upload_quads_from_rsx(u32 first, u32 count)
 /* Upload RSX QUADS as raw float4 attrib0 (byte-swapped) into vp_vb, expanded
  * to a triangle list (6 verts/quad). The decompiled vertex shader does the
  * transform. Returns emitted vertex count. */
-static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
+/* Generic VP vertex: all 16 RSX vertex attributes, each converted to a float4
+ * slot -- 256 bytes/vertex, input layout ATTRi @ i*16. Apps place attributes at
+ * arbitrary indices (tiny3d: pos=a0 colour=a3 tex=a8; SDK gcm samples: pos=a0
+ * colour=a1 tex=a2; dbgfont: a0..a2), so a hardcoded pos+colour pair can't
+ * cover them: every enabled attrib is fetched from guest memory and converted
+ * by its RSX type; disabled slots read (0,0,0,1). */
+typedef struct { float v[4]; } VPSlot;
+#define VP_VERT_STRIDE (16 * sizeof(VPSlot))   /* 256 */
+
+static float rd_half_be(const u8* p)
+{
+    u16 h = (u16)((p[0] << 8) | p[1]);
+    u32 sgn = (h >> 15) & 1, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+    u32 f;
+    if (exp == 0)       f = (sgn << 31);                                    /* +-0 / denorm->0 */
+    else if (exp == 31) f = (sgn << 31) | 0x7F800000u | (man << 13);        /* inf/nan */
+    else                f = (sgn << 31) | ((exp - 15 + 127) << 23) | (man << 13);
+    float out; memcpy(&out, &f, 4); return out;
+}
+
+static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
 {
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveOffset(u32);
-    typedef struct { float x, y, z, w; } V4;
-    /* 32-byte VP vertex: attrib0 (position) then attrib3 (colour), matching the
-     * input layout (ATTR0@0, ATTR3@16). tiny3d interleaves pos+colour in one
-     * 32-byte stride (a0 off 0xF01100, a3 off 0xF01110). Reading only a0 aliased
-     * the colour to the position -> HSV rainbow instead of the guest's colour. */
-    typedef struct { V4 pos; V4 col; } VPVert;
+    for (int i = 0; i < 16; i++) {
+        VPSlot* o = &out16[i];
+        o->v[0] = o->v[1] = o->v[2] = 0.0f; o->v[3] = 1.0f;
+        const rsx_vertex_attrib* a = &state->vertex_attribs[i];
+        if (!a->enabled || a->stride == 0) continue;
+        const u8* p = vm_base + cellGcmResolveOffset(a->offset + vi * a->stride);
+        u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+        switch (a->type) {
+        case 2: /* CELL_GCM_VERTEX_F: float32 BE */
+            for (u32 k = 0; k < n; k++) o->v[k] = rd_bef(p + k * 4);
+            break;
+        case 3: /* SF: half float BE */
+            for (u32 k = 0; k < n; k++) o->v[k] = rd_half_be(p + k * 2);
+            break;
+        case 4: /* UB: u8 normalized [0,1] */
+            for (u32 k = 0; k < n; k++) o->v[k] = p[k] / 255.0f;
+            break;
+        case 1: /* S1: s16 normalized [-1,1] */
+            for (u32 k = 0; k < n; k++) {
+                s16 s = (s16)((p[k*2] << 8) | p[k*2+1]);
+                o->v[k] = (float)s / 32767.0f;
+            }
+            break;
+        case 5: /* S32K: s16 integer */
+            for (u32 k = 0; k < n; k++)
+                o->v[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]);
+            break;
+        case 7: /* UB256: u8 unnormalized */
+            for (u32 k = 0; k < n; k++) o->v[k] = (float)p[k];
+            break;
+        default:
+            for (u32 k = 0; k < n; k++) o->v[k] = rd_bef(p + k * 4);
+            break;
+        }
+    }
+}
+
+static void vp_attrs_dbg(const rsx_state* state)
+{
+    if (!getenv("VP_ATTRS")) return;
+    static int _a = 0; if (_a++ >= 4) return;
+    for (int i = 0; i < 16; i++) {
+        const rsx_vertex_attrib* a = &state->vertex_attribs[i];
+        if (a->enabled) fprintf(stderr, "[VPATTR] a%d off=0x%X stride=%u size=%u type=%u\n",
+                                i, a->offset, a->stride, a->size, a->type);
+    }
+}
+
+static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
+{
+    extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
-    const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
-    const rsx_vertex_attrib* col = &state->vertex_attribs[3];
-    if (!pos->enabled) return 0;
-    if (getenv("VP_ATTRS")) { static int _a=0; if(_a++<2) {
-        for (int _i=0;_i<16;_i++){ const rsx_vertex_attrib* a=&state->vertex_attribs[_i];
-            if(a->enabled) fprintf(stderr,"[VPATTR] a%d off=0x%X stride=%u size=%u type=%u\n",_i,a->offset,a->stride,a->size,a->type); } } }
+    if (!state->vertex_attribs[0].enabled) return 0;
+    vp_attrs_dbg(state);
     u32 quads = count / 4;
-    u32 maxv = (MAX_VERTICES * 32 - s_d3d.vp_vb_offset) / 32;
+    u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (quads * 6 > maxv) quads = maxv / 6;
-    VPVert* out = (VPVert*)((u8*)s_d3d.vp_vb_mapped + s_d3d.vp_vb_offset);
+    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped + s_d3d.vp_vb_offset);
     u32 o = 0;
     for (u32 q = 0; q < quads; q++) {
-        VPVert c[4];
-        for (u32 k = 0; k < 4; k++) {
-            u32 vi = first + q*4 + k;
-            u8* ps = vm_base + cellGcmResolveOffset(pos->offset + vi * pos->stride);
-            c[k].pos.x = rd_bef(ps); c[k].pos.y = rd_bef(ps+4); c[k].pos.z = rd_bef(ps+8); c[k].pos.w = rd_bef(ps+12);
-            if (col->enabled && col->type == 2 /* CELL_GCM_VERTEX_F */) {
-                u8* cs = vm_base + cellGcmResolveOffset(col->offset + vi * col->stride);
-                c[k].col.x = rd_bef(cs); c[k].col.y = rd_bef(cs+4); c[k].col.z = rd_bef(cs+8); c[k].col.w = rd_bef(cs+12);
-            } else {
-                c[k].col.x = c[k].col.y = c[k].col.z = c[k].col.w = 1.0f;
-            }
-        }
-        if (q == 0 && getenv("VP_DUMP")) { static int _n=0; if(_n++<3) fprintf(stderr,
-            "[VPVTX] v0 pos=(%.3f,%.3f,%.3f,%.3f) col=(%.3f,%.3f,%.3f,%.3f)\n",
-            c[0].pos.x,c[0].pos.y,c[0].pos.z,c[0].pos.w, c[0].col.x,c[0].col.y,c[0].col.z,c[0].col.w); }
-        out[o++]=c[0]; out[o++]=c[1]; out[o++]=c[2];
-        out[o++]=c[0]; out[o++]=c[2]; out[o++]=c[3];
+        VPSlot c[4][16];
+        for (u32 k = 0; k < 4; k++)
+            read_vp_vertex(state, first + q*4 + k, c[k]);
+        /* quad -> two triangles (perimeter winding) */
+        static const int idx[6] = {0,1,2, 0,2,3};
+        for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
     }
-    s_d3d.vp_vb_offset += o * 32;
+    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
+}
+
+/* Straight triangle-list upload through the VP path (gcm/cube's cube draws
+ * TRIANGLES, prim 5 -- no expansion needed). */
+static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
+{
+    extern uint8_t* vm_base;
+    if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
+    if (!state->vertex_attribs[0].enabled) return 0;
+    vp_attrs_dbg(state);
+    u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+    if (count > maxv) count = maxv - (maxv % 3);
+    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped + s_d3d.vp_vb_offset);
+    for (u32 k = 0; k < count; k++)
+        read_vp_vertex(state, first + k, &out[k*16]);
+    s_d3d.vp_vb_offset += count * VP_VERT_STRIDE;
+    return count;
 }
 
 static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
@@ -1727,6 +1796,25 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             s_d3d.draws[s_d3d.draw_count].topology       = D3D_TOPOLOGY_TRIANGLELIST;
             s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
             s_d3d.draws[s_d3d.draw_count].is_vp          = 0;
+            s_d3d.draw_count++;
+        }
+        return;
+    }
+
+    /* TRIANGLES (prim 5): same VP-path preference as quads -- the guest's
+     * vertex program does the MVP transform (gcm/cube draws its cube this way);
+     * the fixed-function fallback below applies no transform, so 3D geometry
+     * ends up in object space (invisible/garbage). */
+    if (primitive == 5 /* CELL_GCM_PRIMITIVE_TRIANGLES */ &&
+        s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
+        u32 rec = s_d3d.vp_vb_offset;
+        u32 emitted = upload_tris_vp(s_d3d.current_rsx_state, first, count);
+        if (emitted && s_d3d.draw_count < MAX_DRAWS) {
+            s_d3d.draws[s_d3d.draw_count].vb_byte_offset = rec;
+            s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
+            s_d3d.draws[s_d3d.draw_count].topology       = D3D_TOPOLOGY_TRIANGLELIST;
+            s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
+            s_d3d.draws[s_d3d.draw_count].is_vp          = 1;
             s_d3d.draw_count++;
         }
         return;
