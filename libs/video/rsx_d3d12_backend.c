@@ -30,6 +30,7 @@
 
 /* D3D12 headers */
 #include <d3d12.h>
+#include <d3d12sdklayers.h>   /* ID3D12Debug / ID3D12InfoQueue */
 #include <dxgi1_4.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -215,17 +216,26 @@ static int init_d3d12(u32 width, u32 height)
     HRESULT hr;
 
     /* Enable debug layer in debug builds */
-#ifndef NDEBUG
-    {
+    /* Debug layer: on in debug builds, or in any build when D3D12_DBG is set
+     * (so a Release run can capture exact PSO/validation errors). */
+    if (
+#ifdef NDEBUG
+        getenv("D3D12_DBG")
+#else
+        1
+#endif
+    ) {
         ID3D12Debug* debug_controller = NULL;
         hr = D3D12GetDebugInterface(&IID_ID3D12Debug, (void**)&debug_controller);
         if (SUCCEEDED(hr) && debug_controller) {
             debug_controller->lpVtbl->EnableDebugLayer(debug_controller);
             debug_controller->lpVtbl->Release(debug_controller);
             printf("[D3D12] Debug layer enabled\n");
+        } else {
+            printf("[D3D12] Debug layer requested but unavailable (0x%08lX) -- "
+                   "install 'Graphics Tools' optional feature\n", hr);
         }
     }
-#endif
 
     /* Create DXGI factory */
     IDXGIFactory4* factory = NULL;
@@ -912,6 +922,11 @@ static void compile_vp(void)
     static char hlsl[64 * 1024];
     int ni = rsx_vp_decompile(st->vp_ucode, st->vp_ucode_bytes, hlsl, sizeof hlsl);
     if (ni <= 0) { printf("[VP] decompile failed (%d)\n", ni); s_d3d.vp_compiled_bytes = st->vp_ucode_bytes; return; }
+    if (getenv("VP_DUMP")) {
+        FILE* vf = fopen("vp_dump.hlsl", "w");
+        if (vf) { fwrite(hlsl, 1, strlen(hlsl), vf); fclose(vf);
+                  printf("[VP] dumped vp_dump.hlsl (%d instrs)\n", ni); }
+    }
 
     /* Pixel shader mirrors dbgfont's FP: sample the atlas coverage at TEXCOORD0
      * (VP output o[7]), alpha-test at 0.5, output the vertex color (o[1]). */
@@ -929,14 +944,32 @@ static void compile_vp(void)
     hr = D3DCompile(ps, sizeof(ps)-1, "vpps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &e);
     if (FAILED(hr)) { printf("[VP] PS compile FAIL: %s\n", e?(const char*)e->lpVtbl->GetBufferPointer(e):"?"); if(e)e->lpVtbl->Release(e); if(vb)vb->lpVtbl->Release(vb); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
 
-    D3D12_INPUT_ELEMENT_DESC il[] = {
-        {"POSITION",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
-    };
+    /* The decompiled VS declares inputs a0:ATTR0 .. a15:ATTR15 and the HLSL
+     * compiler keeps whichever the program body reads. D3D12 requires EVERY VS
+     * input to have a matching input-layout element (by semantic name+index),
+     * so declare all 16 ATTR slots. (The old single "POSITION" element matched
+     * NO VS input once the decompiler switched to ATTR semantics -> PSO failed
+     * with E_INVALIDARG for every VP, blanking cellmark's text and vkcube.)
+     * The VP path uploads only attrib0 to vp_vb (one float4/vertex), so every
+     * slot reads that same float4 at offset 0; attributes other than position
+     * therefore alias attrib0 for now (colours/uv wrong until the VP path
+     * uploads multiple attributes), but geometry is correct and the PSO is
+     * valid. */
+    D3D12_INPUT_ELEMENT_DESC il[16];
+    for (int _e = 0; _e < 16; _e++) {
+        il[_e].SemanticName = "ATTR";
+        il[_e].SemanticIndex = _e;
+        il[_e].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        il[_e].InputSlot = 0;
+        il[_e].AlignedByteOffset = 0;
+        il[_e].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        il[_e].InstanceDataStepRate = 0;
+    }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
     pd.pRootSignature = s_d3d.vp_root_sig;
     pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb); pd.VS.BytecodeLength = vb->lpVtbl->GetBufferSize(vb);
     pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb); pd.PS.BytecodeLength = pb->lpVtbl->GetBufferSize(pb);
-    pd.InputLayout.pInputElementDescs = il; pd.InputLayout.NumElements = 1;
+    pd.InputLayout.pInputElementDescs = il; pd.InputLayout.NumElements = 16;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -950,7 +983,25 @@ static void compile_vp(void)
     vb->lpVtbl->Release(vb); pb->lpVtbl->Release(pb);
     s_d3d.vp_compiled_bytes = st->vp_ucode_bytes;
     if (SUCCEEDED(hr)) { s_d3d.vp_ready = 1; printf("[VP] pipeline ready (%d instrs)\n", ni); }
-    else printf("[VP] PSO creation FAIL (0x%08lX)\n", hr);
+    else {
+        printf("[VP] PSO creation FAIL (0x%08lX)\n", hr);
+        /* Drain the debug layer's message queue to get the EXACT validation
+         * reason (E_INVALIDARG is otherwise opaque). One-shot. */
+        ID3D12InfoQueue* iq = NULL;
+        if (SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(
+                s_d3d.device, &IID_ID3D12InfoQueue, (void**)&iq)) && iq) {
+            UINT64 n = iq->lpVtbl->GetNumStoredMessages(iq);
+            for (UINT64 mi = 0; mi < n; mi++) {
+                SIZE_T len = 0;
+                iq->lpVtbl->GetMessage(iq, mi, NULL, &len);
+                D3D12_MESSAGE* m = (D3D12_MESSAGE*)malloc(len);
+                if (m && SUCCEEDED(iq->lpVtbl->GetMessage(iq, mi, m, &len)))
+                    printf("[VP][DBG] %s\n", m->pDescription);
+                free(m);
+            }
+            iq->lpVtbl->Release(iq);
+        }
+    }
 }
 
 static void render_frame(void)
@@ -963,9 +1014,21 @@ static void render_frame(void)
         s_d3d.current_rsx_state->vp_ucode_bytes >= 16 &&
         s_d3d.vp_compiled_bytes != s_d3d.current_rsx_state->vp_ucode_bytes)
         compile_vp();
-    if (s_d3d.vp_cb_mapped && s_d3d.current_rsx_state)
+    if (s_d3d.vp_cb_mapped && s_d3d.current_rsx_state) {
         memcpy(s_d3d.vp_cb_mapped, s_d3d.current_rsx_state->vertex_constants,
                RSX_MAX_VERTEX_CONSTANTS * 16);
+        /* The (merged) decompiled VS finishes with
+         *   Out.pos = float4(o0.xyz*vp_posscale.xyz + o0.w*vp_posoffset.xyz, o0.w)
+         * expecting the harness to append the RSX->D3D clip-space viewport
+         * transform after vp_c[512]. It was never written, so posscale/posoffset
+         * were garbage and every HPOS collapsed (cellmark text + vkcube both went
+         * black after the merge). Identity (scale=1, offset=0) passes the VP's
+         * clip-space HPOS straight through -- exactly the pre-merge behaviour.
+         * TODO: derive from NV4097_SET_VIEWPORT_SCALE/OFFSET for correct Z/Y. */
+        float* vpx = (float*)((char*)s_d3d.vp_cb_mapped + RSX_MAX_VERTEX_CONSTANTS * 16);
+        vpx[0] = vpx[1] = vpx[2] = vpx[3] = 1.0f;   /* vp_posscale  */
+        vpx[4] = vpx[5] = vpx[6] = vpx[7] = 0.0f;   /* vp_posoffset */
+    }
 
     /* Lazily create the readback buffer the first time a dump is requested. */
     if (s_d3d.dump_frames_left > 0 && !s_d3d.readback_buf) {
