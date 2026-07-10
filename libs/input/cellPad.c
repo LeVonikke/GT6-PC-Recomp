@@ -380,6 +380,8 @@ extern void vm_write32(unsigned long long a, unsigned int   v);
 
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
+    { static int _once = 0;
+      if (!_once++) printf("[cellPad] GetData polling begins (port %u)\n", port_no); }
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 

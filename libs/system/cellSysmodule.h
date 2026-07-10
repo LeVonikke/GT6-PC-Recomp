@@ -102,6 +102,8 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 
 /* NID: 0x26A6E12B */
+s32 cellSysmoduleInitialize(void);
+s32 cellSysmoduleFinalize(void);
 s32 cellSysmoduleLoadModule(u16 id);
 
 /* NID: 0x112A5EE9 */

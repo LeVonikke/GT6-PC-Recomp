@@ -207,7 +207,8 @@ static void dest_mask(u32 op0, char* m)
     m[n] = '\0';
 }
 
-int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
+int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+                     int exports32)
 {
     if (!ucode || !out || out_size == 0) return -1;
 
@@ -501,11 +502,17 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
     while (n_else-- > 0) out_puts(&o, "    } else {\n");
     while (n_end--  > 0) out_puts(&o, "    } }\n");
 
-    /* Fragment colour outputs. MRT: RSX colour outputs are r0 (h0), r2 (h4),
-     * r3 (h6), r4 (h8). Always emit 4 targets -- writes to unbound RTs are
-     * discarded, and both register files are zero-initialised so the unused
-     * one of each r/h pair contributes nothing. */
-    if (wrote_r0 || !wrote_h0)
+    /* Fragment colour outputs, selected by SET_SHADER_CONTROL: 32-bit
+     * programs export r0/r2/r3/r4, half programs h0/h4/h6/h8 (wave's water
+     * height FP writes its result to h0 and uses r0 lanes as scratch --
+     * heuristics picked r0 and the pond stayed flat forever). Unbound MRT
+     * writes are discarded. */
+    /* h0 ALIASES r0 on hardware -- the control bit only picks the export
+     * view. With separate register files, honour the bit but fall back to
+     * whichever file the program actually wrote (PSL1GHT programs run with
+     * half-export control while writing r0). Secondary targets use the
+     * zero-init sum trick: only one of each aliased pair is ever written. */
+    if (exports32 ? wrote_r0 : !wrote_h0)
         out_puts(&o, "    PSOut _po; _po.c0 = r[0];\n");
     else
         out_puts(&o, "    PSOut _po; _po.c0 = h[0];\n");
