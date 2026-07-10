@@ -524,6 +524,78 @@ static u32 gcm_io2ea(u32 io)
 static u32 s_fifo_getoff  = 0;
 static u32 s_fifo_calloff = 0;
 
+/* ---------------------------------------------------------------------------
+ * 2D transfer engines (FIFO subchannels != 0).
+ *
+ * libgcm binds: sub 1/6 = NV0039 (m2mf buffer copy), sub 2 = NV3062 (context
+ * surface 2D), sub 3 = NV309E (swizzled surface), sub 4 = NV308A (image from
+ * CPU / inline transfer), sub 5 = NV3089 (scaled image).
+ *
+ * cellGcmSetFragmentProgramParameter patches a fragment program's inline
+ * constants by emitting NV3062 (destination surface) + NV308A (COLOR data
+ * words) through the FIFO -- it does NOT CPU-write the ucode copy. Without
+ * this engine the patched constants stay zero in local memory (demosaic: all
+ * its texture-size constants -> UVs scaled by 0 -> uniform output).
+ * -----------------------------------------------------------------------*/
+extern u32 cellGcmResolveLocated(int local, u32 offset);
+
+static struct {
+    u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
+    u32 color_fmt;    /* NV3062 0x0300 SET_COLOR_FORMAT             */
+    u32 pitch;        /* NV3062 0x0304 SET_PITCH (dst in bits 16-31) */
+    u32 dst_offset;   /* NV3062 0x030C SET_OFFSET_DESTIN            */
+    u32 point;        /* NV308A 0x0304 SET_POINT ((y<<16)|x)        */
+    u32 size_out;     /* NV308A 0x0308 SET_SIZE_OUT                 */
+} s_gcm2d;
+
+static void gcm_2d_method(u32 subch, u32 method, u32 data)
+{
+    /* Subchannel bindings are libgcm-version-specific (SET_OBJECT binds are
+     * not tracked): demosaic's SDK emits dest-surface on sub 3 and image-from-
+     * CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 / 0xA400
+     * headers); other versions use the classic 2 / 4. Accept both. */
+    if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
+        switch (method) {
+        case 0x0184: case 0x0188: s_gcm2d.dst_dma = data; return;
+        case 0x0300: s_gcm2d.color_fmt  = data; return;
+        case 0x0304: s_gcm2d.pitch      = data; return;
+        case 0x030C: s_gcm2d.dst_offset = data; return;
+        }
+        return;
+    }
+    if (subch == 4 || subch == 5) {         /* NV308A image from CPU */
+        switch (method) {
+        case 0x0304: s_gcm2d.point    = data; return;
+        case 0x0308: s_gcm2d.size_out = data; return;
+        case 0x030C: return;                /* SIZE_IN */
+        }
+        if (method >= 0x0400 && method <= 0x07FC) {
+            /* COLOR data word: write into the destination surface. Inline
+             * transfers use format Y32 (4 bytes/px, one row per point.y).
+             * DMA 0xFEED0000 = local memory, 0xFEED0001 = main memory. */
+            u32 idx = (method - 0x0400) >> 2;
+            u32 px  = (s_gcm2d.point & 0xFFFF) + idx;
+            u32 py  = s_gcm2d.point >> 16;
+            u32 dst_pitch = s_gcm2d.pitch >> 16;
+            int local = (s_gcm2d.dst_dma != 0xFEED0001u);
+            u32 base = cellGcmResolveLocated(local, s_gcm2d.dst_offset);
+            { static int _it = 0;
+              if (_it++ < 6)
+                  printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
+                         base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
+                         s_gcm2d.dst_dma, px, py, dst_pitch, data); }
+            vm_write32(base + py * dst_pitch + px * 4, data);
+            return;
+        }
+        return;
+    }
+    /* NV0039 / NV309E / NV3089: not implemented yet -- log first sightings. */
+    static int warned = 0;
+    if (warned++ < 8)
+        printf("[cellGcmSys] FIFO subch %u method 0x%04X (unhandled 2D engine)\n",
+               subch, method);
+}
+
 void cellGcm_rsx_process_fifo(void)
 {
     static rsx_state s_state;
@@ -574,12 +646,15 @@ void cellGcm_rsx_process_fifo(void)
         if (type == 0 || type == 2) {          /* method (incrementing / NI) */
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
+            u32 subch  = (w >> 13) & 7;
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
-                rsx_process_method(&s_state,
-                                   (type == 0) ? method + i * 4 : method,
-                                   vm_read32(dea));
+                u32 m = (type == 0) ? method + i * 4 : method;
+                if (subch == 0)
+                    rsx_process_method(&s_state, m, vm_read32(dea));
+                else
+                    gcm_2d_method(subch, m, vm_read32(dea));
             }
             s_fifo_getoff += 4 + count * 4;
             continue;
@@ -664,6 +739,17 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
     s_display_buffer_set[bufferId] = 1;
 
     return CELL_OK;
+}
+
+/* Backend query (not a guest API): is this raw RSX offset a registered
+ * display buffer? Used to split display draws (-> backbuffer) from
+ * offscreen render-to-texture passes. */
+int cellGcmOffsetIsDisplay(u32 offset)
+{
+    for (int i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++)
+        if (s_display_buffer_set[i] && s_display_buffers[i].offset == offset)
+            return 1;
+    return 0;
 }
 
 /* NID: 0xEAA52F23 */
@@ -808,6 +894,8 @@ s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
 }
 
 /* NID: 0xDB769B32 */
+static u32 gcm_io_alloc(u32 size);   /* defined below */
+
 s32 cellGcmAddressToOffset(u32 address, u32* offset)
 {
     /* `offset` is a GUEST address; write big-endian via vm_write32. */
