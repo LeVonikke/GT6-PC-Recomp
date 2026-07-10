@@ -139,6 +139,61 @@ static inline uint64_t ppu_f2i64(double v, int rn)
     return (uint64_t)(int64_t)r;
 }
 
+/* PPC FP NaN semantics (Book I 4.6.5.2): a propagated input NaN keeps its
+ * sign and payload and is QUIETED, selected in operand order; an invalid
+ * operation with no NaN inputs produces the DEFAULT QNaN
+ * 0x7FF8000000000000 (positive). x86's default "real indefinite" is
+ * NEGATIVE (0xFFF8...), so plain C expressions diverge on every inf-inf,
+ * 0*inf and 0/0. The fmadd family also needs a REAL fused fma(): the
+ * unfused a*b+c double-rounds away cancellation residuals (newlib atan2's
+ * argument reduction depends on the fused residual; wave's colour wheel
+ * painted garbage without it). */
+static inline double ppu_fp_quiet(double x)
+{
+    uint64_t b; memcpy(&b, &x, 8);
+    b |= 0x0008000000000000ULL;
+    memcpy(&x, &b, 8);
+    return x;
+}
+static inline double ppu_fp_default_qnan(void)
+{
+    uint64_t q = 0x7FF8000000000000ULL; double d;
+    memcpy(&d, &q, 8);
+    return d;
+}
+static inline double ppu_fp_bin(double a, double b, double r)
+{
+    if (a != a) return ppu_fp_quiet(a);
+    if (b != b) return ppu_fp_quiet(b);
+    if (r != r) return ppu_fp_default_qnan();
+    return r;
+}
+static inline double ppu_fadd(double a, double b) { return ppu_fp_bin(a, b, a + b); }
+static inline double ppu_fsub(double a, double b) { return ppu_fp_bin(a, b, a - b); }
+static inline double ppu_fmul(double a, double b) { return ppu_fp_bin(a, b, a * b); }
+static inline double ppu_fdiv(double a, double b) { return ppu_fp_bin(a, b, a / b); }
+/* FRT = (neg_res ? - : +)([FRA*FRC] + (neg_b ? -FRB : FRB)), fused.
+ * NaN priority: FRA, FRB, FRC (negations never apply to propagated NaNs). */
+static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
+{
+    if (a != a) return ppu_fp_quiet(a);
+    if (b != b) return ppu_fp_quiet(b);
+    if (c != c) return ppu_fp_quiet(c);
+    double r = fma(a, c, neg_b ? -b : b);
+    if (r != r) return ppu_fp_default_qnan();
+    return neg_res ? -r : r;
+}
+/* Round-to-single of a NaN keeps the full double payload (quieted). */
+static inline double ppu_fp_single(double r)
+{
+    return (r != r) ? r : (double)(float)r;
+}
+static inline double ppu_frsp(double b)
+{
+    if (b != b) return ppu_fp_quiet(b);
+    return (double)(float)b;
+}
+
 /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
  * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
 #ifdef __cplusplus
@@ -923,6 +978,28 @@ class PPULifter:
                 return line
             return f"/* {mn} unhandled operands: {insn.operands} */;"
 
+        # ------- Load/Store Multiple (Book I 3.3.5) -------
+        # lmw rD,disp(rA): words at EA,EA+4,... into rD..r31 (zero-extended).
+        # stmw rS,disp(rA): low words of rS..r31 to EA,EA+4,...
+        # Previously unhandled -> silent no-ops; newlib -O2 prologues use
+        # them to save/restore callee-saves, so every libm call returned
+        # with garbage non-volatiles (wave's colour wheel, vkcube's tanf).
+        if mn in ("lmw", "stmw"):
+            r0_i = _reg_idx(ops[0])
+            disp, base = _disp_base(ops[1])
+            if disp is not None and str(r0_i).isdigit():
+                first = int(r0_i)
+                if mn == "lmw":
+                    body = " ".join(
+                        f"ctx->gpr[{r}] = vm_read32(_ea + {4*(r-first)});"
+                        for r in range(first, 32))
+                else:
+                    body = " ".join(
+                        f"vm_write32(_ea + {4*(r-first)}, (uint32_t)ctx->gpr[{r}]);"
+                        for r in range(first, 32))
+                return (f"{{ uint64_t _ea = ctx->gpr[{base}] + {disp}; {body} }}")
+            return f"/* {mn} unhandled operands: {insn.operands} */;"
+
         # ------- Stores -------
         store_map = {
             "stb": "vm_write8", "stbu": "vm_write8",
@@ -1307,25 +1384,26 @@ class PPULifter:
                             f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
 
         # ------- FP arithmetic -------
+        # PPC NaN semantics + default +QNaN via preamble helpers (a plain C
+        # expression yields x86's NEGATIVE indefinite NaN on inf-inf etc.).
         fp_binary = {
-            "fadd": "+", "fadds": "+", "fsub": "-", "fsubs": "-",
-            "fmul": "*", "fmuls": "*", "fdiv": "/", "fdivs": "/",
+            "fadd": "ppu_fadd", "fadds": "ppu_fadd",
+            "fsub": "ppu_fsub", "fsubs": "ppu_fsub",
+            "fmul": "ppu_fmul", "fmuls": "ppu_fmul",
+            "fdiv": "ppu_fdiv", "fdivs": "ppu_fdiv",
         }
         mn_base = mn.rstrip(".")
         if mn_base in fp_binary:
             frd = _reg_idx(ops[0])
             fra = _reg_idx(ops[1])
             frb = _reg_idx(ops[2])
-            op_c = fp_binary[mn_base]
-            # Book I 4.6.5: the single forms (fadds/fsubs/fmuls/fdivs) round
-            # the result to single precision before storing back to the
-            # 64-bit FPR; keeping the double intermediate diverges from real
-            # HW (breaks exact-compare/convergence idioms and oracle
-            # comparability against a real PPU).
+            helper = fp_binary[mn_base]
+            expr = f"{helper}(ctx->fpr[{fra}], ctx->fpr[{frb}])"
+            # Book I 4.6.5: the single forms round the result to single
+            # precision (NaNs keep the double payload -- ppu_fp_single).
             if mn_base.endswith("s"):
-                return (f"ctx->fpr[{frd}] = (double)(float)"
-                        f"(ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}]);")
-            return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}];"
+                expr = f"ppu_fp_single({expr})"
+            return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("fmr",):
             frd = _reg_idx(ops[0])
@@ -1347,40 +1425,29 @@ class PPULifter:
             frb = _reg_idx(ops[1])
             return f"ctx->fpr[{frd}] = -fabs(ctx->fpr[{frb}]);"
 
-        # The single fused forms (fmadds/fmsubs/fnmadds/fnmsubs) round to
-        # single precision too (same Book I 4.6.5 rule as fp_binary above).
-        if mn_base in ("fmadd", "fmadds"):
+        # Fused multiply-add family through a REAL fma() (unfused a*b+c
+        # double-rounds; PPC NaN priority FRA,FRB,FRC via the helper). The
+        # single forms round the (non-NaN) result to single precision.
+        fma_map = {
+            "fmadd":  (0, 0), "fmadds":  (0, 0),
+            "fmsub":  (1, 0), "fmsubs":  (1, 0),
+            "fnmadd": (0, 1), "fnmadds": (0, 1),
+            "fnmsub": (1, 1), "fnmsubs": (1, 1),
+        }
+        if mn_base in fma_map:
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            expr = f"ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}]"
+            neg_b, neg_res = fma_map[mn_base]
+            expr = (f"ppu_fmadd_core(ctx->fpr[{fra}], ctx->fpr[{frc}], "
+                    f"ctx->fpr[{frb}], {neg_b}, {neg_res})")
             if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
-            return f"ctx->fpr[{frd}] = {expr};"
-
-        if mn_base in ("fmsub", "fmsubs"):
-            frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            expr = f"ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}]"
-            if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
-            return f"ctx->fpr[{frd}] = {expr};"
-
-        if mn_base in ("fnmadd", "fnmadds"):
-            frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            expr = f"-(ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}])"
-            if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
-            return f"ctx->fpr[{frd}] = {expr};"
-
-        if mn_base in ("fnmsub", "fnmsubs"):
-            frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            expr = f"-(ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}])"
-            if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
+                expr = f"ppu_fp_single({expr})"
             return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("frsp",):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
-            return f"ctx->fpr[{frd}] = (float)ctx->fpr[{frb}];"
+            # NaN: quiet and keep the FULL double payload (no single rounding).
+            return f"ctx->fpr[{frd}] = ppu_frsp(ctx->fpr[{frb}]);"
 
         # Book I 4.6.7 float->int: SATURATE (>max => max, <min => min,
         # NaN => min) and fctiw/fctid round per FPSCR[RN] (default nearest-
