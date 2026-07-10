@@ -360,8 +360,8 @@ u32 cellGcmGetTimeStampLocation(u32 index, u32* location);
 s32 cellGcmSetDefaultFifoSize(u32 size);
 
 /* Internal flip commands (called by game code directly) */
-s32 _cellGcmSetFlipCommand(u32 bufferId);
-s32 _cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue);
+s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId);
+s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId, u32 labelIndex, u32 labelValue);
 
 /* --- Additional functions (RPCS3 parity) --- */
 

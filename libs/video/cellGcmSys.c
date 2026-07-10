@@ -629,6 +629,19 @@ void cellGcm_rsx_process_fifo(void)
         u32 w = vm_read32(ea);
         u32 type = w >> 29;
 
+        if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
+            /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
+             * this word into the FIFO instead of calling any import. Fire the
+             * flip (status/count/handler) and STOP this drain so the ticker's
+             * flip-gated present shows exactly the completed frame -- draining
+             * on would mix the next frame's head into the batch (wave: every
+             * frame split across 4 presents, layout flashing/zooming). */
+            extern s32 cellGcmSetFlipCommand(u32 bufferId);
+            s_fifo_getoff += 4;
+            cellGcmSetFlipCommand(w & 0xFFu);
+            break;
+        }
+
         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
             s_fifo_getoff = w & 0x1FFFFFFCu;
             continue;
@@ -659,6 +672,8 @@ void cellGcm_rsx_process_fifo(void)
             s_fifo_getoff += 4 + count * 4;
             continue;
         }
+        { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
+            fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
@@ -1338,13 +1353,20 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 }
 
 /* Internal flip commands — called directly by some games */
-s32 _cellGcmSetFlipCommand(u32 bufferId)
+/* libgcm's internal exports pass the command context FIRST -- taking
+ * bufferId as arg1 made the range check eat the context pointer, so the
+ * flip counter never advanced (wave: presents free-ran 4x per frame,
+ * layout flashing/zooming). */
+s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
+    (void)ctx;
     return cellGcmSetFlipCommand(bufferId);
 }
 
-s32 _cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue)
+s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
+                                        u32 labelIndex, u32 labelValue)
 {
+    (void)ctx;
     return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
 }
 
