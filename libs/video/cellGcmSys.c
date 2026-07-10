@@ -795,12 +795,14 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
      * its frame before flipping, so wait (bounded) for get to reach put --
      * which is also what a real GCM flip does. */
     {
-        for (int _spin = 0; _spin < 200; _spin++) {
+        for (int _spin = 0; _spin < 400000; _spin++) {
             u32 _put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
             u32 _get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
             if (_get == _put) break;
 #ifdef _WIN32
-            Sleep(1);
+            /* Yield, don't timer-sleep: Sleep(1) is ~15ms on Windows and
+             * paced the whole guest (and its pad polling) to ~9 fps. */
+            if ((_spin & 0x3FF) == 0x3FF) Sleep(0); else YieldProcessor();
 #endif
         }
     }
