@@ -849,12 +849,8 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
      * before handing an EA to the RSX (Tiny3D's command ring lives in an
      * sys_mmapper region). Mirror that by mapping the 1MB page on first use. */
     if (address < 0x40000000u) {
-        static u32 s_io_auto_next = 0;
-        if (!s_io_auto_next)
-            s_io_auto_next = (s_config.ioSize + 0xFFFFFu) & ~0xFFFFFu;
         u32 ea_page = address & ~0xFFFFFu;
-        u32 io      = s_io_auto_next;
-        s_io_auto_next += 0x100000u;
+        u32 io      = gcm_io_alloc(0x100000u);
         populate_offset_table(ea_page, io, 0x100000u);
         printf("[cellGcmSys] AddressToOffset: auto-mapped ea 0x%08X -> io 0x%08X\n",
                ea_page, io);
@@ -865,6 +861,23 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
     vm_write32(off_ea, 0);
     return CELL_GCM_ERROR_FAILURE;
+}
+
+/* IO-offset space bump allocator for main-memory mappings. Starts PAST the
+ * Init command-buffer region: handing out io 0 (the old s_local_mem_allocated
+ * bump, which begins at 0) remapped the FIFO's own io page -- demosaic's
+ * cellGcmMapMainMemory(sys heap) got offset 0, io2ea(0) then resolved into its
+ * heap (all zeros) and the RSX walker consumed every frame's commands as
+ * no-ops (no draws, label fence never written, guest waited forever). */
+static u32 s_io_alloc_next = 0;
+static u32 gcm_io_alloc(u32 size)
+{
+    if (s_io_alloc_next == 0)
+        s_io_alloc_next = (s_config.ioSize + 0xFFFFFu) & ~0xFFFFFu;
+    if (s_io_alloc_next < 0x100000u) s_io_alloc_next = 0x100000u;
+    u32 io = s_io_alloc_next;
+    s_io_alloc_next += (size + 0xFFFFFu) & ~0xFFFFFu;
+    return io;
 }
 
 /* NID: 0x2A6FBA9C */
@@ -883,9 +896,8 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
 
     printf("[cellGcmSys] MapMainMemory(ea=0x%08X, size=0x%X)\n", ea, size);
 
-    /* Find a free IO offset region (bump allocate from local_mem_allocated) */
-    u32 io_offset = s_local_mem_allocated;
-    s_local_mem_allocated += size;
+    /* Allocate a fresh IO region past the Init command-buffer window. */
+    u32 io_offset = gcm_io_alloc(size);
 
     IoMapping* mapping = find_free_mapping();
     if (!mapping) {
