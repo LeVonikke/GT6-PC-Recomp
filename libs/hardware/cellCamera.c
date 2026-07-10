@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 extern void vm_write32(u32 addr, u32 value);
 extern u32  vm_read32(u32 addr);
@@ -46,6 +47,19 @@ static int s_initialized = 0;
 static int s_open        = 0;
 static int s_started     = 0;
 static u32 s_frame       = 0;
+
+/* PS3_CAMERA=0 reports no camera attached: camera-optional apps (wave) then
+ * fall back to their file-based input, matching RPCS3's no-camera behavior.
+ * Default stays attached -- demosaic's whole input is the virtual camera. */
+static int cam_present(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("PS3_CAMERA");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
 
 /* CellCameraInfoEx field offsets (all 4-byte fields, 32-bit guest ABI):
  * format@0 resolution@4 framerate@8 buffer@12 bytesize@16 width@20 height@24
@@ -70,6 +84,7 @@ s32 cellCameraOpenEx(s32 devNum, void* info)
     (void)devNum;
     u32 ea = (u32)(uintptr_t)info;
     if (!ea) return (s32)CELL_CAMERA_ERROR_INVALID_ARGUMENT;
+    if (!cam_present()) return (s32)CELL_CAMERA_ERROR_DEVICE_NOT_FOUND;
     /* The app requested format/resolution; always serve RAW8 VGA frames. */
     vm_write32(ea + 12, CAM_BUFFER_GUEST_EA);       /* buffer   */
     vm_write32(ea + 16, CAM_W * CAM_H);             /* bytesize */
@@ -177,8 +192,8 @@ s32 cellCameraReadEx(s32 devNum, CellCameraReadInfo* info)
     return CELL_OK;
 }
 
-s32 cellCameraIsAvailable(s32 devNum) { (void)devNum; return 1; }
-s32 cellCameraIsAttached(s32 devNum)  { (void)devNum; return 1; }
+s32 cellCameraIsAvailable(s32 devNum) { (void)devNum; return cam_present(); }
+s32 cellCameraIsAttached(s32 devNum)  { (void)devNum; return cam_present(); }
 s32 cellCameraIsOpen(s32 devNum)      { (void)devNum; return s_open; }
 s32 cellCameraIsStarted(s32 devNum)   { (void)devNum; return s_started; }
 
@@ -187,7 +202,9 @@ s32 cellCameraGetType(s32 devNum, s32* type)
     (void)devNum;
     u32 ea = (u32)(uintptr_t)type;
     if (!ea) return (s32)CELL_CAMERA_ERROR_INVALID_ARGUMENT;
-    vm_write32(ea, SDK_CAMERA_EYETOY2);
+    /* TYPE_UNKNOWN (0) routes camera-optional apps (wave) to their
+     * file-based input when PS3_CAMERA=0. */
+    vm_write32(ea, cam_present() ? SDK_CAMERA_EYETOY2 : 0);
     return CELL_OK;
 }
 

@@ -229,6 +229,10 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
          * 0-3; higher units clamp to 3 in the TEX emission below. */
         "Texture2D    rsx_tex0 : register(t0); Texture2D rsx_tex1 : register(t1);\n"
         "Texture2D    rsx_tex2 : register(t2); Texture2D rsx_tex3 : register(t3);\n"
+        /* Per-draw texcoord scale (b1): RSX textures with the UNnormalized
+         * flag are sampled in texel space; the backend supplies 1/size for
+         * those units and 1.0 for normalized ones. */
+        "cbuffer FPTex : register(b1) { float4 rsx_texscale[4]; };\n"
         "SamplerState rsx_samp0 : register(s0); SamplerState rsx_samp1 : register(s1);\n"
         "SamplerState rsx_samp2 : register(s2); SamplerState rsx_samp3 : register(s3);\n"
         "struct PSOut { float4 c0:SV_Target0; float4 c1:SV_Target1;\n"
@@ -406,13 +410,13 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
             snprintf(rhs, sizeof(rhs),
-                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy)",
-                     tex_unit & 3u, tex_unit & 3u, a);
+                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy * rsx_texscale[%u].xy)",
+                     tex_unit & 3u, tex_unit & 3u, a, tex_unit & 3u);
             break;
         case OP_TXP:
             snprintf(rhs, sizeof(rhs),
-                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy / (%s).w)",
-                     tex_unit & 3u, tex_unit & 3u, a, a);
+                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy / (%s).w * rsx_texscale[%u].xy)",
+                     tex_unit & 3u, tex_unit & 3u, a, a, tex_unit & 3u);
             break;
         case OP_KIL: {
             if (exec_cond != 0) {
