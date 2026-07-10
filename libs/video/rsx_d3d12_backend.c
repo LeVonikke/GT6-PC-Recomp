@@ -512,8 +512,13 @@ static int init_d3d12(u32 width, u32 height)
 
         D3D12_RESOURCE_DESC depth_desc = {0};
         depth_desc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        depth_desc.Width              = width;
-        depth_desc.Height             = height;
+        /* Sized to cover the LARGEST render target, not just the window:
+         * D3D12 clips rasterization to the smallest bound attachment, and
+         * this DSV is shared by every pass -- with a window-sized depth
+         * buffer, draws into larger offscreen RTs (wave's 1920x1080 input
+         * image) were silently cropped to the window rect. */
+        depth_desc.Width              = 2048;
+        depth_desc.Height             = 2048;
         depth_desc.DepthOrArraySize   = 1;
         depth_desc.MipLevels          = 1;
         depth_desc.Format             = DXGI_FORMAT_D24_UNORM_S8_UINT;
