@@ -37,21 +37,32 @@ extern "C" {
  * Naming: NV4097_SET_* for 3D methods, NV3062_SET_* for 2D methods
  * -----------------------------------------------------------------------*/
 
-/* Surface / render target configuration */
-#define NV4097_SET_SURFACE_FORMAT              0x00000200
-#define NV4097_SET_SURFACE_CLIP_HORIZONTAL     0x00000204
-#define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000208
+/* Surface / render target configuration (real NV4097 numbering -- RPCS3 /
+ * nouveau. The original table here was shuffled: only COLOR_AOFFSET was
+ * right, so SET_SURFACE_COLOR_TARGET (MRT selection) was never decoded and
+ * clip dims read the format register). */
+#define NV4097_SET_SURFACE_CLIP_HORIZONTAL     0x00000200
+#define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000204
+#define NV4097_SET_SURFACE_FORMAT              0x00000208
+#define NV4097_SET_SURFACE_PITCH_A             0x0000020C
 #define NV4097_SET_SURFACE_COLOR_AOFFSET       0x00000210
-#define NV4097_SET_SURFACE_COLOR_BOFFSET       0x00000214
-#define NV4097_SET_SURFACE_COLOR_COFFSET       0x00000218
-#define NV4097_SET_SURFACE_COLOR_DOFFSET       0x0000021C
-#define NV4097_SET_SURFACE_ZETA_OFFSET         0x00000220
-#define NV4097_SET_SURFACE_COLOR_TARGET        0x00000224
-#define NV4097_SET_SURFACE_PITCH_A             0x0000022C
-#define NV4097_SET_SURFACE_PITCH_B             0x00000230
-#define NV4097_SET_SURFACE_PITCH_C             0x00000234
-#define NV4097_SET_SURFACE_PITCH_D             0x00000238
-#define NV4097_SET_SURFACE_PITCH_Z             0x0000023C
+#define NV4097_SET_SURFACE_ZETA_OFFSET         0x00000214
+#define NV4097_SET_SURFACE_COLOR_BOFFSET       0x00000218
+#define NV4097_SET_SURFACE_PITCH_B             0x0000021C
+#define NV4097_SET_SURFACE_COLOR_TARGET        0x00000220
+#define NV4097_SET_SURFACE_PITCH_Z             0x0000022C
+#define NV4097_SET_SURFACE_PITCH_C             0x00000280
+#define NV4097_SET_SURFACE_PITCH_D             0x00000284
+#define NV4097_SET_SURFACE_COLOR_COFFSET       0x00000288
+#define NV4097_SET_SURFACE_COLOR_DOFFSET       0x0000028C
+
+/* SET_SURFACE_COLOR_TARGET values */
+#define CELL_GCM_SURFACE_TARGET_NONE  0x00
+#define CELL_GCM_SURFACE_TARGET_0     0x01
+#define CELL_GCM_SURFACE_TARGET_1     0x02
+#define CELL_GCM_SURFACE_TARGET_MRT1  0x13   /* A + B     */
+#define CELL_GCM_SURFACE_TARGET_MRT2  0x17   /* A + B + C */
+#define CELL_GCM_SURFACE_TARGET_MRT3  0x1F   /* A+B+C+D   */
 
 /* Viewport */
 #define NV4097_SET_VIEWPORT_HORIZONTAL         0x00000300

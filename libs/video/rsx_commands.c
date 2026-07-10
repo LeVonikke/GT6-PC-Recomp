@@ -136,6 +136,10 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_TARGET:
+        { static int _ct=0; if (_ct++ < 24 && getenv("RTT_DUMP"))
+            fprintf(stderr, "[RSXCT] color_target=0x%X offA=0x%X offB=0x%X offC=0x%X offD=0x%X%s",
+                    data, state->surface_color_offset[0], state->surface_color_offset[1],
+                    state->surface_color_offset[2], state->surface_color_offset[3], "\n"); }
         state->color_target = data;
         state->surface_dirty = 1;
         return 0;
@@ -288,7 +292,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", 0x03000000u+(s_sem_off&0xFFFFFF), val, data); }
         return 0;
       } }
-    if (method >= 0x200 && method <= 0x23C)
+    if ((method >= 0x200 && method <= 0x23C) ||
+        (method >= 0x280 && method <= 0x28C))
         return process_surface_method(state, method, data);
 
     /* Texture methods: 0x1A00..0x1A00 + 16*0x20 - 1 */
