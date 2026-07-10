@@ -64,9 +64,10 @@ extern "C" {
 #define CELL_GCM_SURFACE_TARGET_MRT2  0x17   /* A + B + C */
 #define CELL_GCM_SURFACE_TARGET_MRT3  0x1F   /* A+B+C+D   */
 
-/* Viewport */
-#define NV4097_SET_VIEWPORT_HORIZONTAL         0x00000300
-#define NV4097_SET_VIEWPORT_VERTICAL           0x00000304
+/* Viewport (real NV4097 numbering -- the old 0x300/0x304 values actually
+ * belong to the dither/alpha-test block, so viewport rects read garbage). */
+#define NV4097_SET_VIEWPORT_HORIZONTAL         0x00000A00
+#define NV4097_SET_VIEWPORT_VERTICAL           0x00000A04
 #define NV4097_SET_CLIP_MIN                    0x00000394
 #define NV4097_SET_CLIP_MAX                    0x00000398
 
@@ -106,7 +107,7 @@ extern "C" {
 /* shader_control bit: fragment colour exports come from r0/r2/r3/r4 (32-bit)
  * instead of h0/h4/h6/h8 (half). */
 #define CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS 0x00000040
-#define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF0
+#define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF4
 #define NV4097_SET_TRANSFORM_PROGRAM_LOAD       0x00001E9C
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
 #define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
@@ -117,36 +118,36 @@ extern "C" {
 #define RSX_MAX_VERTEX_CONSTANTS                512
 
 /* Color mask */
-#define NV4097_SET_COLOR_MASK                   0x00000028
+#define NV4097_SET_COLOR_MASK                   0x00000324
 
 /* Alpha test */
-#define NV4097_SET_ALPHA_TEST_ENABLE            0x00000104
-#define NV4097_SET_ALPHA_FUNC                   0x00000108
-#define NV4097_SET_ALPHA_REF                    0x0000010C
+#define NV4097_SET_ALPHA_TEST_ENABLE            0x00000304
+#define NV4097_SET_ALPHA_FUNC                   0x00000308
+#define NV4097_SET_ALPHA_REF                    0x0000030C
 
 /* Blending */
 #define NV4097_SET_BLEND_ENABLE                 0x00000310
-#define NV4097_SET_BLEND_FUNC_SFACTOR           0x00000344
-#define NV4097_SET_BLEND_FUNC_DFACTOR           0x00000348
-#define NV4097_SET_BLEND_EQUATION               0x0000034C
-#define NV4097_SET_BLEND_COLOR                  0x00000350
+#define NV4097_SET_BLEND_FUNC_SFACTOR           0x00000314
+#define NV4097_SET_BLEND_FUNC_DFACTOR           0x00000318
+#define NV4097_SET_BLEND_EQUATION               0x00000320
+#define NV4097_SET_BLEND_COLOR                  0x0000031C
 
 /* Depth / stencil */
-#define NV4097_SET_DEPTH_TEST_ENABLE            0x00000304
-#define NV4097_SET_DEPTH_FUNC                   0x00000308
-#define NV4097_SET_DEPTH_MASK                   0x0000030C
-#define NV4097_SET_STENCIL_TEST_ENABLE          0x00000360
-#define NV4097_SET_STENCIL_FUNC                 0x00000364
-#define NV4097_SET_STENCIL_FUNC_REF             0x00000368
-#define NV4097_SET_STENCIL_FUNC_MASK            0x0000036C
-#define NV4097_SET_STENCIL_OP_FAIL              0x00000370
-#define NV4097_SET_STENCIL_OP_ZFAIL             0x00000374
-#define NV4097_SET_STENCIL_OP_ZPASS             0x00000378
+#define NV4097_SET_DEPTH_TEST_ENABLE            0x00000A74
+#define NV4097_SET_DEPTH_FUNC                   0x00000A6C
+#define NV4097_SET_DEPTH_MASK                   0x00000A70
+#define NV4097_SET_STENCIL_TEST_ENABLE          0x00000328
+#define NV4097_SET_STENCIL_FUNC                 0x00000330
+#define NV4097_SET_STENCIL_FUNC_REF             0x00000334
+#define NV4097_SET_STENCIL_FUNC_MASK            0x00000338
+#define NV4097_SET_STENCIL_OP_FAIL              0x0000033C
+#define NV4097_SET_STENCIL_OP_ZFAIL             0x00000340
+#define NV4097_SET_STENCIL_OP_ZPASS             0x00000344
 
 /* Culling */
-#define NV4097_SET_CULL_FACE_ENABLE             0x000002BC
-#define NV4097_SET_CULL_FACE                    0x000002C0
-#define NV4097_SET_FRONT_FACE                   0x000002C4
+#define NV4097_SET_CULL_FACE_ENABLE             0x0000183C
+#define NV4097_SET_CULL_FACE                    0x00001830
+#define NV4097_SET_FRONT_FACE                   0x00001834
 
 /* Primitive types */
 #define RSX_PRIMITIVE_POINTS             1

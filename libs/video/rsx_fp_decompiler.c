@@ -174,6 +174,13 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
 {
     char base[96];
     if (s->type == FP_REG_TYPE_TEMP) {
+        /* h and r are modelled as SEPARATE register files. On hardware the
+         * h pairs overlay r bit-wise (h0 = r0.xy bits, h1 = r0.zw bits), so
+         * cgc code like dbgfont's [r0.w = coverage; h0 = colour; r0.w *=
+         * h0.w] works because the h0 write leaves r0.w's bits intact --
+         * a lane-wise alias (h[N] = r[N>>1]) clobbers it (cellmark text
+         * flooded white). Value-level cross-view reads are rare; keep the
+         * files separate and select the export bank via SET_SHADER_CONTROL. */
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
         snprintf(base, sizeof(base), "%s", input_expr(input_src));
@@ -488,9 +495,8 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
             snprintf(line + pos, sizeof(line) - pos, " }\n");
             out_puts(&o, line);
 
-            if (!(w0 & FP_OUT_NONE)) {
-                if (!dst_half && dst_idx == 0) wrote_r0 = 1;
-                if (dst_half  && dst_idx == 0) wrote_h0 = 1;
+            if (!(w0 & FP_OUT_NONE) && dst_idx == 0) {
+                if (dst_half) wrote_h0 = 1; else wrote_r0 = 1;
             }
         }
 
@@ -507,11 +513,10 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
      * height FP writes its result to h0 and uses r0 lanes as scratch --
      * heuristics picked r0 and the pond stayed flat forever). Unbound MRT
      * writes are discarded. */
-    /* h0 ALIASES r0 on hardware -- the control bit only picks the export
-     * view. With separate register files, honour the bit but fall back to
-     * whichever file the program actually wrote (PSL1GHT programs run with
-     * half-export control while writing r0). Secondary targets use the
-     * zero-init sum trick: only one of each aliased pair is ever written. */
+    /* Colour exports: SET_SHADER_CONTROL bit 0x40 selects the 32-bit bank
+     * (r0/r2/r3/r4) vs half (h0/h4/h6/h8); fall back to whichever file the
+     * program actually wrote for c0 (PSL1GHT runs half-export control over
+     * r0-writing programs). Secondaries use the zero-init sum trick. */
     if (exports32 ? wrote_r0 : !wrote_h0)
         out_puts(&o, "    PSOut _po; _po.c0 = r[0];\n");
     else
