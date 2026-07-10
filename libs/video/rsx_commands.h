@@ -102,6 +102,10 @@ extern "C" {
 
 /* Shader programs */
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
+#define NV4097_SET_SHADER_CONTROL               0x00001D60
+/* shader_control bit: fragment colour exports come from r0/r2/r3/r4 (32-bit)
+ * instead of h0/h4/h6/h8 (half). */
+#define CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS 0x00000040
 #define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF0
 #define NV4097_SET_TRANSFORM_PROGRAM_LOAD       0x00001E9C
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
@@ -260,6 +264,7 @@ typedef struct rsx_state {
     float viewport_offset[4];
     float viewport_scale[4];
     u32 shader_program;       /* fragment program address (offset | location in bits [0:1]) */
+    u32 shader_control;       /* SET_SHADER_CONTROL (0x40 = 32-bit colour exports) */
     u32 fragment_program_addr;
     u32 vertex_attrib_output_mask;
     u32 transform_program_load; /* vertex program load slot index */

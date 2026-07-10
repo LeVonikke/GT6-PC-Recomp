@@ -81,6 +81,10 @@ void rsx_state_init(rsx_state* state)
     state->alpha_func = 0x0207; /* ALWAYS */
     state->alpha_ref = 0;
 
+    /* Default shader control: 32-bit colour exports (r0..) -- matches every
+     * title that never programs the register. */
+    state->shader_control = CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS;
+
     /* Mark everything dirty */
     state->surface_dirty = 1;
     state->viewport_dirty = 1;
@@ -610,6 +614,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    if (method == NV4097_SET_SHADER_CONTROL) {
+        { static int _sc=0; if (_sc++ < 12 && getenv("RTT_DUMP"))
+            fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }
+        state->shader_control = data;
+        state->shader_dirty = 1;
+        return 0;
+    }
     if (method == NV4097_SET_INDEX_ARRAY_ADDRESS) {
         state->index_array_offset = data;
         return 0;
