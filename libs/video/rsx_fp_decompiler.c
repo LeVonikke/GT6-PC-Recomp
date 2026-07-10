@@ -240,7 +240,7 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
         /* Per-draw texcoord scale (b1): RSX textures with the UNnormalized
          * flag are sampled in texel space; the backend supplies 1/size for
          * those units and 1.0 for normalized ones. */
-        "cbuffer FPTex : register(b1) { float4 rsx_texscale[4]; };\n"
+        "cbuffer FPTex : register(b1) { float4 rsx_texscale[4]; float4 rsx_alphatest; };\n"
         "SamplerState rsx_samp0 : register(s0); SamplerState rsx_samp1 : register(s1);\n"
         "SamplerState rsx_samp2 : register(s2); SamplerState rsx_samp3 : register(s3);\n"
         "struct PSOut { float4 c0:SV_Target0; float4 c1:SV_Target1;\n"
@@ -522,7 +522,19 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
     else
         out_puts(&o, "    PSOut _po; _po.c0 = h[0];\n");
     out_puts(&o, "    _po.c1 = r[2] + h[4]; _po.c2 = r[3] + h[6];\n"
-                 "    _po.c3 = r[4] + h[8]; return _po;\n}\n");
+                 "    _po.c3 = r[4] + h[8];\n"
+        /* Guest alpha test (D3D12 has none fixed-function): func codes are
+         * RSX 0x200+f with f: 0=NEVER 1=LESS 2=EQUAL 3=LEQUAL 4=GREATER
+         * 5=NOTEQUAL 6=GEQUAL 7=ALWAYS. */
+        "    if (rsx_alphatest.x != 0.0) {\n"
+        "        float _a = _po.c0.a, _r = rsx_alphatest.y;\n"
+        "        int _f = (int)rsx_alphatest.z;\n"
+        "        bool _p = (_f == 7) || (_f == 1 && _a < _r) || (_f == 2 && _a == _r) ||\n"
+        "                  (_f == 3 && _a <= _r) || (_f == 4 && _a > _r) ||\n"
+        "                  (_f == 5 && _a != _r) || (_f == 6 && _a >= _r);\n"
+        "        if (!_p) discard;\n"
+        "    }\n"
+        "    return _po;\n}\n");
 
     if (!o.ok) return -1;
     return count;

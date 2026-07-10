@@ -68,6 +68,7 @@ typedef struct {
     /* VP path per-draw shader/texture state, captured at draw_arrays time. */
     u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
     int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
+    u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
     u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
                          * (wave's sim passes write single lanes of the height
                          * maps; ignoring the mask stomped persistent state) */
@@ -140,7 +141,11 @@ typedef struct {
     ID3DBlob* vs;
     int uses_c03;
 } VPVSEntry;
-#define VP_VS_CACHE 4
+#define VP_VS_CACHE 16  /* wave uses 5+ distinct VPs; at 4 the cache
+                         * thrashed every frame and eviction shifted slots
+                         * under recorded vs_idx values -- the display mesh
+                         * drew with the WRONG vertex program (sub-rect +
+                         * edge slivers instead of fullscreen) */
 
 /* Compiled guest-FP pipeline cache: decompiled VS (by cache slot) + decompiled
  * PS (fragment ucode at fp_addr). */
@@ -1605,6 +1610,18 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             }
             ts[_u*4+0] = sx; ts[_u*4+1] = sy; ts[_u*4+2] = 0.0f; ts[_u*4+3] = 0.0f;
         }
+        /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
+         * has no fixed alpha test; guest FPs discard on it dynamically
+         * (wave's colour wheel is a disc via alpha test -- without it the
+         * palette drew as an opaque square). */
+        if (dr) {
+            ts[16] = (float)((dr->alpha_ctl >> 16) & 1u);
+            ts[17] = (float)(dr->alpha_ctl & 0xFFu) / 255.0f;
+            ts[18] = (float)((dr->alpha_ctl >> 8) & 0x07u);
+            ts[19] = 0.0f;
+        } else {
+            ts[16] = 0.0f; ts[17] = 0.0f; ts[18] = 7.0f; ts[19] = 0.0f;
+        }
     }
     char* dst = (char*)s_d3d.vp_cb_mapped
         + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
@@ -3064,6 +3081,11 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                               | ((_cm & 0x00000001) ? 4u : 0u)   /* B */
                               | ((_cm & 0x01000000) ? 8u : 0u);  /* A */
                 }
+                dr->alpha_ctl = 0;
+                if (s_d3d.current_rsx_state)
+                    dr->alpha_ctl = ((s_d3d.current_rsx_state->alpha_test_enable ? 1u : 0u) << 16)
+                                  | ((s_d3d.current_rsx_state->alpha_func & 0xFFu) << 8)
+                                  | (s_d3d.current_rsx_state->alpha_ref & 0xFFu);
                 for (int _u = 0; _u < 4; _u++) {
                     dr->tex[_u].off = s_d3d.cur_texs[_u].off;
                     dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
@@ -3132,6 +3154,11 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                           | ((_cm & 0x00000001) ? 4u : 0u)   /* B */
                           | ((_cm & 0x01000000) ? 8u : 0u);  /* A */
             }
+            dr->alpha_ctl = 0;
+            if (s_d3d.current_rsx_state)
+                dr->alpha_ctl = ((s_d3d.current_rsx_state->alpha_test_enable ? 1u : 0u) << 16)
+                              | ((s_d3d.current_rsx_state->alpha_func & 0xFFu) << 8)
+                              | (s_d3d.current_rsx_state->alpha_ref & 0xFFu);
             for (int _u = 0; _u < 4; _u++) {
                 dr->tex[_u].off = s_d3d.cur_texs[_u].off;
                 dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
@@ -3232,6 +3259,11 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                       | ((_cm & 0x00000001) ? 4u : 0u)   /* B */
                       | ((_cm & 0x01000000) ? 8u : 0u);  /* A */
         }
+        dr->alpha_ctl = 0;
+        if (s_d3d.current_rsx_state)
+            dr->alpha_ctl = ((s_d3d.current_rsx_state->alpha_test_enable ? 1u : 0u) << 16)
+                          | ((s_d3d.current_rsx_state->alpha_func & 0xFFu) << 8)
+                          | (s_d3d.current_rsx_state->alpha_ref & 0xFFu);
         for (int _u = 0; _u < 4; _u++) {
             dr->tex[_u].off = s_d3d.cur_texs[_u].off;
             dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
