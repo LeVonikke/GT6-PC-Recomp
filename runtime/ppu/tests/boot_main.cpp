@@ -151,6 +151,7 @@ extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSys
 extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
+extern "C" int  cellGcm_take_flip_pending(void);  /* hoisted to file scope: clang-cl rejects block-scope extern "C" */
 
 static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 { ppu_guest_call(opd, a0, a1, a2, a3); }
@@ -189,7 +190,6 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * flip-count change after the drain raced the guest's next-frame
              * writes and showed empty or mixed batches. */
             {
-                extern "C" int cellGcm_take_flip_pending(void);
                 if (rsx_ok && cellGcm_take_flip_pending()) {
                     rsx_d3d12_backend_present();
                     last_flip = cellGcm_flip_request_count();
