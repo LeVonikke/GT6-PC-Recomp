@@ -82,7 +82,9 @@ extern "C" {
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
 #define NV4097_DRAW_ARRAYS                     0x00001814
-#define NV4097_DRAW_INDEX_ARRAY                0x00001820
+#define NV4097_SET_INDEX_ARRAY_ADDRESS         0x0000181C
+#define NV4097_SET_INDEX_ARRAY_DMA             0x00001820
+#define NV4097_DRAW_INDEX_ARRAY                0x00001824
 
 /* Vertex attributes */
 #define NV4097_SET_VERTEX_DATA_ARRAY_FORMAT     0x00001740
@@ -245,6 +247,12 @@ typedef struct rsx_state {
     /* Current draw state */
     u32 primitive_type;
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
+
+    /* Index array (SET_INDEX_ARRAY_ADDRESS/_DMA): offset is a raw RSX offset;
+     * dma bits [3:0] = location context (0=local 1=main via CELL_GCM_DMA ids),
+     * bits [7:4] = index type (0 = u32, 1 = u16). */
+    u32 index_array_offset;
+    u32 index_array_dma;
 
     /* Shader state */
     /* RSX viewport transform (SET_VIEWPORT_OFFSET 0x0A20 / _SCALE 0x0A30,

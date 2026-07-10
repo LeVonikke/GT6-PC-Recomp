@@ -610,17 +610,22 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    if (method == NV4097_SET_INDEX_ARRAY_ADDRESS) {
+        state->index_array_offset = data;
+        return 0;
+    }
+    if (method == NV4097_SET_INDEX_ARRAY_DMA) {
+        state->index_array_dma = data;
+        return 0;
+    }
     if (method == NV4097_DRAW_INDEX_ARRAY) {
-        /*
-         * Draw indexed command:
-         *   [23:0]  index buffer offset (in indices, not bytes)
-         *   [31:24] count - 1
-         */
-        u32 index_offset = data & 0xFFFFFF;
+        /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
+        u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
+        { static int _d=0; if (_d++ < 8) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
         if (s_backend && s_backend->draw_indexed)
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
-                                    index_offset, count);
+                                    first, count);
         return 0;
     }
 
