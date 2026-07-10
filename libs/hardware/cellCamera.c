@@ -170,6 +170,8 @@ s32 cellCameraRead(s32 devNum, u32* frame_num, u32* bytes_read)
     (void)devNum;
     if (!s_started) return (s32)CELL_CAMERA_ERROR_NOT_STARTED;
     s_frame++;
+    { static int _once = 0;
+      if (!_once++) printf("[cellCamera] frame reads begin\n"); }
     cam_fill_frame();
     u32 fea = (u32)(uintptr_t)frame_num;
     u32 bea = (u32)(uintptr_t)bytes_read;

@@ -68,6 +68,9 @@ typedef struct {
     /* VP path per-draw shader/texture state, captured at draw_arrays time. */
     u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
     int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
+    u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
+                         * (wave's sim passes write single lanes of the height
+                         * maps; ignoring the mask stomped persistent state) */
     /* Per-unit textures (t0-t3): decompiled FPs sample up to 4 units
      * (demosaic's interpolation passes read 3). Captured at draw time. */
     struct {
@@ -88,6 +91,10 @@ typedef struct {
     u32 rt_off2;        /* second colour target (MRT1), 0 = none */
     u32 rt_w, rt_h;     /* surface clip dims at record time (offscreen RT size) */
     u32 rt_fmt;         /* RSX surface colour format (SET_SURFACE_FORMAT [4:0]) */
+    /* Guest viewport rect at draw time (target pixels). Sub-viewport layouts
+     * (wave's debug tiles) position quads with this, not with constants --
+     * forcing full-target viewports drew every tile window-sized. */
+    u32 vp_x, vp_y, vp_w, vp_h;
     /* Ordered clear op (offscreen surfaces only; display clears stay the
      * frame-start backbuffer clear). is_clear records also set is_vp so the
      * legacy replay pass skips them. */
@@ -99,6 +106,7 @@ typedef struct {
  * pass N's output is sampled by pass N+1 and possibly by later frames. */
 typedef struct {
     ID3D12Resource*       res;
+    ID3D12Resource*       up;          /* init-upload staging (kept alive) */
     u32                   off, w, h;   /* raw RSX offset + dims */
     u32                   dxgi;        /* DXGI_FORMAT of the resource */
     D3D12_RESOURCE_STATES st;          /* tracked resource state */
@@ -149,6 +157,7 @@ typedef struct {
                              * constants per frame (wave's stamp position/
                              * amplitude) -- address-only keying served the
                              * stale compile forever. */
+    u32 cmask;              /* colour write mask (PSO key) */
     ID3D12PipelineState* pso;
 } VPFPEntry;
 #define VP_FP_CACHE 16
@@ -1281,7 +1290,7 @@ static int vp_get_vs(const rsx_state* st)
 }
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, int blend, int nrt,
-                                          DXGI_FORMAT rtfmt, int exp32)
+                                          DXGI_FORMAT rtfmt, int exp32, u32 cmask)
 {
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1318,7 +1327,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, int blend, in
             s_d3d.vp_fp[i].vs_hash == vs_hash && s_d3d.vp_fp[i].gen == s_d3d.vp_gen &&
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
-            s_d3d.vp_fp[i].ucode_hash == uhash)
+            s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask)
             return s_d3d.vp_fp[i].pso;
     static char hlsl[32768];
     int n = rsx_fp_decompile(vm_base + off, 4096, hlsl, sizeof(hlsl), exp32);
@@ -1332,6 +1341,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, int blend, in
             fprintf(f, " */\n%s\n", hlsl); fclose(f);
         } } }
 
+    /* Debug FP_ONE=<hex fp_addr>: force that program's colour output to
+     * all-ones (e.g. wave's colour-detect -> full mask -> island borders
+     * everywhere -> the water sim must visibly radiate if it works). */
+    { const char* f1 = getenv("FP_ONE");
+      if (f1 && (u32)strtoul(f1, NULL, 16) == fp_addr) {
+          char* rp = strstr(hlsl, "PSOut _po; _po.c0 = r[0];");
+          if (rp) memcpy(rp, "PSOut _po; _po.c0=(1).xxxx;", 27);
+      } }
     /* FP_FORCE=1: replace the translated body with solid magenta -- isolates
      * geometry/transform problems from texture/blend problems. */
     if (getenv("FP_FORCE")) {
@@ -1387,6 +1404,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, int blend, in
          * every MRT-B write would be masked off. Mirror RT0's blend state. */
         pd.BlendState.RenderTarget[_r] = pd.BlendState.RenderTarget[0];
     }
+    /* Guest colour write mask (RGBA nibble, already D3D-ordered). */
+    for (int _r = 0; _r < nrt; _r++)
+        pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask ? cmask : 0xF);
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     pd.DepthStencilState.DepthEnable = TRUE;
     pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
@@ -1419,6 +1439,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, int blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].rtfmt   = (u32)rtfmt;
     s_d3d.vp_fp[s_d3d.vp_fp_n].exp32   = exp32;
     s_d3d.vp_fp[s_d3d.vp_fp_n].ucode_hash = uhash;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp_n++;
     return pso;
@@ -1688,6 +1709,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         OffRT* r = &s_d3d.off_rt[slot];
         if (r->w == w && r->h == h && r->dxgi == (u32)want_fmt) { r->used = 1; return slot; }
         r->res->lpVtbl->Release(r->res); r->res = NULL;   /* dims/format changed */
+        if (r->up) { r->up->lpVtbl->Release(r->up); r->up = NULL; }
     } else {
         for (int i = 0; i < MAX_OFF_RTS; i++)
             if (!s_d3d.off_rt[i].res) { slot = i; break; }
@@ -1697,6 +1719,10 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             if (slot < 0) return -1;
             s_d3d.off_rt[slot].res->lpVtbl->Release(s_d3d.off_rt[slot].res);
             s_d3d.off_rt[slot].res = NULL;
+            if (s_d3d.off_rt[slot].up) {
+                s_d3d.off_rt[slot].up->lpVtbl->Release(s_d3d.off_rt[slot].up);
+                s_d3d.off_rt[slot].up = NULL;
+            }
         }
     }
     OffRT* r = &s_d3d.off_rt[slot];
@@ -1711,12 +1737,92 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     cv.Format = td.Format;
     if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
             s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
+            D3D12_RESOURCE_STATE_COPY_DEST, &cv,
             &IID_ID3D12Resource, (void**)&r->res)))
         return -1;
     r->off = off; r->w = w; r->h = h; r->dxgi = (u32)want_fmt;
-    r->st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    r->st = D3D12_RESOURCE_STATE_COPY_DEST;
     r->used = 1;
+
+    /* Populate the new RT from guest memory: titles CPU-initialise their
+     * render-target buffers (wave fills the height fields with texels of
+     * (0,0,0, 1.0f) -- the .w is 'inverse of mass'; from an all-zero GPU
+     * resource the water simulation can never boot). Guest data is
+     * big-endian and tightly packed. */
+    {
+        extern uint8_t* vm_base;
+        extern u32 cellGcmResolveOffset(u32);
+        u32 bpp = (want_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8u :
+                  (want_fmt == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16u :
+                  (want_fmt == DXGI_FORMAT_R32_FLOAT) ? 4u : 4u;
+        u32 pitch = (w * bpp + 255) & ~255u;
+        u32 src = cellGcmResolveOffset(off);
+        if (vm_base && src != 0xFFFFFFFFu) {
+            D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC bd = {0};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = (u64)pitch * h; bd.Height = 1; bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                    s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                    &IID_ID3D12Resource, (void**)&r->up))) {
+                void* mp = NULL; D3D12_RANGE nr = {0,0};
+                if (SUCCEEDED(r->up->lpVtbl->Map(r->up, 0, &nr, &mp)) && mp) {
+                    const u8* sp = vm_base + src;
+                    for (u32 y = 0; y < h; y++) {
+                        const u8* srow = sp + (u64)y * w * bpp;
+                        u8* drow = (u8*)mp + (u64)y * pitch;
+                        if (want_fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                            /* guest A8R8G8B8 (bytes A,R,G,B) -> R,G,B,A */
+                            for (u32 x = 0; x < w; x++) {
+                                drow[x*4+0] = srow[x*4+1];
+                                drow[x*4+1] = srow[x*4+2];
+                                drow[x*4+2] = srow[x*4+3];
+                                drow[x*4+3] = srow[x*4+0];
+                            }
+                        } else if (want_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                            for (u32 x = 0; x < w * 4; x++) {   /* u16 halves, BE */
+                                drow[x*2+0] = srow[x*2+1];
+                                drow[x*2+1] = srow[x*2+0];
+                            }
+                        } else {                                 /* u32 floats, BE */
+                            u32 nw = (w * bpp) / 4;
+                            for (u32 x = 0; x < nw; x++) {
+                                drow[x*4+0] = srow[x*4+3];
+                                drow[x*4+1] = srow[x*4+2];
+                                drow[x*4+2] = srow[x*4+1];
+                                drow[x*4+3] = srow[x*4+0];
+                            }
+                        }
+                    }
+                    r->up->lpVtbl->Unmap(r->up, 0, NULL);
+                    D3D12_TEXTURE_COPY_LOCATION cdst = {0}, csrc = {0};
+                    cdst.pResource = r->res;
+                    cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    csrc.pResource = r->up;
+                    csrc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    csrc.PlacedFootprint.Footprint.Format   = want_fmt;
+                    csrc.PlacedFootprint.Footprint.Width    = w;
+                    csrc.PlacedFootprint.Footprint.Height   = h;
+                    csrc.PlacedFootprint.Footprint.Depth    = 1;
+                    csrc.PlacedFootprint.Footprint.RowPitch = pitch;
+                    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &cdst, 0, 0, 0, &csrc, NULL);
+                }
+            }
+        }
+        {
+            D3D12_RESOURCE_BARRIER b = {0};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource   = r->res;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+            r->st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        }
+    }
 
     D3D12_CPU_DESCRIPTOR_HANDLE rh;
     s_d3d.rt_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rt_rtv_heap, &rh);
@@ -1903,9 +2009,10 @@ static void render_frame(void)
         fprintf(stderr, "[RTT] frame %d: %u ops\n", _f, s_d3d.draw_count);
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
             D3D12DrawRecord* r = &s_d3d.draws[_d];
-            fprintf(stderr, "[RTT]  op%02u %s rt=0x%X rt2=0x%X t0=0x%X t1=0x%X t2=0x%X fp=0x%X n=%u\n",
+            fprintf(stderr, "[RTT]  op%02u %s rt=0x%X rt2=0x%X t0=0x%X fp=0x%X n=%u cmask=%X vp=%u,%u %ux%u blend=%d\n",
                 _d, r->is_clear?"CLR ":(r->is_vp?"draw":"leg "), r->rt_off, r->rt_off2,
-                r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->fp_addr, r->vertex_count);
+                r->tex[0].raw, r->fp_addr, r->vertex_count,
+                r->cmask, r->vp_x, r->vp_y, r->vp_w, r->vp_h, r->blend);
         }
     } }
 
@@ -2003,7 +2110,7 @@ static void render_frame(void)
                                        dr->rt_off2 ? 2 : 1,
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32);
+                                       dr->fp_exp32, dr->cmask);
     }
 
     /* Transition render target to RENDER_TARGET state */
@@ -2196,9 +2303,29 @@ static void render_frame(void)
                                                 dr->rt_off2 ? 2 : 1,
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                dr->fp_exp32) : NULL;
+                                                dr->fp_exp32, dr->cmask) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
+                /* Per-draw viewport: the guest rect when sane, else the
+                 * full target. Scissor tracks the same rect. */
+                {
+                    float tw = (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].w : (float)s_d3d.width;
+                    float th = (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].h : (float)s_d3d.height;
+                    D3D12_VIEWPORT dvp = {0, 0, tw, th, 0.0f, 1.0f};
+                    if (dr->vp_w >= 2 && dr->vp_h >= 2 &&
+                        (float)(dr->vp_x + dr->vp_w) <= tw + 0.5f &&
+                        (float)(dr->vp_y + dr->vp_h) <= th + 0.5f) {
+                        dvp.TopLeftX = (float)dr->vp_x;
+                        dvp.TopLeftY = (float)dr->vp_y;
+                        dvp.Width    = (float)dr->vp_w;
+                        dvp.Height   = (float)dr->vp_h;
+                    }
+                    D3D12_RECT dsc = {(LONG)dvp.TopLeftX, (LONG)dvp.TopLeftY,
+                                      (LONG)(dvp.TopLeftX + dvp.Width),
+                                      (LONG)(dvp.TopLeftY + dvp.Height)};
+                    s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &dvp);
+                    s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &dsc);
+                }
                 /* Per-draw textures: bind this draw's t0-t3 SRV window.
                  * Any sampled offscreen RT transitions to PSR first (never
                  * one of the currently-bound colour targets). */
@@ -2370,6 +2497,24 @@ static void render_frame(void)
                         } else {
                             const u8* p8 = srow + (u64)x * 4;
                             rv = p8[0] / 255.0f; gv = p8[1] / 255.0f; bv = p8[2] / 255.0f;
+                        }
+                        /* RTT_SAVEA=1: show the alpha lane in RED (gates
+                         * like wave's mask.w live there). */
+                        if (getenv("RTT_SAVEA")) {
+                            float av;
+                            if (s_rtsave_dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                                const u16* hp16 = (const u16*)(srow + (u64)x * 8);
+                                u16 hv = hp16[3];
+                                u32 sign = (hv >> 15) & 1, exp = (hv >> 10) & 0x1F, man = hv & 0x3FF;
+                                if (exp == 0) av = (float)man / 16777216.0f;
+                                else { u32 fb = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13);
+                                       memcpy(&av, &fb, 4); }
+                            } else if (s_rtsave_dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+                                av = ((const float*)(srow + (u64)x * 16))[3];
+                            } else {
+                                av = (srow + (u64)x * 4)[3] / 255.0f;
+                            }
+                            rv = av;
                         }
                         /* |v| tonemap so signed heights are visible */
                         float ar = rv < 0 ? -rv : rv, ag = gv < 0 ? -gv : gv, ab = bv < 0 ? -bv : bv;
@@ -2911,6 +3056,14 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+                dr->cmask = 0xF;
+                if (s_d3d.current_rsx_state) {
+                    u32 _cm = s_d3d.current_rsx_state->color_mask;
+                    dr->cmask = ((_cm & 0x00010000) ? 1u : 0u)   /* R */
+                              | ((_cm & 0x00000100) ? 2u : 0u)   /* G */
+                              | ((_cm & 0x00000001) ? 4u : 0u)   /* B */
+                              | ((_cm & 0x01000000) ? 8u : 0u);  /* A */
+                }
                 for (int _u = 0; _u < 4; _u++) {
                     dr->tex[_u].off = s_d3d.cur_texs[_u].off;
                     dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
@@ -2926,6 +3079,12 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
                 dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, &dr->rt_off2);
                 dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
+                if (s_d3d.current_rsx_state) {
+                    dr->vp_x = s_d3d.current_rsx_state->viewport_x;
+                    dr->vp_y = s_d3d.current_rsx_state->viewport_y;
+                    dr->vp_w = s_d3d.current_rsx_state->viewport_w;
+                    dr->vp_h = s_d3d.current_rsx_state->viewport_h;
+                } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
                 s_d3d.draw_count++;
             }
@@ -2965,6 +3124,14 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+            dr->cmask = 0xF;
+            if (s_d3d.current_rsx_state) {
+                u32 _cm = s_d3d.current_rsx_state->color_mask;
+                dr->cmask = ((_cm & 0x00010000) ? 1u : 0u)   /* R */
+                          | ((_cm & 0x00000100) ? 2u : 0u)   /* G */
+                          | ((_cm & 0x00000001) ? 4u : 0u)   /* B */
+                          | ((_cm & 0x01000000) ? 8u : 0u);  /* A */
+            }
             for (int _u = 0; _u < 4; _u++) {
                 dr->tex[_u].off = s_d3d.cur_texs[_u].off;
                 dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
@@ -2980,6 +3147,12 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
             dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, &dr->rt_off2);
             dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
+            if (s_d3d.current_rsx_state) {
+                dr->vp_x = s_d3d.current_rsx_state->viewport_x;
+                dr->vp_y = s_d3d.current_rsx_state->viewport_y;
+                dr->vp_w = s_d3d.current_rsx_state->viewport_w;
+                dr->vp_h = s_d3d.current_rsx_state->viewport_h;
+            } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
             vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
             s_d3d.draw_count++;
         }
@@ -3051,6 +3224,14 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+        dr->cmask = 0xF;
+        if (s_d3d.current_rsx_state) {
+            u32 _cm = s_d3d.current_rsx_state->color_mask;
+            dr->cmask = ((_cm & 0x00010000) ? 1u : 0u)   /* R */
+                      | ((_cm & 0x00000100) ? 2u : 0u)   /* G */
+                      | ((_cm & 0x00000001) ? 4u : 0u)   /* B */
+                      | ((_cm & 0x01000000) ? 8u : 0u);  /* A */
+        }
         for (int _u = 0; _u < 4; _u++) {
             dr->tex[_u].off = s_d3d.cur_texs[_u].off;
             dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
@@ -3066,6 +3247,12 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
         dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, &dr->rt_off2);
         dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
+        if (s_d3d.current_rsx_state) {
+            dr->vp_x = s_d3d.current_rsx_state->viewport_x;
+            dr->vp_y = s_d3d.current_rsx_state->viewport_y;
+            dr->vp_w = s_d3d.current_rsx_state->viewport_w;
+            dr->vp_h = s_d3d.current_rsx_state->viewport_h;
+        } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
         vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
         s_d3d.draw_count++;
     }
