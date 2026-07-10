@@ -1614,7 +1614,11 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
          * has no fixed alpha test; guest FPs discard on it dynamically
          * (wave's colour wheel is a disc via alpha test -- without it the
          * palette drew as an opaque square). */
-        if (dr) {
+        if (dr && !getenv("NO_ALPHATEST")) {
+            { static int _at = 0;
+              if (((dr->alpha_ctl >> 16) & 1u) && _at++ < 4)
+                  printf("[ALPHATEST] enable func=%u ref=%u\n",
+                         (dr->alpha_ctl >> 8) & 0xFFu, dr->alpha_ctl & 0xFFu); }
             ts[16] = (float)((dr->alpha_ctl >> 16) & 1u);
             ts[17] = (float)(dr->alpha_ctl & 0xFFu) / 255.0f;
             ts[18] = (float)((dr->alpha_ctl >> 8) & 0x07u);
