@@ -98,6 +98,7 @@ int cellGcm_take_flip_pending(void)
     return v;
 }
 
+
 /* Configuration */
 static CellGcmConfig s_config;
 /* Offset pages (1MB) known to be LOCAL-memory-derived (set by
@@ -482,10 +483,10 @@ u32 cellGcmGetFlipStatus(void)
     /* Avoid host-calling the guest OPDs directly (they're not valid host
      * function pointers). Use cellGcmTickVBlank() / TickFlip() instead,
      * which dispatch via g_ps3_guest_caller — see below. */
-    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING) {
-        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-        s_last_flip_time = get_timestamp_ns();
-    }
+    /* Report the CURRENT status; cellGcmTickFlip (the ticker's 60Hz vblank
+     * beat) completes pending flips. The old self-completing version made
+     * every wait-for-flip loop exit on its first poll, so titles ran
+     * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
     return s_flip_status;
 }
 
@@ -533,6 +534,15 @@ static u32 gcm_io2ea(u32 io)
 
 /* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
  * recycle path teleports these when it resets a ring without a JUMP command. */
+unsigned long long ps3_ms_now(void)
+{
+#ifdef _WIN32
+    return (unsigned long long)GetTickCount64();
+#else
+    return 0;
+#endif
+}
+
 static u32 s_fifo_getoff  = 0;
 static u32 s_fifo_calloff = 0;
 
@@ -608,8 +618,34 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                subch, method);
 }
 
+/* Present gate for the ticker: a flip is ready once the drain has consumed
+ * everything up to put. The guest blocks in its own WaitFlip right after
+ * flipping, so the FIFO holds EXACTLY the completed frame -- no guest-side
+ * blocking needed (the old spin serialized two vsync-class waits per frame
+ * and halved the frame rate). Call AFTER draining. */
+int cellGcm_take_flip_pending_synced(void)
+{
+    if (!s_flip_pending) return 0;
+    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+    if (get != put) return 0;   /* frame not fully drained yet */
+    s_flip_pending = 0;
+    return 1;
+}
+
 void cellGcm_rsx_process_fifo(void)
 {
+    { static unsigned _n = 0; static unsigned long long _t0 = 0;
+      extern unsigned long long ps3_ms_now(void);
+      _n++;
+      if (getenv("GCM_RATE")) {
+          unsigned long long now = ps3_ms_now();
+          if (_t0 == 0) _t0 = now;
+          if (now - _t0 >= 2000) {
+              fprintf(stderr, "[RATE] drains/sec=%.0f\n", _n * 1000.0 / (now - _t0));
+              _n = 0; _t0 = now;
+          }
+      } }
     static rsx_state s_state;
     static int  s_inited = 0;
     extern u32 g_rsx_last_reference;
@@ -788,24 +824,6 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    /* Order the flip against the FIFO: this runs on the guest thread while
-     * the ticker thread drains, so the flip count can outrun the drain --
-     * the flip-gated present then shows an EMPTY or partial batch (wave:
-     * black flashes + layout flicker between frames). The guest flushed
-     * its frame before flipping, so wait (bounded) for get to reach put --
-     * which is also what a real GCM flip does. */
-    {
-        for (int _spin = 0; _spin < 400000; _spin++) {
-            u32 _put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
-            u32 _get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
-            if (_get == _put) break;
-#ifdef _WIN32
-            /* Yield, don't timer-sleep: Sleep(1) is ~15ms on Windows and
-             * paced the whole guest (and its pad polling) to ~9 fps. */
-            if ((_spin & 0x3FF) == 0x3FF) Sleep(0); else YieldProcessor();
-#endif
-        }
-    }
 
     s_current_display_buffer_id = bufferId;
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks

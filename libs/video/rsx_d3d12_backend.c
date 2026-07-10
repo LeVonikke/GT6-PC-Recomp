@@ -289,6 +289,8 @@ typedef struct {
 } D3D12State;
 
 static D3D12State s_d3d;
+char g_rsx_title_base[128] = "ps3recomp";
+static u32 s_dbg_last_draws = 0;
 
 /* ---------------------------------------------------------------------------
  * Win32 window
@@ -2385,6 +2387,7 @@ static void render_frame(void)
         }
     }
 
+    s_dbg_last_draws = s_d3d.draw_count;
     s_d3d.vb_offset  = 0; /* reset for next frame */
     s_d3d.vp_vb_offset = 0;
     s_d3d.draw_count = 0;
@@ -2566,6 +2569,27 @@ static void render_frame(void)
     move_to_next_frame();
 
     s_d3d.frame_count++;
+
+    /* RPCS3-style titlebar stats, refreshed once a second: presented FPS,
+     * draw count of the last frame, and the backbuffer size. */
+    {
+        static ULONGLONG s_tt0 = 0;
+        static u64 s_tframes = 0;
+        s_tframes++;
+        ULONGLONG tnow = GetTickCount64();
+        if (s_tt0 == 0) s_tt0 = tnow;
+        if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
+            extern char g_rsx_title_base[128];
+            char tb[256];
+            snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",
+                     g_rsx_title_base,
+                     s_tframes * 1000.0 / (double)(tnow - s_tt0),
+                     s_dbg_last_draws, s_d3d.width, s_d3d.height);
+            SetWindowTextA(s_d3d.hwnd, tb);
+            s_tframes = 0;
+            s_tt0 = tnow;
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -3453,6 +3477,11 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     }
 
     /* Create window */
+    {
+        extern char g_rsx_title_base[128];
+        snprintf(g_rsx_title_base, sizeof(g_rsx_title_base), "%s",
+                 title ? title : "ps3recomp");
+    }
     s_d3d.hwnd = create_window(width, height, title);
     if (!s_d3d.hwnd) {
         printf("[D3D12] ERROR: Window creation failed\n");
