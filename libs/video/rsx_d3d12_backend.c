@@ -3516,13 +3516,18 @@ void rsx_d3d12_backend_present(void)
         return;
 
     /* Same display gate as d3d12_present: a batch of offscreen pass work only
-     * (render-to-texture) keeps accumulating until its composite arrives. */
-    int has_display = (s_d3d.draw_count == 0);
+     * (render-to-texture) keeps accumulating until its composite arrives.
+     * Empty batches present only until the first real frame -- after that an
+     * empty present is a flip/drain race and wipes the screen for a frame
+     * (wave: black flashes and layout flicker between frames). */
+    static int s_seen_content = 0;
+    int has_display = (s_d3d.draw_count == 0 && !s_seen_content);
     for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
         if (!s_d3d.draws[_i].is_clear && s_d3d.draws[_i].rt_off == 0) {
             has_display = 1;
             break;
         }
+    if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
 
     if (s_d3d.initialized && has_display)
         render_frame();

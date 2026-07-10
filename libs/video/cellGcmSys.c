@@ -85,6 +85,18 @@ static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 static CellGcmDisplayInfo s_display_buffers[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
 static int s_display_buffer_set[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
 static u32 s_current_display_buffer_id = 0;
+/* Set by the flip (guest thread, at a get==put frame boundary); consumed by
+ * the ticker, which presents the accumulated batch BEFORE draining further --
+ * presenting on a raw flip-count change raced the drain and showed empty or
+ * mixed batches (wave: black flashes, layout flicker). */
+static volatile int s_flip_pending = 0;
+
+int cellGcm_take_flip_pending(void)
+{
+    int v = s_flip_pending;
+    s_flip_pending = 0;
+    return v;
+}
 
 /* Configuration */
 static CellGcmConfig s_config;
@@ -776,10 +788,28 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
+    /* Order the flip against the FIFO: this runs on the guest thread while
+     * the ticker thread drains, so the flip count can outrun the drain --
+     * the flip-gated present then shows an EMPTY or partial batch (wave:
+     * black flashes + layout flicker between frames). The guest flushed
+     * its frame before flipping, so wait (bounded) for get to reach put --
+     * which is also what a real GCM flip does. */
+    {
+        for (int _spin = 0; _spin < 200; _spin++) {
+            u32 _put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+            u32 _get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+            if (_get == _put) break;
+#ifdef _WIN32
+            Sleep(1);
+#endif
+        }
+    }
+
     s_current_display_buffer_id = bufferId;
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
     s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
