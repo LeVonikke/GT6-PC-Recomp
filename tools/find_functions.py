@@ -264,12 +264,16 @@ class FunctionFinder:
         for func in self.functions.values():
             bl_targets.update(func.calls)
 
-        # Also scan instructions for bl -- but only trust calls that sit
-        # inside an already-detected function (raw data in the executable
-        # segment decodes into phantom bl instructions otherwise).
+        # Also scan instructions for bl. A `bl` is an unambiguous call, so its
+        # target is a function start by construction -- unlike the conditional
+        # branches in find_branch_target_functions, whose targets are usually just
+        # basic blocks. That makes it safe to trust every bl in the code span,
+        # rather than only those inside an already-detected function; see
+        # _code_span_fn for why the tighter test silently loses real functions.
         covered = self._coverage_fn()
+        in_code = self._code_span_fn()
         for insn in self.instructions:
-            if _is_bl(insn) and covered(insn.addr):
+            if _is_bl(insn) and (covered(insn.addr) or in_code(insn.addr)):
                 target = _bl_target(insn)
                 if target is not None:
                     bl_targets.add(target)
@@ -323,6 +327,32 @@ class FunctionFinder:
             return i >= 0 and addr < ends[i]
 
         return covered
+
+    def _code_span_fn(self):
+        """Return an addr-is-inside-the-.opd-span predicate, for trusting `bl` sources.
+
+        `covered()` alone is too tight: a function is only ever scanned to its FIRST
+        blr, so the tail of every early-returning function reads as "not a function"
+        -- and any `bl` sitting there is discarded along with its callee. Measured
+        against the Dungeon Siege III debug build's .symtab, that lost 1,723 real
+        functions (96.1% recall), among them a 15 KB PhysX contact routine and a 9 KB
+        Wwise mixer -- each silently swallowed into a neighbour by the lifter.
+
+        The span is taken from the .opd seeds *only*. They are descriptor table
+        entries, so every one is a genuine code address -- unlike a prologue anchor,
+        which can be data that happened to decode like one. That matters here because
+        .rodata and .spu_image share the executable segment: bounding the span by
+        prologue anchors lets it run into .rodata (0x00C059CC on DS3) and re-admits
+        the phantom branches this guard exists to reject. .opd stops at the end of
+        .text, which is where the calls are.
+
+        No seeds (--no-opd, or a raw binary) means no span, and the caller falls back
+        to `covered()` -- i.e. exactly the old behaviour.
+        """
+        if not self.seeds:
+            return lambda addr: False
+        lo, hi = min(self.seeds), max(self.seeds)
+        return lambda addr: lo <= addr <= hi
 
     def find_branch_target_functions(self) -> None:
         """Third pass: find branch targets that fall outside known function boundaries.
