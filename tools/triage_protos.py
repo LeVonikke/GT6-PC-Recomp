@@ -73,7 +73,17 @@ def sz_listing(sevenzip: str, container: str) -> list[str]:
     return r.stdout.splitlines()
 
 
-def extract_eboot(sevenzip, container, workdir) -> tuple[str | None, str]:
+def _nested_image(lines: list[str]) -> str | None:
+    """First disc-image entry name (Name is the last column of `7z l` rows)."""
+    for ln in lines:
+        name = ln[53:].strip() if len(ln) > 53 else ""
+        if name and os.path.splitext(name)[1].lower() in (".gcm", ".iso", ".pkg"):
+            return name
+    return None
+
+
+def extract_eboot(sevenzip, container, workdir, descend=False, pkg_timeout=1800,
+                  depth=0) -> tuple[str | None, str]:
     """Return (eboot_path_or_None, note). Cheapest path per container type."""
     ext = os.path.splitext(container)[1].lower()
 
@@ -83,9 +93,9 @@ def extract_eboot(sevenzip, container, workdir) -> tuple[str | None, str]:
         try:
             subprocess.run([sys.executable, os.path.join(HERE, "pkg_extract.py"),
                             container, out, "--only", "EBOOT.BIN"],
-                           capture_output=True, text=True, timeout=600)
+                           capture_output=True, text=True, timeout=pkg_timeout)
         except subprocess.TimeoutExpired:
-            return None, "pkg extract timed out"
+            return None, f"pkg extract timed out (>{pkg_timeout}s)"
         hits = glob.glob(os.path.join(out, "**", "EBOOT.BIN"), recursive=True)
         return (hits[0] if hits else None), ("" if hits else "no EBOOT in pkg")
 
@@ -97,10 +107,24 @@ def extract_eboot(sevenzip, container, workdir) -> tuple[str | None, str]:
         return eb, ""
 
     # Archive with no direct EBOOT: is it wrapping a disc image?
-    listing = "\n".join(sz_listing(sevenzip, container)).lower()
-    if any(e in listing for e in (".gcm", ".iso", ".pkg")):
+    lines = sz_listing(sevenzip, container)
+    img = _nested_image(lines)
+    if not img:
+        return None, "no EBOOT found"
+    if not descend or depth > 1:
         return None, "nested disc image (use --descend)"
-    return None, "no EBOOT found"
+
+    # Extract just the nested image (the GB cost), then recurse into it. A fresh
+    # subdir keeps the big image isolated so main()'s cleanup reclaims it per title.
+    sub = os.path.join(workdir, f"nested{depth}")
+    os.makedirs(sub, exist_ok=True)
+    subprocess.run([sevenzip, "e", container, f"-o{sub}", "-y", os.path.basename(img)],
+                   capture_output=True, text=True)
+    inner = os.path.join(sub, os.path.basename(img))
+    if not os.path.isfile(inner):
+        return None, "nested image extract failed"
+    eb, note = extract_eboot(sevenzip, inner, sub, descend, pkg_timeout, depth + 1)
+    return eb, (note or "(via nested disc)")
 
 
 def classify(eboot_path: str, workdir: str):
@@ -152,6 +176,8 @@ def main() -> int:
                     help="Also unpack nested disc images inside archives (extracts GBs)")
     ap.add_argument("--settle", type=float, default=4.0,
                     help="Seconds to watch a file's size before trusting it (default 4)")
+    ap.add_argument("--pkg-timeout", type=int, default=1800,
+                    help="Seconds to allow pkg_extract per .pkg (default 1800)")
     ap.add_argument("--keep-elf", metavar="DIR",
                     help="Save each debug build's unwrapped EBOOT.elf here for mining")
     args = ap.parse_args()
@@ -178,12 +204,9 @@ def main() -> int:
         if not stable(c, args.settle):
             print(f"{title:44} {ext:6} {'DOWNLOADING':16} {'-':>7} {'-':5}  size changing / locked")
             continue
-        if ext in (".iso", ".gcm", ".pkg") and not args.descend and ext != ".pkg":
-            # standalone disc images are cheap for 7z (seeks); only skip nested ones.
-            pass
         work = tempfile.mkdtemp(prefix="triage_")
         try:
-            eb, note = extract_eboot(sevenzip, c, work)
+            eb, note = extract_eboot(sevenzip, c, work, args.descend, args.pkg_timeout)
             if not eb:
                 print(f"{title:44} {ext:6} {'-':16} {'-':>7} {'-':5}  {note}")
                 continue
