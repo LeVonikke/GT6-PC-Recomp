@@ -432,6 +432,12 @@ s32 cellSync2SemaphoreGetValue(const CellSync2Semaphore* sem, s32* value)
 s32 cellSync2QueueAttributeInitialize(CellSync2QueueAttribute* attr)
 {
     if (!attr) return CELL_SYNC2_ERROR_NULL_POINTER;
+    /* ponytail: writes the correct 128-byte ABI layout, but like the rest of this
+     * module it does NOT translate the guest EA (GUEST_PTR) or byte-swap to
+     * big-endian -- cellSync2QueueInit ignores attr, so nothing consumes these bytes
+     * yet. Add GUEST_PTR + be_t writes here (and module-wide) if a title starts
+     * reading the attribute back. */
+    memset(attr, 0, sizeof(*attr));
     attr->maxPushWaiters = 32;
     attr->maxPopWaiters  = 32;
     return CELL_OK;

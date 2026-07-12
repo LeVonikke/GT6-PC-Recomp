@@ -492,6 +492,15 @@ class NIDDatabase:
             self.load_implemented()
         except Exception:                          # repo not present / unreadable
             pass
+        # Names recovered from debug-build symbol tables, each validated by
+        # compute_nid(name) == a NID the same builds actually import (see
+        # tools/nid_harvest.py). +371 firmware NIDs -> ~70% of the proto corpus.
+        proto_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "nid_from_protos.json")
+        try:
+            self.load_json(proto_db)
+        except Exception:                          # file absent / unreadable
+            pass
 
     def load_implemented(self, repo_root: str | None = None) -> int:
         """Add every exported (cell*/sys*/sce*) function DEFINED in the repo's

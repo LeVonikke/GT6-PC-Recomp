@@ -2494,10 +2494,30 @@ class PPULifter:
                     f"float r[4]; for(int i=0;i<4;i++) r[i]=1.0f/sqrtf(vrf(b,i)); "
                     f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
-        if mn == "vrfim":  # round to FP integer toward -inf (floor); vrfim is vD,vB
+        # Merge note: research/proto-builds added vexptefp/vlogefp/vrfin/vrfiz/vrfip
+        # (from the objdump decoder audit) but wrote them with raw `float*` casts,
+        # which would silently undo the VMX big-endian lane fix on this branch. Keep
+        # the new opcodes, express them through the lane-safe vrf/vstf accessors like
+        # every other float op here.
+        if mn == "vexptefp":  # 2^x estimate (vD, vB)
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])
             return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
-                    f"float r[4]; for(int i=0;i<4;i++) r[i]=floorf(vrf(b,i)); "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]=exp2f(vrf(b,i)); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
+
+        if mn == "vlogefp":  # log2 estimate (vD, vB)
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]=log2f(vrf(b,i)); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
+
+        # Round to FP integer (all vD, vB): nearest / toward zero / +inf / -inf.
+        if mn in ("vrfin", "vrfiz", "vrfip", "vrfim"):
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            fn = {"vrfin": "rintf", "vrfiz": "truncf",
+                  "vrfip": "ceilf", "vrfim": "floorf"}[mn]
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]={fn}(vrf(b,i)); "
                     f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
         # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int).

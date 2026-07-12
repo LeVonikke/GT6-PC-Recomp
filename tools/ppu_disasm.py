@@ -956,9 +956,13 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         vmx_vx = {
             # Float arithmetic
             10: "vaddfp", 74: "vsubfp",
-            266: "vrefp", 330: "vrsqrtefp",
             1034: "vmaxfp", 1098: "vminfp",
-            714: "vrfim",  # round to FP integer toward -inf (floor)
+            # Float estimate family (vD, vB; step-64 XOs). vexptefp/vlogefp were
+            # decoding as vmx_x394/x458 -- found by diffing against spu/ppu-lv2-objdump
+            # over 17M instructions of retail code (objdump_audit.py).
+            266: "vrefp", 330: "vrsqrtefp", 394: "vexptefp", 458: "vlogefp",
+            # Round to FP integer (vD, vB; step-64 XOs): nearest / zero / +inf / -inf.
+            522: "vrfin", 586: "vrfiz", 650: "vrfip", 714: "vrfim",
 
             # Integer add/sub
             0: "vaddubm", 64: "vadduhm", 128: "vadduwm",
