@@ -134,13 +134,21 @@
     "cellSailGraphicsAdapterFinalize": "0x76488BB1",
     "cellSailGraphicsAdapterGetFormat": "0xFFD58AA4",
     "cellSailGraphicsAdapterGetFrame": "0x0247C69E",
+    "cellSailGraphicsAdapterGetFrame2": "0x018281A8",
     "cellSailGraphicsAdapterInitialize": "0x1C983864",
     "cellSailGraphicsAdapterPtsToTimePosition": "0x1872331B",
     "cellSailGraphicsAdapterSetPreferredFormat": "0x2E3CCB5E",
     "cellSailGraphicsAdapterUpdateAvSync": "0x44A20E79",
     "cellSailPlayerFinalize": "0x18B4629D",
     "cellSailPlayerInitialize": "0x17932B26",
-    "cellSailPlayerReplaceEventHandler": "0x47632810"
+    "cellSailPlayerReplaceEventHandler": "0x47632810",
+    "cellSailPlayerSetParameter": "0x5F7C7A6F",
+    "cellSailSoundAdapterFinalize": "0xD1462438",
+    "cellSailSoundAdapterGetFormat": "0xF25F197D",
+    "cellSailSoundAdapterGetFrame": "0x7EB8D6B5",
+    "cellSailSoundAdapterInitialize": "0x3D0D3B72",
+    "cellSailSoundAdapterPtsToTimePosition": "0x4AE979DF",
+    "cellSailSoundAdapterUpdateAvSync": "0xEEC22809"
   },
   "cellSaveData": {
     "cellSaveDataGetListItem": "0x04C06FC2",
