@@ -1931,10 +1931,23 @@ class PPULifter:
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) d[i]=1.0f/sqrtf(b[i]); }}")
 
-        if mn == "vrfim":  # round to FP integer toward -inf (floor); vrfim is vD,vB
+        if mn == "vexptefp":  # 2^x estimate (vD, vB)
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=floorf(b[i]); }}")
+                    f"for(int i=0;i<4;i++) d[i]=exp2f(b[i]); }}")
+
+        if mn == "vlogefp":  # log2 estimate (vD, vB)
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=log2f(b[i]); }}")
+
+        # Round to FP integer (all vD, vB): nearest / toward zero / +inf / -inf.
+        if mn in ("vrfin", "vrfiz", "vrfip", "vrfim"):
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            fn = {"vrfin": "rintf", "vrfiz": "truncf",
+                  "vrfip": "ceilf", "vrfim": "floorf"}[mn]
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]={fn}(b[i]); }}")
 
         # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int)
         if mn == "vcfsx" or mn == "vcfux":
