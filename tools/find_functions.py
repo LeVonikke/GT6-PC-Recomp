@@ -392,8 +392,20 @@ class FunctionFinder:
             if not covered(target) and target not in self.functions:
                 new_targets.append(target)
 
-        # Create minimal functions for uncovered targets
+        # A branch target that survives extend_function_extents (i.e. is still
+        # uncovered) is only a real function if it independently looks like one:
+        # a call target, an .opd/entry seed, or a prologue. A bare conditional-branch
+        # target with none of those is a basic block, not a function -- promoting it
+        # is exactly the phantom-inflation this gate prevents.
+        bl_targets = self._all_bl_targets()
+
+        def looks_like_function(addr: int) -> bool:
+            return addr in bl_targets or addr in self.seeds or self._has_prologue(addr)
+
+        # Create minimal functions for uncovered targets that look like functions.
         for target in new_targets:
+            if not looks_like_function(target):
+                continue
             idx = self._addr_to_idx.get(target)
             if idx is None:
                 continue
@@ -424,6 +436,90 @@ class FunctionFinder:
                 if t is not None:
                     targets.add(t)
         return targets
+
+    def _cfg_target(self, insn) -> int | None:
+        """Direct branch target of a b/bc-family instruction (NOT bl/blr/bctr*), else
+        None -- i.e. an intra-function control-flow edge, not a call or return."""
+        mn = insn.mnemonic
+        if not mn.startswith("b") or mn in ("bl", "blr", "bctr", "bctrl", "blrl"):
+            return None
+        for p in insn.operands.split(","):
+            p = p.strip()
+            if p.startswith("0x"):
+                try:
+                    return int(p, 16)
+                except ValueError:
+                    return None
+        return None
+
+    def _has_prologue(self, addr: int) -> bool:
+        """True if addr begins with a standard function prologue (mflr r0, or a
+        stdu r1 frame alloc), the shape a real function start has and a mid-function
+        basic block does not."""
+        idx = self._addr_to_idx.get(addr)
+        if idx is None:
+            return False
+        if _is_mflr_r0(self.instructions[idx]) or _is_stack_alloc(self.instructions[idx]):
+            return True
+        for k in range(idx + 1, min(idx + 3, len(self.instructions))):
+            if _is_mflr_r0(self.instructions[k]):
+                return True
+        return False
+
+    def extend_function_extents(self) -> int:
+        """Grow each function to cover the basic blocks it actually branches into.
+
+        Detection ends a function at its FIRST blr, so blocks after an early return
+        (the cold path of an `if`, a loop tail) are left 'uncovered' -- and the
+        branch-target pass then mis-promotes each to a phantom function. On branchy
+        engines (UE3) that inflated Gears of War 3 to 111k detected vs 57k real
+        functions. Coverage here follows the intra-function CFG *only*: from the
+        entry, walk basic blocks, following forward b/bc edges that stay within
+        [start, next start), and set the end to the furthest instruction reached.
+        Because it never runs past the last reachable block, it does NOT sweep in
+        the inter-function padding/data that blind end-extension would (the hazard
+        apply_seeds warns about)."""
+        starts = sorted(self.functions)
+        idx_of = self._addr_to_idx
+        insns = self.instructions
+        n = len(insns)
+        grown = 0
+        for i, start in enumerate(starts):
+            func = self.functions[start]
+            cap = starts[i + 1] if i + 1 < len(starts) else \
+                (insns[-1].addr + 4 if insns else start + 4)
+            if idx_of.get(start) is None:
+                continue
+            seen: set[int] = set()
+            work = [start]
+            max_end = func.end
+            while work:
+                b = work.pop()
+                if b in seen or not (start <= b < cap):
+                    continue
+                seen.add(b)
+                j = idx_of.get(b)
+                if j is None:
+                    continue
+                while j < n:
+                    insn = insns[j]
+                    a = insn.addr
+                    if a >= cap:
+                        break
+                    if a + 4 > max_end:
+                        max_end = a + 4
+                    t = self._cfg_target(insn)
+                    if t is not None and start <= t < cap:
+                        work.append(t)
+                    mn = insn.mnemonic
+                    if _is_blr(insn) or mn in ("b", "ba", "bctr"):
+                        break                      # unconditional end of this block
+                    j += 1
+            new_end = min(max(max_end, func.end), cap)
+            if new_end > func.end:
+                func.end = new_end
+                grown += 1
+        return grown
 
     def apply_seeds(self) -> int:
         """Register every seed address (.opd descriptors, ELF entry) as a
@@ -519,11 +615,9 @@ class FunctionFinder:
         _note(f"leaf pass: {len(self.functions)} functions "
               f"({time.time() - t:.1f}s)")
 
-        t = time.time()
-        self.find_branch_target_functions()
-        _note(f"branch-target pass: {len(self.functions)} functions "
-              f"({time.time() - t:.1f}s)")
-
+        # Seeds (.opd/entry) first, so they are anchors for the extent + branch
+        # passes; then grow every function over its own basic blocks so early-return
+        # tails are covered, not mis-promoted to phantoms by the branch-target pass.
         if self.seeds:
             t = time.time()
             added = self.apply_seeds()
@@ -532,6 +626,16 @@ class FunctionFinder:
             _note(f"seed pass: +{added} seeded starts, "
                   f"-{dropped} prologue slivers -> {len(self.functions)} "
                   f"({time.time() - t:.1f}s)")
+
+        t = time.time()
+        grown = self.extend_function_extents()
+        _note(f"extent pass: {grown} functions grown over their basic blocks "
+              f"({time.time() - t:.1f}s)")
+
+        t = time.time()
+        self.find_branch_target_functions()
+        _note(f"branch-target pass: {len(self.functions)} functions "
+              f"({time.time() - t:.1f}s)")
 
         t = time.time()
         clipped = self.clip_overlaps()
