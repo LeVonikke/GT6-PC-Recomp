@@ -5,6 +5,7 @@
 #include "sys_ppu_thread.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv */
 
 /* ---------------------------------------------------------------------------
  * Globals

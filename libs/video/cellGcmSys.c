@@ -133,7 +133,7 @@ static u32 s_second_v_handler_opd = 0;
  * base instead of the real handler. Capture-at-registration + dispatch by
  * code+toc runs the real lifted handler regardless. */
 extern uint32_t ppu_active_lr(void);
-extern unsigned vm_read32(unsigned long long);
+/* vm_read32 comes from ppu_memory.h (uint32_t EA); no local extern. */
 extern unsigned long long ppu_guest_call_ct(u32 code, u32 toc, u64 a0, u64 a1, u64 a2, u64 a3);
 static u32 s_flip_handler_code=0,   s_flip_handler_toc=0;
 static u32 s_vblank_handler_code=0, s_vblank_handler_toc=0;
