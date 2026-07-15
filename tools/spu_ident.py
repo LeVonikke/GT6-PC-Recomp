@@ -113,6 +113,79 @@ def _text_hash(blob: bytes) -> str:
     return hashlib.sha1(blob).hexdigest()
 
 
+def spu_elf_layout(blob: bytes) -> dict | None:
+    """Parse an SPU ELF32 (big-endian) into the code/data-partition landmarks a matcher
+    needs: entry PC, code base (.init), .text range, where data (.rodata) starts, and the
+    loaded footprint (max non-NOBITS extent -- .bss beyond it is zeroed, not DMA'd). None
+    if the blob is not a parseable SPU ELF (a raw job binary)."""
+    if blob[:4] != b"\x7fELF" or len(blob) < 0x34:
+        return None
+    if struct.unpack_from(">H", blob, 18)[0] != SPU_MACHINE:
+        return None
+    shoff = struct.unpack_from(">I", blob, 0x20)[0]
+    shent, shnum, shstrndx = struct.unpack_from(">HHH", blob, 0x2E)
+    if shoff + shnum * shent > len(blob):
+        return None
+    sname_off, ssz = struct.unpack_from(">II", blob, shoff + shstrndx * shent + 16)
+    shstr = blob[sname_off:sname_off + ssz]
+    code_lo, code_hi, load_hi = None, 0, 0
+    text = data_start = None
+    for i in range(shnum):
+        b = shoff + i * shent
+        _no, typ, _fl, addr, off, size = struct.unpack_from(">IIIIII", blob, b)
+        z = shstr.find(b"\0", _no)
+        nm = shstr[_no:z]
+        if nm == b".text":
+            text = (off, size, addr)
+        elif nm == b".rodata" and data_start is None:
+            data_start = addr
+        if nm in (b".init", b".text", b".fini") and size:
+            code_lo = addr if code_lo is None else min(code_lo, addr)
+            code_hi = max(code_hi, addr + size)
+        if typ != 8 and size:                      # SHT_NOBITS (.bss) is not loaded
+            load_hi = max(load_hi, addr + size)
+    if text is None:
+        return None
+    t_off, t_sz, t_addr = text
+    return {
+        "entry_pc": struct.unpack_from(">I", blob, 0x18)[0],
+        "code_base": code_lo, "text_ls": t_addr, "text_end": t_addr + t_sz,
+        "data_start": data_start, "load_footprint": load_hi, "text_size": t_sz,
+        "text_sha1": hashlib.sha1(blob[t_off:t_off + t_sz]).hexdigest(),
+    }
+
+
+def fingerprint_table(elf, min_size: int = 16) -> list[dict]:
+    """Per embedded SPU image: the layout + .text fingerprint (SPU-ELFs) or a whole-blob
+    hash (raw job binaries), so a flat local-store dump can be labelled by matching its
+    code region. Symbols smaller than min_size are skipped (stray data symbols that share
+    the _binary_ naming)."""
+    syms = _all_symbols(elf)
+    starts = {k[:-6]: v for k, v in syms.items()
+              if k.startswith("_binary_") and k.endswith("_start")}
+    ends = {k[:-4]: v for k, v in syms.items()
+            if k.startswith("_binary_") and k.endswith("_end")}
+    rows = []
+    for key, start in sorted(starts.items(), key=lambda kv: kv[1]):
+        end = ends.get(key)
+        if not end or end - start < min_size:
+            continue
+        blob = read_vaddr(elf, start, end - start)
+        if not blob:
+            continue
+        name = _clean_name(key[len("_binary_"):])
+        cat, advice = classify(name)
+        lay = spu_elf_layout(blob)
+        if lay:
+            rows.append({"name": name, "format": "spu-elf",
+                         "category": cat, "advice": advice, **lay})
+        else:
+            rows.append({"name": name, "format": "raw", "category": cat,
+                         "advice": advice, "blob_size": len(blob),
+                         "blob_sha1": hashlib.sha1(blob).hexdigest()})
+    return rows
+
+
 def embedded_spu_images(elf) -> list[dict]:
     """Every embedded SPU image: name (best available), category, size, text hash."""
     syms = _all_symbols(elf)
@@ -150,12 +223,32 @@ def main() -> int:
     ap.add_argument("--db", help="Fingerprint DB to identify against (JSON)")
     ap.add_argument("--update-db", metavar="JSON",
                     help="Harvest fingerprints from the inputs into this DB")
+    ap.add_argument("--fingerprints", metavar="JSON", nargs="?", const="-",
+                    help="Emit the code/data-layout + .text-fingerprint table (for matching "
+                         "a flat local-store dump to a job); JSON path, or omit for stdout")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     files = []
     for p in args.inputs:
         files.extend(sorted(glob.glob(p)) if any(c in p for c in "*?") else [p])
+
+    if args.fingerprints is not None:
+        rows = []
+        for path in files:
+            try:
+                elf = ELFFile(path); elf.load()
+            except Exception as exc:
+                print(f"{path}: {exc}", file=sys.stderr); continue
+            rows.extend(fingerprint_table(elf))
+        if args.fingerprints == "-":
+            json.dump(rows, sys.stdout, indent=1); print()
+        else:
+            json.dump(rows, open(args.fingerprints, "w", encoding="utf-8"), indent=1)
+            elfs = sum(1 for r in rows if r["format"] == "spu-elf")
+            print(f"[spu_ident] {len(rows)} images ({elfs} SPU-ELF fingerprintable, "
+                  f"{len(rows) - elfs} raw) -> {args.fingerprints}", file=sys.stderr)
+        return 0
 
     db = {}
     if args.db and os.path.exists(args.db):
