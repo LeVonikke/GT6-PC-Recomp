@@ -526,29 +526,41 @@ void cellGcm_rsx_process_fifo(void)
     if (!s_gcm_context_ea) return;
     if (!s_inited) { rsx_state_init(&s_state); s_get = s_config.ioAddress; s_inited = 1; }
 
-    /* The title's cellGcm macros write methods to the context's `current` pointer
-     * (context+0x8) and advance it. Read it (vm_read32 byte-swaps BE->host). */
-    u32 current = vm_read32(s_gcm_context_ea + 0x8);
-    if (current < s_get) s_get = s_config.ioAddress;   /* wrapped */
-    g_gcm_fifo_drained_ea = s_get;                      /* publish drain progress */
-    if (current <= s_get) return;                       /* nothing new */
+    /* The RSX submit pointer is control->put (IO offset); the jsGcm FIFO path
+     * (_jsGcmFifoFlush) and the inline context path both advance it. The FIFO is
+     * a ring built with JUMP commands, so we must WALK it following jumps from
+     * get to put -- a linear drain hits the first JUMP header and then garbage. */
+    u32 put_ea = s_control_ea ? s_config.ioAddress + vm_read32(s_control_ea + 0x0)
+                              : vm_read32(s_gcm_context_ea + 0x8);
+    { u32 cur = vm_read32(s_gcm_context_ea + 0x8); if (cur > put_ea) put_ea = cur; }
 
-    { static int _f=0; if (_f++ < 24) fprintf(stderr, "[GCM] fifo drain ctx=0x%08X get=0x%08X current=0x%08X words=%u\n", s_gcm_context_ea, s_get, current, (current - s_get)/4); }
-    u32 words = (current - s_get) / 4;
-    if (words > 0x40000u) words = 0x40000u;             /* cap 1MB/frame */
+    if (s_get == put_ea) return;                        /* caught up */
 
-    /* Byte-swap the BE command words into a host buffer (the parser reads host
-     * endian); vm_read32 does the swap per word. */
-    static u32 cmds[0x40000];
-    for (u32 i = 0; i < words; i++)
-        cmds[i] = vm_read32(s_get + i * 4);
-
-    rsx_process_command_buffer(&s_state, cmds, words * 4);
-    s_get += words * 4;
-    g_gcm_fifo_drained_ea = s_get;                      /* RSX has consumed up to here */
-    /* Advance the control register's `get` so FIFO-init / flush loops that poll
-     * get (catching up to put) see the RSX drain. */
-    if (s_control_ea) vm_write32(s_control_ea + 0x4, s_get);
+    u32 pos = s_get;
+    int guard = 0;
+    while (pos != put_ea && guard++ < 8000000) {
+        u32 header = vm_read32(pos);
+        pos += 4;
+        u32 type = (header >> 29) & 0x7;
+        if (type == 1) {                                /* JUMP: redirect (ring) */
+            pos = s_config.ioAddress + (header & 0x1FFFFFFC);
+            continue;
+        }
+        if (type == 0 || type == 2) {                   /* increasing / non-incr methods */
+            u32 method   = ((header >> 2) & 0x7FF) << 2;
+            u32 num_data = (header >> 18) & 0x7FF;
+            int incr     = (type == 0);
+            for (u32 i = 0; i < num_data && pos != put_ea; i++) {
+                u32 data = vm_read32(pos);
+                pos += 4;
+                rsx_process_method(&s_state, incr ? method + i * 4 : method, data);
+            }
+        }
+        /* type 3 (call/return) not yet used by this title */
+    }
+    s_get = pos;
+    g_gcm_fifo_drained_ea = s_get;
+    if (s_control_ea) vm_write32(s_control_ea + 0x4, vm_read32(s_control_ea + 0x0)); /* get = put */
 }
 
 /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
