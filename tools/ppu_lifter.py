@@ -217,6 +217,14 @@ _CS_SAVE_RE = re.compile(
     r'vm_write64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
 _CS_REST_RE = re.compile(
     r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+)\);')
+# A write (assignment) to a callee-saved GPR. Used to reject false "saves": a
+# `std rN,off(r1)` only preserves the caller's value if rN has NOT been
+# reassigned in the body first. When the compiler reuses a callee-save slot for
+# a local (e.g. `std r29,0x90(r1)` storing a computed 0, then later
+# `ld r29,0x90(r1)` reloading a stat result into r29), the store is NOT a save
+# and the later load is a genuine reload -- must not be rewritten to _cs_N.
+_CS_WRITE_RE = re.compile(
+    r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\s*(?:\+=|-=|\*=|/=|&=|\|=|\^=|<<=|>>=|=)(?!=)')
 # A primary stack-frame allocation (lifted `stdu r1,-N(r1)`); its presence means
 # the body is a real function/merge, not a pure mid-function tail-entry.
 _FRAME_ALLOC = "ctx->gpr[1] += -0x"
@@ -347,6 +355,15 @@ class PPULifter:
         # Firmware-import stub: replace the whole body with an HLE dispatch.
         nid = self.hle_stub_nids.get(start)
         if nid is not None:
+            # The real PPU import stub does `std r2, 0x28(r1)` (saves the CALLER's
+            # TOC to the ABI TOC-save slot) before tail-calling the resolved target,
+            # so the caller can restore its TOC with `ld r2, 0x28(r1)` afterward.
+            # Skipping it leaves that slot uninitialized -> the caller reloads r2
+            # from garbage (seen as r2=0x00000004) -> every subsequent TOC-relative
+            # load reads bad memory (e.g. scene-root globals -> func_0036E868 walks
+            # a null root -> infinite recursion / stack overflow). Replicate it.
+            func.body_lines.append(
+                "    vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);  /* stub: std r2,0x28(r1) */")
             func.body_lines.append(
                 f"    ps3_hle_call(0x{nid:08X}u, ctx); return;  /* import stub */")
             self.functions.append(func)
@@ -447,10 +464,16 @@ class PPULifter:
         # stale slot). Leave such restores reading the frame (pairing-only).
         _has_stdu = any(_FRAME_ALLOC in _l for _l in func.body_lines)
         _saved_slots = set()
+        _cs_written = set()   # callee-save regs already reassigned in the body
         for _l in func.body_lines:
             _m = _CS_SAVE_RE.search(_l)
-            if _m:
+            # Only a genuine callee-save: stores the register's ENTRY value, i.e.
+            # rN has not been written yet. A store of an already-reassigned rN is
+            # a reused stack local, not a save -- don't register its slot.
+            if _m and int(_m.group(2)) not in _cs_written:
                 _saved_slots.add((_m.group(1), _m.group(2)))
+            for _wm in _CS_WRITE_RE.finditer(_l):
+                _cs_written.add(int(_wm.group(1)))
         _reg_snap = set()        # regs to snapshot from the register at entry
         _mem_snap = {}           # reg -> offset, snapshot from memory at entry
         for _i, _l in enumerate(func.body_lines):
@@ -859,6 +882,12 @@ class PPULifter:
         if mn in idx_store_map:
             helper = idx_store_map[mn]
             rs_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            # Indexed update forms (stbux/sthux/stwux): EA = ra+rb, then ra = EA.
+            # Mirror the indexed-LOAD handler above -- dropping the base write-back
+            # leaves ra stale and corrupts every subsequent (ra)-relative access.
+            if mn.endswith("ux") and ra_i != "0":
+                return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
+                        f"{helper}(ea, ctx->gpr[{rs_i}]); ctx->gpr[{ra_i}] = ea; }}")
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             return f"{helper}({ea}, ctx->gpr[{rs_i}]);"
 
@@ -1110,11 +1139,17 @@ class PPULifter:
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 if "s" in mn:
-                    return (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
+                    body = (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
                             f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
                 else:
-                    return (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
+                    body = (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
+                # Update-form (lfsu/lfdu): EA = (rA)+disp, then rA = EA.
+                # Dropping this base write-back leaves rA stale and corrupts every
+                # subsequent (rA)-relative access (systemic C++ object-field corruption).
+                if mn in ("lfsu", "lfdu"):
+                    body += f" ctx->gpr[{base}] = ctx->gpr[{base}] + {disp};"
+                return body
 
         if mn in ("stfs", "stfsu", "stfd", "stfdu"):
             frs = _reg_idx(ops[0])
@@ -1126,11 +1161,17 @@ class PPULifter:
                 # store, corrupting the double (breaks fctidz+stfd+ld float->GPR
                 # idioms and any stored double). [ps3recomp fork JonathanDC64 eb5451b3]
                 if mn in ("stfs", "stfsu"):
-                    return (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
+                    body = (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
                             f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
                 else:
-                    return (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
+                    body = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
                             f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
+                # Update-form (stfsu/stfdu): EA = (rA)+disp, then rA = EA.
+                # Dropping this base write-back is what let stfsu-initialized color
+                # fields clobber the object vtable at (rA)+0 -> under-construction crash.
+                if mn in ("stfsu", "stfdu"):
+                    body += f" ctx->gpr[{base}] = ctx->gpr[{base}] + {disp};"
+                return body
 
         # ------- FP arithmetic -------
         fp_binary = {
@@ -2567,20 +2608,44 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             continue
         # `lwzx rD, rA, rB` computes MEM(rA + rB); the table-base register may be
         # EITHER operand — gcc emits both `lwzx rD, base, idx` and the swapped
-        # `lwzx rD, idx, base`. Try each candidate; the real base is the one
-        # loaded TOC-relative via `lwz base, disp(r2)`. (Hardcoding p[2] as the
-        # base silently skipped every dispatcher with the operands swapped.)
-        r_val = p[0]
-        disp = None; r_base = None
-        for cand in (p[1], p[2]):
+        # `lwzx rD, idx, base`. Try each candidate for the table-base register.
+        #
+        # The base is loaded either directly TOC-relative (`lwz base, d(r2)`) or
+        # via ONE level of indirection through a TOC global — gcc's PIC switch
+        # idiom `lwz mid, d1(r2); lwz base, d2(mid)`, so the table pointer lives
+        # in a data global at *(TOC+d1) and the table at *(that + d2). Only
+        # matching the direct form silently dropped every two-level dispatcher
+        # (109 of 130 here), leaving each switch lifted as a failing bctr.
+        def _lwz_of(reg):
+            """Most-recent `lwz reg, disp(rA)` in the window -> (disp, rA_name)."""
             for w in reversed(win):
                 if w.mnemonic == 'lwz':
                     a = [x.strip() for x in w.operands.split(',')]
-                    if len(a) == 2 and a[0] == cand and '(r2)' in a[1]:
-                        disp = mem_disp(a[1]); r_base = cand; break
-            if disp is not None:
-                break
-        if disp is None or not toc:
+                    if len(a) == 2 and a[0] == reg and '(' in a[1]:
+                        d = mem_disp(a[1])
+                        rA = a[1].split('(')[1].rstrip(')').strip()
+                        return (d, rA)
+            return None
+        r_val = p[0]
+        r_base = None; table_base = None
+        for cand in (p[1], p[2]):
+            ld = _lwz_of(cand)
+            if ld is None:
+                continue
+            d_base, rA = ld
+            if d_base is None:
+                continue
+            if rA == 'r2' and toc:                       # one-level: lwz base, d(r2)
+                table_base = read_u32((toc + d_base) & 0xFFFFFFFF)
+            else:                                        # two-level: base <- global <- TOC
+                mid = _lwz_of(rA)
+                if mid is not None and mid[0] is not None and mid[1] == 'r2' and toc:
+                    midval = read_u32((toc + mid[0]) & 0xFFFFFFFF)
+                    if midval is not None:
+                        table_base = read_u32((midval + d_base) & 0xFFFFFFFF)
+            if table_base is not None:
+                r_base = cand; break
+        if table_base is None or not toc:
             continue
         # offset table iff an `add rC, *, r_base` combines the loaded value + base
         is_offset = any(
@@ -2588,9 +2653,6 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             [x.strip() for x in w.operands.split(',')][0] == rC and
             r_base in [x.strip() for x in w.operands.split(',')][1:]
             for w in win)
-        table_base = read_u32((toc + disp) & 0xFFFFFFFF)
-        if table_base is None:
-            continue
         # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
         count = None
         for w in reversed(win):
