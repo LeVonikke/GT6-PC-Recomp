@@ -333,19 +333,16 @@ class SPULifter:
     def _branch_target(insn: SPUInstruction):
         mn = insn.mnemonic
         ops = _ops(insn.operands)
-        if mn not in ("br", "brsl", "bra", "brasl") and mn not in _COND_BR:
-            return None
-        # The address operand is the immediate (0x...). brsl/brasl and the
-        # conditional branches also carry a register operand (the link register
-        # $r0 for brsl, the tested register for conditionals) which the
-        # disassembler emits FIRST -- so scan for the hex token rather than
-        # assuming ops[0]/ops[-1]. (Fixes brsl targets lifting as "unresolved".)
-        for tok in ops:
-            if tok.startswith("0x"):
-                try:
-                    return int(tok, 16)
-                except ValueError:
-                    return None
+        tok = None
+        if mn in ("br", "brsl", "bra", "brasl") and ops:
+            tok = ops[0]
+        elif mn in _COND_BR and ops:
+            tok = ops[-1]
+        if tok and tok.startswith("0x"):
+            try:
+                return int(tok, 16)
+            except ValueError:
+                return None
         return None
 
     # ------------------------------------------------------------------ #
