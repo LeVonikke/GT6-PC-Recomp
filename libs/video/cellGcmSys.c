@@ -534,6 +534,12 @@ void cellGcm_rsx_process_fifo(void)
                               : vm_read32(s_gcm_context_ea + 0x8);
     { u32 cur = vm_read32(s_gcm_context_ea + 0x8); if (cur > put_ea) put_ea = cur; }
 
+    if (getenv("RD_FIFO_DBG")) { static int _n=0; if(_n++<10)
+        fprintf(stderr,"[FIFO] ctrl_ea=0x%08X put_off=0x%08X put_ea=0x%08X get=0x%08X cur=0x%08X ref=0x%08X | fifo[0..4]=%08X %08X %08X %08X\n",
+            s_control_ea, s_control_ea?vm_read32(s_control_ea):0, put_ea, s_get,
+            vm_read32(s_gcm_context_ea+0x8), s_control_ea?vm_read32(s_control_ea+0x8):0,
+            vm_read32(s_config.ioAddress), vm_read32(s_config.ioAddress+4), vm_read32(s_config.ioAddress+8), vm_read32(s_config.ioAddress+12)); }
+
     if (s_get == put_ea) return;                        /* caught up */
 
     u32 pos = s_get;
