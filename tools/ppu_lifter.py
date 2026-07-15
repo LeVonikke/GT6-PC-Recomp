@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -217,6 +218,17 @@ _CS_SAVE_RE = re.compile(
     r'vm_write64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
 _CS_REST_RE = re.compile(
     r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+)\);')
+# Any frame-relative store (any width), capturing the offset. Used to tell a
+# spill/reload apart from a callee-save restore: a slot this body writes itself
+# is scratch, so a later load from it is NOT a callee-save restore.
+_CS_ANY_STORE_RE = re.compile(
+    r'vm_write(?:8|16|32|64)\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+),')
+# A write (assignment) to a callee-saved GPR. A `std rN,off(r1)` only preserves
+# the caller's value if rN has NOT been reassigned first; when the compiler
+# reuses a callee-save slot for a local (store a computed rN, later reload rN),
+# the store isn't a save and the reload must stay a real memory load.
+_CS_WRITE_RE = re.compile(
+    r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\s*(?:\+=|-=|\*=|/=|&=|\|=|\^=|<<=|>>=|=)(?!=)')
 # A primary stack-frame allocation (lifted `stdu r1,-N(r1)`); its presence means
 # the body is a real function/merge, not a pure mid-function tail-entry.
 _FRAME_ALLOC = "ctx->gpr[1] += -0x"
@@ -348,6 +360,8 @@ class PPULifter:
         nid = self.hle_stub_nids.get(start)
         if nid is not None:
             func.body_lines.append(
+                "    vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);  /* stub: std r2,0x28(r1) */")
+            func.body_lines.append(
                 f"    ps3_hle_call(0x{nid:08X}u, ctx); return;  /* import stub */")
             self.functions.append(func)
             return func
@@ -446,11 +460,34 @@ class PPULifter:
         # be memory-snapshotted (the snapshot would run before the stdu and read a
         # stale slot). Leave such restores reading the frame (pairing-only).
         _has_stdu = any(_FRAME_ALLOC in _l for _l in func.body_lines)
+        # A genuine callee-save slot is written EXACTLY ONCE (the prologue save)
+        # and holds that value untouched until the epilogue restore. Count every
+        # frame-relative store per offset: a slot written more than once is being
+        # reused as SCRATCH, so a `std rN,X` / `ld rN,X` there is an ordinary
+        # spill/reload, NOT a callee-save pair. Pairing them by (off,reg) alone
+        # (the old logic) matched newlib dtoa's `stfd f,0x98; ld r30,0x98`
+        # double-word-extract against an unrelated `std r30,0x98` spill elsewhere
+        # in the function, so the "restore" was rewritten to a register snapshot
+        # taken at entry -> r30 got a garbage word0 -> exponent wrong -> k=INT_MAX
+        # -> __pow5mult spun forever (any printf("%f") never returned).
+        _write_counts = Counter()
+        for _l in func.body_lines:
+            _wm = _CS_ANY_STORE_RE.search(_l)
+            if _wm:
+                _write_counts[_wm.group(1)] += 1
         _saved_slots = set()
+        _cs_written = set()   # callee-save regs already reassigned in the body
         for _l in func.body_lines:
             _m = _CS_SAVE_RE.search(_l)
-            if _m:
+            # Genuine callee-save: slot stored exactly once AND the register still
+            # holds its entry value (not yet reassigned). The second test rejects a
+            # reused save slot (e.g. `std r29,0x90` of a computed 0 followed by
+            # `ld r29,0x90` reloading a stat result) that otherwise looks like a
+            # save/restore pair and would be wrongly rewritten to `_cs_29`.
+            if _m and _write_counts[_m.group(1)] == 1 and int(_m.group(2)) not in _cs_written:
                 _saved_slots.add((_m.group(1), _m.group(2)))
+            for _wm in _CS_WRITE_RE.finditer(_l):
+                _cs_written.add(int(_wm.group(1)))
         _reg_snap = set()        # regs to snapshot from the register at entry
         _mem_snap = {}           # reg -> offset, snapshot from memory at entry
         for _i, _l in enumerate(func.body_lines):
@@ -460,7 +497,9 @@ class PPULifter:
                 if (_off, _m.group(1)) in _saved_slots:
                     _reg_snap.add(_reg)
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
-                elif not _has_stdu:
+                elif not _has_stdu and _write_counts[_off] == 0:
+                    # pure tail-entry: the save lives in the original function, so
+                    # this body never writes the slot; snapshot from memory at entry.
                     _mem_snap.setdefault(_reg, _off)
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
         if _reg_snap or _mem_snap:
@@ -688,15 +727,26 @@ class PPULifter:
 
         # ------- Shift / Rotate -------
         if mn.startswith("rlwinm"):
+            # PPC rlwinm is a WORD op: the 32-bit masked result is placed in the
+            # low 32 bits of RA and the HIGH 32 bits are set to 0 (zero-extended).
+            # The old emission sign-extended via (int64_t)(int32_t), which is WRONG
+            # for any result whose bit 31 is set (produces 0xFFFFFFFF_xxxxxxxx instead
+            # of 0x00000000_xxxxxxxx) -> corrupts 64-bit compares (cmpd), pointer math,
+            # and the record-form (rlwinm.) CR0. rlwnm (the register-shift twin) already
+            # zero-extends -- match it.
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
             sh, mb, me = ops[2], ops[3], ops[4]
-            return (f"ctx->gpr[{ra}] = (int64_t)(int32_t)"
+            return (f"ctx->gpr[{ra}] = (uint64_t)"
                     f"ppc_rlwinm((uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
 
         if mn.startswith("rlwimi"):
+            # PPC rlwimi INSERTS the masked 32-bit field into the low 32 bits of RA;
+            # the high 32 bits of RA are PRESERVED (RA & ~m, where ~m covers bits 0-31).
+            # The old emission (int64_t)(int32_t) both destroyed the high 32 bits and
+            # sign-extended -- wrong on both counts. Preserve high 32, zero-extend low.
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
             sh, mb, me = ops[2], ops[3], ops[4]
-            return (f"ctx->gpr[{ra}] = (int64_t)(int32_t)"
+            return (f"ctx->gpr[{ra}] = (ctx->gpr[{ra}] & 0xFFFFFFFF00000000ull) | (uint64_t)"
                     f"ppc_rlwimi((uint32_t)ctx->gpr[{ra}], (uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
 
         if mn in ("slw", "slw."):
@@ -988,7 +1038,10 @@ class PPULifter:
                     return f"/* bl -> non-code 0x{tgt:08X} */;"
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
-                return f"{self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
+                # PPC `bl` sets LR = return address (next instr). Emit it so mflr
+                # reads the correct value AND stack-saved LRs are real return
+                # addresses -> reliable back-chain unwinding for diagnostics.
+                return f"ctx->lr = 0x{insn.addr + 4:08X}; {self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
             except ValueError:
                 return f"/* bl {target} */;"
 
@@ -1110,11 +1163,14 @@ class PPULifter:
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 if "s" in mn:
-                    return (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
+                    body = (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
                             f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
                 else:
-                    return (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
+                    body = (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
+                if mn in ("lfsu", "lfdu"):
+                    body += f" ctx->gpr[{base}] = ctx->gpr[{base}] + {disp};"
+                return body
 
         if mn in ("stfs", "stfsu", "stfd", "stfdu"):
             frs = _reg_idx(ops[0])
@@ -1126,11 +1182,14 @@ class PPULifter:
                 # store, corrupting the double (breaks fctidz+stfd+ld float->GPR
                 # idioms and any stored double). [ps3recomp fork JonathanDC64 eb5451b3]
                 if mn in ("stfs", "stfsu"):
-                    return (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
+                    body = (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
                             f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
                 else:
-                    return (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
+                    body = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
                             f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
+                if mn in ("stfsu", "stfdu"):
+                    body += f" ctx->gpr[{base}] = ctx->gpr[{base}] + {disp};"
+                return body
 
         # ------- FP arithmetic -------
         fp_binary = {
@@ -1931,23 +1990,10 @@ class PPULifter:
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) d[i]=1.0f/sqrtf(b[i]); }}")
 
-        if mn == "vexptefp":  # 2^x estimate (vD, vB)
+        if mn == "vrfim":  # round to FP integer toward -inf (floor); vrfim is vD,vB
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=exp2f(b[i]); }}")
-
-        if mn == "vlogefp":  # log2 estimate (vD, vB)
-            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=log2f(b[i]); }}")
-
-        # Round to FP integer (all vD, vB): nearest / toward zero / +inf / -inf.
-        if mn in ("vrfin", "vrfiz", "vrfip", "vrfim"):
-            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
-            fn = {"vrfin": "rintf", "vrfiz": "truncf",
-                  "vrfip": "ceilf", "vrfim": "floorf"}[mn]
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]={fn}(b[i]); }}")
+                    f"for(int i=0;i<4;i++) d[i]=floorf(b[i]); }}")
 
         # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int)
         if mn == "vcfsx" or mn == "vcfux":

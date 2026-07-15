@@ -961,11 +961,24 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
     extern uint8_t* vm_base;
     uint32_t img_ea = (uint32_t)ctx->gpr[3];
     uint32_t src_ea = (uint32_t)ctx->gpr[4];
+    uint32_t entry = 0;
     if (img_ea && vm_base) {
         memset(vm_base + img_ea, 0, 16);
-        /* sys_spu_image.type = 0 (SYS_SPU_IMAGE_TYPE_KERNEL), entry=0, segs=0, nsegs=0 */
+        /* Parse the in-memory SPU ELF32 at src_ea: e_ident magic then e_entry
+         * at offset 0x18 (big-endian). Set image type=USER(1)+entry so the SPU
+         * thread has a real entry and the PPU-fallback registry can match it. */
+        if (src_ea) {
+            const uint8_t* e = vm_base + src_ea;
+            if (e[0]==0x7f && e[1]=='E' && e[2]=='L' && e[3]=='F') {
+                entry = ((uint32_t)e[0x18]<<24)|((uint32_t)e[0x19]<<16)|
+                        ((uint32_t)e[0x1A]<<8)|(uint32_t)e[0x1B];
+                uint8_t* im = vm_base + img_ea;
+                im[0]=0;im[1]=0;im[2]=0;im[3]=1;                    /* type=USER */
+                im[4]=e[0x18];im[5]=e[0x19];im[6]=e[0x1A];im[7]=e[0x1B]; /* entry */
+            }
+        }
     }
-    fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X\n", img_ea, src_ea);
+    fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X entry=0x%08X\n", img_ea, src_ea, entry);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
