@@ -17,6 +17,7 @@
 #include "rsx_commands.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv */
 
 /* ---------------------------------------------------------------------------
  * Global backend
