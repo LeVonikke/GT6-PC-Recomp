@@ -544,6 +544,9 @@ void cellGcm_rsx_process_fifo(void)
     rsx_process_command_buffer(&s_state, cmds, words * 4);
     s_get += words * 4;
     g_gcm_fifo_drained_ea = s_get;                      /* RSX has consumed up to here */
+    /* Advance the control register's `get` so FIFO-init / flush loops that poll
+     * get (catching up to put) see the RSX drain. */
+    if (s_control_ea) vm_write32(s_control_ea + 0x4, s_get);
 }
 
 /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
