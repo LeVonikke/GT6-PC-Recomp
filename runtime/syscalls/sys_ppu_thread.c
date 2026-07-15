@@ -5,6 +5,12 @@
 #include "sys_ppu_thread.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
+#ifdef _WIN32
+#include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
+                        * leaves per-thread CRT state uninit -> buffered fread() silently
+                        * returns 0 on those threads). */
+#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -114,6 +120,30 @@ static void* ppu_host_thread_proc(void* param)
 }
 
 /* ---------------------------------------------------------------------------
+/* YDKJ_THREADGATE: PS3 priority scheduling — a newly created same/lower-priority
+ * thread does NOT run until the creating thread blocks. Our HLE spawns host threads
+ * immediately, so a worker (GThread entry=0x5353C0) can read its job object's
+ * [arg+0x10] owner link BEFORE the main thread finishes linking it -> null -> spin.
+ * Fix: create workers SUSPENDED and resume them only when a thread first blocks on
+ * an event-queue wait (by then the creator has finished initialization). */
+#ifdef _WIN32
+static HANDLE g_gate_pending[256];
+static int    g_gate_n = 0;
+static int    g_gate_on = -1;
+void ydkj_release_pending_threads(void)
+{
+    if (g_gate_on <= 0) return;
+    table_lock();
+    int n = g_gate_n; g_gate_n = 0;
+    for (int i = 0; i < n; i++) if (g_gate_pending[i]) ResumeThread(g_gate_pending[i]);
+    table_unlock();
+    if (n) fprintf(stderr, "[THREADGATE] released %d pending worker thread(s) on first block\n", n);
+}
+#else
+void ydkj_release_pending_threads(void) {}
+#endif
+
+/* ---------------------------------------------------------------------------
  * sys_ppu_thread_create
  *
  * r3 = pointer to receive thread ID (u64*)
@@ -210,6 +240,16 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     fprintf(stderr, "[SYS] sys_ppu_thread_create name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
             t->name, (unsigned long long)entry, (unsigned long long)arg,
             stack_size, priority);
+    /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
+     * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
+     * the worker dispatches its job on a null object -> construction never runs. */
+    { extern uint8_t* vm_base; uint32_t a=(uint32_t)arg;
+      if(a && a<0x50000000u && getenv("YDKJ_THREADARG")){
+        #define RB(o) (((uint32_t)vm_base[(a+(o))&0x0FFFFFFFu]<<24)|((uint32_t)vm_base[(a+(o)+1)&0x0FFFFFFFu]<<16)|((uint32_t)vm_base[(a+(o)+2)&0x0FFFFFFFu]<<8)|vm_base[(a+(o)+3)&0x0FFFFFFFu])
+        uint32_t self=RB(0x0), thisp=RB(0x8), vtbl=RB(0xC);
+        fprintf(stderr,"[THREADARG] arg=0x%08X [+0]=0x%08X this[+8]=0x%08X vtbl[+C]=0x%08X\n", a, self, thisp, vtbl);
+        #undef RB
+      } }
 
     /* Diagnostic (YDKJ_NOHDLR): suppress libsre's SPURS handler threads (entry in
      * the libsre image range) -- they assert that the SPU side isn't operational
@@ -229,14 +269,21 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * the host stack and overflow the 1 MB default. Reserve 256 MB (committed
      * lazily by the OS via STACK_SIZE_PARAM_IS_A_RESERVATION). */
 #ifdef _WIN32
-    t->host_thread = CreateThread(NULL, 256u * 1024 * 1024, ppu_host_thread_proc, t,
-                                  STACK_SIZE_PARAM_IS_A_RESERVATION, &t->host_tid);
+    if (g_gate_on < 0) g_gate_on = getenv("YDKJ_THREADGATE") ? 1 : 0;
+    /* Gate only guest worker threads (game .text entry), never libsre/system threads. */
+    unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
+    int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
+    if (_gate_this) _initflag |= CREATE_SUSPENDED;
+    t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
+                                  (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
+                                  _initflag, (unsigned*)&t->host_tid);
     if (t->host_thread == NULL) {
         t->state = PPU_THREAD_STATE_FREE;
         CloseHandle(t->finish_event);
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
+    if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
 #else
     int rc = pthread_create(&t->host_thread, NULL, ppu_host_thread_proc, t);
     if (rc != 0) {

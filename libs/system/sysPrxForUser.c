@@ -772,11 +772,18 @@ s32 sys_prx_exitspawn_with_level(void)
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 {
     (void)flags;
+    /* name/id arrive as raw GUEST effective addresses (the generic HLE adapter
+     * forwards gpr3.. untranslated). Translate before touching memory -- else
+     * printf("%s", name) derefs a bare host address and AVs. This path first
+     * appears once real libsre is loaded (its name string lives in the libsre
+     * image at 0x3000xxxx). Same bug class as the _sys_memset fix above. */
+    const char* hname = (const char*)yz_g2h(name);
+    u32* hid = (u32*)yz_g2h(id);
     printf("[sysPrxForUser] sys_prx_get_module_id_by_name('%s')\n",
-           name ? name : "(null)");
+           hname ? hname : "(null)");
 
-    if (!id) return CELL_EFAULT;
-    *id = 0; /* fake module ID */
+    if (!hid) return CELL_EFAULT;
+    *hid = 0; /* fake module ID */
     return CELL_OK;
 }
 

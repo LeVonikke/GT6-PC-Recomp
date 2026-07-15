@@ -166,14 +166,14 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
     uint32_t queue_id = LV2_ARG_U32(ctx, 0);
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
 
     evt_table_lock();
 
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
     if (!q->active) {
         evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
     }
 
 #ifdef _WIN32
@@ -200,9 +200,25 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
+    /* YDKJ_THREADGATE: the creating thread is now blocking -> workers may run
+     * (PS3 priority semantics). Their job objects are fully initialized by now. */
+    { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
     fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
             queue_id, (unsigned long long)timeout_us,
             (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+
+    /* YDKJ_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
+     * exact game function the main thread is stuck polling in the flip loop. */
+    if (getenv("YDKJ_WAITBT")) {
+        static unsigned char seen[8][8] = {{0}};
+        unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
+        if (!seen[t][qk]) {
+            seen[t][qk] = 1;
+            extern void ppu_dump_guest_stack(ppu_context*, const char*);
+            char tag[48]; snprintf(tag, sizeof tag, "waitbt tid=%u q=%u", t, queue_id);
+            ppu_dump_guest_stack(ctx, tag);
+        }
+    }
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -291,6 +307,20 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     if (queue_id == 1 && timeout_us == 0) {
         extern void ppu_dump_guest_stack(ppu_context*, const char*);
         static int _gs = 0; if (_gs++ < 5) ppu_dump_guest_stack(ctx, "q1-worker");
+    }
+    /* Diagnostic: main-thread per-frame poll on q=2/q=3 (timeout ~30us) never
+     * advances to content. Dump its guest call chain to identify the frame-loop
+     * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
+    if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
+#ifdef _WIN32
+        static int _gs23 = 0; if (_gs23++ < 4) {
+            void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
+            char* base=(char*)GetModuleHandleA(0);
+            char ln[1000]; int p=snprintf(ln,sizeof ln,"[Q23STACK q=%u] host RVAs:",queue_id);
+            for(unsigned short i=0;i<n && p<920;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)fr[i]-base));
+            fprintf(stderr,"%s\n",ln);
+        }
+#endif
     }
 
 #ifdef _WIN32
@@ -573,14 +603,14 @@ int64_t sys_event_port_destroy(ppu_context* ctx)
     uint32_t port_id = LV2_ARG_U32(ctx, 0);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
 
     evt_table_lock();
 
     sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
     if (!p->active) {
         evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
     }
 
     p->active = 0;
@@ -626,19 +656,24 @@ int64_t sys_event_port_disconnect(ppu_context* ctx)
     uint32_t port_id = LV2_ARG_U32(ctx, 0);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
 
     evt_table_lock();
 
     sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
     if (!p->active) {
         evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
+        /* YDKJ: libsre (cellSpursInitialize) disconnects a port it already
+         * destroyed (our small reused port-ids make its second teardown hit an
+         * inactive slot) -> lv2 ESRCH -> "SPURS is aborted" assertion in
+         * event_helper.c. Idempotent teardown (return OK when already gone)
+         * removes the spurious abort without fabricating anything game-visible. */
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;
     }
 
     if (p->connected_queue == 0) {
         evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ENOTCONN;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ENOTCONN;
     }
 
     p->connected_queue = 0;
@@ -682,6 +717,12 @@ int64_t sys_event_port_send(ppu_context* ctx)
     uint64_t data1   = LV2_ARG_U64(ctx, 1);
     uint64_t data2   = LV2_ARG_U64(ctx, 2);
     uint64_t data3   = LV2_ARG_U64(ctx, 3);
+    if (getenv("YDKJ_PRODSTACK")) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
+        if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
+            char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
+    if (getenv("YDKJ_NOTIFIER")) { static int _d=0; if(_d++==0){ extern uint32_t vm_read32(uint64_t);
+        fprintf(stderr,"[NOTIFIER-ARRAY] @0x587300..0x5873C0 (each obj: +0x0,+0x4,+0x8=portid,+0xC):\n");
+        for(uint32_t a=0x587300;a<=0x5873C0;a+=0x10) fprintf(stderr,"  0x%08X: %08X %08X %08X %08X\n",a,vm_read32(a),vm_read32(a+4),vm_read32(a+8),vm_read32(a+0xC)); fflush(stderr); } }
     fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
             port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
 
@@ -690,6 +731,23 @@ int64_t sys_event_port_send(ppu_context* ctx)
 
     sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
     if (!p->active) {
+        /* YDKJ: cellSpurs (libsre) sends its REAL completion via port_send(port=N)
+         * but creates the port through a path whose id doesn't map to our port slot,
+         * so the port is never "active" here and the real SPURS ready/completion event
+         * (e.g. port=4 data=0/1/0) is dropped -> cellSpursInitialize deadlocks on q=N.
+         * Bridge: if an event QUEUE with the same id is active, deliver the REAL event
+         * to it (not a synthesized payload). This is the genuine completion the title
+         * sends; we only fix the port->queue routing our HLE lost. Env YDKJ_PORTROUTE
+         * (default ON) can be disabled for A/B. */
+        if (port_id <= SYS_EVENT_QUEUE_MAX && g_sys_event_queues[port_id - 1].active
+                && (!getenv("YDKJ_NO_PORTROUTE"))) {
+            sys_event_queue_info* rq = &g_sys_event_queues[port_id - 1];
+            sys_event_t revt; revt.source = 0; revt.data1 = data1; revt.data2 = data2; revt.data3 = data3;
+            int rc = event_queue_push(rq, &revt);
+            fprintf(stderr, "[evt] port_send(port=%u): port inactive -> ROUTED real event to queue id=%u (data=0x%llX/0x%llX/0x%llX) rc=%d\n",
+                    port_id, port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3, rc);
+            return (rc < 0) ? (int64_t)(int32_t)CELL_EBUSY : CELL_OK;
+        }
         fprintf(stderr, "[evt] port_send(port=%u): port NOT ACTIVE\n", port_id);
         return (int64_t)(int32_t)CELL_ESRCH;
     }

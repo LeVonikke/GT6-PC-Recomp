@@ -911,8 +911,12 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     s32 cb = dispatch_func_stat(func_opd, is_new, dirName);
 
     if (cb < 0) {
+        /* flОw first-boot: its funcStat returns ERR_NODATA on a new profile
+         * (isNewData=1). The callback already ran and told the game "no save",
+         * so report AutoLoad as CELL_OK -- an ERROR return leaves the title
+         * parked in MODE_AUTO_LOAD. */
         if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
-            return CELL_SAVEDATA_ERROR_NODATA;
+            return CELL_OK;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
     /* OK_LAST or OK_NEXT — with no actual file load infrastructure for
@@ -961,10 +965,14 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
 {
     (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
     (void)container; (void)userdata;
-    printf("[cellSaveData] AutoLoad(version=%u, dir='%s')\n",
-           version, dirName ? dirName : "<null>");
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
+    /* dirName arrives as a GUEST EA (gpr4); translate to host before use.
+     * Without this, printf/build_save_path deref the raw guest address ->
+     * access violation (flОw passes it on the 0xD0.. guest stack). funcStat
+     * stays a guest EA (used as func_opd for g_ps3_guest_caller). */
+    dirName = (const char*)(vm_base + (uint32_t)(uintptr_t)dirName);
+    printf("[cellSaveData] AutoLoad(version=%u, dir='%s')\n", version, dirName);
 
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
@@ -974,8 +982,12 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
     s32 cb = dispatch_func_stat(func_opd, is_new, dirName);
 
     if (cb < 0) {
+        /* flОw first-boot: its funcStat returns ERR_NODATA on a new profile
+         * (isNewData=1). The callback already ran and told the game "no save",
+         * so report AutoLoad as CELL_OK -- an ERROR return leaves the title
+         * parked in MODE_AUTO_LOAD. */
         if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
-            return CELL_SAVEDATA_ERROR_NODATA;
+            return CELL_OK;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
     return CELL_OK;
