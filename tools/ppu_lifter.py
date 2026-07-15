@@ -509,6 +509,7 @@ class PPULifter:
         # (ppu_context, func_entry) stay unprefixed — integration TUs declare
         # the prefixed table extern manually rather than including two headers.
         self.prefix = prefix
+        self.toc_base = 0   # module primary TOC (r2) for single-module TOC-restore lowering
         # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
         # the instruction-list identity so the FULL list (mid-function / serial
         # lift) is sorted+indexed once, not rescanned per call.
@@ -1052,6 +1053,19 @@ class PPULifter:
             helper, signed = load_map[mn]
             rd_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
+            # ELFv1 TOC restore (`ld r2,N(r1)` after a call): on HW the glink stub
+            # saved the caller's r2 to N(r1) before the call and this reloads it.
+            # The recomp has no glink stub, so N(r1) is never written -> the reload
+            # pulls uninitialized stack into r2 -> garbage TOC -> every `ld rT,disp(r2)`
+            # OPD/table load reads code-as-data -> `unresolved indirect call ->
+            # 0x39800000` at the first bctrl in _start, cascading into null-vtable
+            # crashes. A single-module executable keeps r2 constant, so lower the
+            # restore to the literal module TOC (matches the old lifter's /*TOCFIX*/).
+            # NOT a no-op: r2 is a general reg that intervening code clobbers as
+            # scratch, so keeping it "as-is" is also garbage — only the literal is safe.
+            # Guarded on a known single TOC; multi-TOC titles keep the stack read.
+            if mn == "ld" and str(rd_i) == "2" and str(base) == "1" and self.toc_base:
+                return f"ctx->gpr[2] = 0x{self.toc_base:08X}ULL; /*TOCFIX ld r2,N(r1)*/"
             if disp is not None:
                 expr = f"{helper}((({base}) ? ctx->gpr[{base}] : 0) + {disp})"
                 if signed and "16" in helper:
@@ -1335,6 +1349,9 @@ class PPULifter:
                     return f"/* bl -> non-code 0x{tgt:08X} */;"
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
+                # (The ELFv1 TOC restore is handled by lowering `ld r2,N(r1)` to the
+                # literal module TOC — see _emit_load — so no TOC save is emitted
+                # here; writing 40(r1) risked clobbering the recomp's frame.)
                 return f"{self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
             except ValueError:
                 return f"/* bl {target} */;"
@@ -3314,11 +3331,13 @@ _WORKER_STATE: dict = {}
 
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
-                 function_entries=None, code_lo=0, code_hi=None, jump_tables=None):
+                 function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
+                 toc_base=0):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
     _WORKER_STATE["prefix"] = prefix
+    _WORKER_STATE["toc_base"] = toc_base
     _WORKER_STATE["hle_stub_nids"] = hle_stub_nids or {}
     # Branch-routing context the body lift needs -- previously omitted, so the
     # parallel path lost the code-window filter (out-of-range branches became
@@ -3342,6 +3361,7 @@ def _worker_lift(task):
     lifter.code_lo = _WORKER_STATE.get("code_lo", 0)
     lifter.code_hi = _WORKER_STATE.get("code_hi", None)
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
+    lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     results = []
     for start, end in bounds:
         blob = b""
@@ -3375,7 +3395,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
     pool = mp.Pool(processes=jobs, initializer=_worker_init,
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
-                             lifter.code_lo, lifter.code_hi, lifter.jump_tables))
+                             lifter.code_lo, lifter.code_hi, lifter.jump_tables,
+                             getattr(lifter, "toc_base", 0)))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -3628,7 +3649,16 @@ def main() -> None:
             # on libsre func_3000AF2C -> an infinite 2-fragment loop that hung
             # cellSpursInitialize). A genuinely merged second function's prologue is
             # always past the first function's body, well beyond start+8.
-            if (_ordered[_j] in _func_entries and _ordered[_j] > _s + 8
+            # ...but ONLY when something actually reaches this prologue (a b/bl/bc
+            # target). An interior `stdu r1,-N` that is reached only by fall-through
+            # is a function's OWN second frame (dynamic alloca / a nested frame the
+            # compiler emitted), NOT a merged function -- cutting there orphans the
+            # rest of the ctor (its vtable-store) into a fragment that never runs,
+            # leaving the object zero -> a null-vtable virtual call (observed on
+            # flОw: obj@0x101875A0 vtable=0 -> stack-overflow). Real merged funcs are
+            # tail-called (`b`) or called via `bl` elsewhere, so they're in _targets.
+            if (_ordered[_j] in _func_entries and _ordered[_j] in _targets
+                    and _ordered[_j] > _s + 8
                     and (_first_alloc is None or _ordered[_j] > _first_alloc)):
                 _cuts.append(_ordered[_j])
             _j += 1
@@ -3786,6 +3816,15 @@ def main() -> None:
     print(f"Lifting {len(func_bounds)} functions...")
 
     lifter = PPULifter(prefix=args.symbol_prefix)
+    # The module's primary TOC (r2). Single-module ELFv1 executables keep r2
+    # constant, so an `ld r2, N(r1)` TOC restore can be lowered to this literal
+    # instead of a stack read (the recomp has no glink stub writing the save slot,
+    # so the stack read returns garbage -> r2/TOC corruption -> OPD loads read
+    # code-as-data -> `unresolved indirect call -> 0x39800000` at the first bctrl).
+    # Only used when exactly one TOC candidate exists (multi-TOC titles keep the
+    # stack read). See the `ld r2, N(r1)` handling in _emit_load.
+    if len(toc_candidates) == 1:
+        lifter.toc_base = toc_candidates[0]
     lifter.code_hi = args.code_end
     # Without --code-end, default the executable window to the function-bounds
     # span so branches into data still get clamped. With no window at all, a

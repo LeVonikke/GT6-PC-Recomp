@@ -89,7 +89,7 @@ s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state
     memset(state, 0, sizeof(CellVideoOutState));
 
     if (videoOut == CELL_VIDEO_OUT_PRIMARY) {
-        state->state      = 2; /* enabled */
+        state->state      = 0; /* CELL_VIDEO_OUT_OUTPUT_STATE_ENABLED (was 2=PREPARING; PhyreEngine gates render-target config on ENABLED) */
         state->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
 
         /* Fill the 8-byte displayMode struct byte-wise (endian-safe): the

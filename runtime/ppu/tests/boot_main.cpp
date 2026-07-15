@@ -165,6 +165,7 @@ extern "C" int cellGcm_take_flip_pending(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" unsigned cellGcm_flip_request_count(void);
+extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
@@ -215,6 +216,14 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             }
             cellGcm_rsx_process_fifo();
         }
+        /* YDKJ_INJECT_Q3: the main thread polls q3 (load/state-complete) each frame but
+         * it's never posted (producer signals a condvar, never enqueues). Inject a q3
+         * event periodically to test whether delivering the completion advances the
+         * game's state machine to instantiate + display the (force-parsed) menu movie. */
+        if (getenv("YDKJ_INJECT_Q3")) {
+            static int s_q3=0; const char* qe=getenv("YDKJ_INJECT_Q3"); uint32_t qid=(uint32_t)strtoul(qe,0,0); if(qid==0||qid==1) qid=3;
+            if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
+              static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
             if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
             if (getenv("YDKJ_PACETRACE")) {

@@ -1954,10 +1954,15 @@ static void render_frame(void)
     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
     s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
 
-    /* Upload the bound font atlas once (or after a dims change) into an
-     * R8_UNORM texture and create its SRV. The atlas is a linear 8-bit
-     * coverage map, so a straight row copy (no deswizzle) suffices. */
-    if (s_d3d.tex_bound && !s_d3d.tex_ready && s_d3d.srv_heap && s_d3d.pipeline_state_tex) {
+    /* Upload the bound font atlas into an R8_UNORM texture and create its SRV.
+     * The atlas is a linear 8-bit coverage map, so a straight row copy (no
+     * deswizzle) suffices. It is a DYNAMIC glyph cache -- the game rasterizes
+     * new glyphs into it over time -- so re-upload whenever it is dirty (set on
+     * every bind), not just once. Uploading only on first bind left every glyph
+     * added after frame 1 sampling stale texels -> torn text. The backend is
+     * synchronous (wait_for_gpu each frame), so recreating the resource per
+     * dirty frame is safe. */
+    if (s_d3d.tex_bound && (!s_d3d.tex_ready || s_d3d.tex_dirty) && s_d3d.srv_heap && s_d3d.pipeline_state_tex) {
         extern uint8_t* vm_base;
         u32 w = s_d3d.tex_w, h = s_d3d.tex_h;
         u32 pitch = (w + 255) & ~255u;   /* D3D12 requires 256-byte row pitch */
@@ -2028,7 +2033,9 @@ static void render_frame(void)
                 s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.tex_resource, &sv, sh);
 
                 s_d3d.tex_ready = 1;
-                printf("[D3D12] atlas uploaded (%ux%u R8) -> textured\n", w, h);
+                s_d3d.tex_dirty = 0;   /* content now in sync with guest atlas */
+                { static int _au = 0; if (_au++ < 3)
+                    printf("[D3D12] atlas uploaded (%ux%u R8) -> textured\n", w, h); }
             }
         }
     }
@@ -2212,6 +2219,39 @@ static void render_frame(void)
         }
         s_d3d.cmd_list->lpVtbl->SetGraphicsRoot32BitConstants(
             s_d3d.cmd_list, 0 /*root param 0*/, 16, mvp, 0);
+
+        /* D3D12_IQ=1: dump exactly what the GPU is about to see -- the MVP root
+         * constants and the first uploaded host vertices. The legacy path draws
+         * with no validation errors yet produces zero pixels, so the geometry
+         * must be degenerate/off-screen post-VS. */
+        { static int _vd = -1;
+          if (_vd < 0) { const char* e = getenv("D3D12_IQ"); _vd = e ? 1 : 0; }
+          static int _n = 0;
+          if (_vd && _n < 3) {
+            _n++;
+            fprintf(stderr, "[D3D12-DBG] have_mvp=%d draw_count=%u vb_offset=%u\n",
+                    have_mvp, s_d3d.draw_count, s_d3d.vb_offset);
+            fprintf(stderr, "[D3D12-DBG] mvp rows: [%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]"
+                            "[%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]\n",
+                    mvp[0],mvp[1],mvp[2],mvp[3], mvp[4],mvp[5],mvp[6],mvp[7],
+                    mvp[8],mvp[9],mvp[10],mvp[11], mvp[12],mvp[13],mvp[14],mvp[15]);
+            if (s_d3d.vb_mapped) {
+                /* host vertex = 9 floats (pos3 + col4 + uv2), VERTEX_STRIDE=36 */
+                const float* bv = (const float*)s_d3d.vb_mapped;
+                for (int k = 0; k < 3; k++) {
+                    const float* v = bv + k * 9;
+                    fprintf(stderr, "[D3D12-DBG]  hostvert[%d] pos=(%.3f,%.3f,%.3f) col=(%.2f,%.2f,%.2f,%.2f)\n",
+                            k, v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+                }
+            }
+            for (u32 d = 0; d < s_d3d.draw_count && d < 3; d++) {
+                const D3D12DrawRecord* dr = &s_d3d.draws[d];
+                fprintf(stderr, "[D3D12-DBG]  draw[%u] is_vp=%d is_clear=%d topo=%u cnt=%u vbofs=%u startv=%u rt=%u\n",
+                        d, dr->is_vp, dr->is_clear, dr->topology, dr->vertex_count,
+                        dr->vb_byte_offset, dr->vb_byte_offset / VERTEX_STRIDE, dr->rt_off);
+            }
+            fflush(stderr);
+          } }
 
         /* Replay each recorded draw with its own primitive topology and
          * the matching PSO class (triangle / line / point). The PSO class
@@ -2478,6 +2518,37 @@ static void render_frame(void)
     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
+
+    /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
+     * frame. The legacy (is_vp=0) DrawInstanced path silently produced ZERO
+     * pixels in flOw's render injection while ClearRenderTargetView worked, and
+     * every input (verts, offsets, layout, MVP, PSO, root sig, depth, cull) was
+     * verified correct -- so the only remaining explanation is a validation
+     * error the debug layer is swallowing. Off unless the env var is set. */
+    { static int _iq = -1;
+      if (_iq < 0) { const char* e = getenv("D3D12_IQ"); _iq = e ? 1 : 0; }
+      if (_iq && s_d3d.device) {
+        ID3D12InfoQueue* iq = NULL;
+        if (SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(
+                s_d3d.device, &IID_ID3D12InfoQueue, (void**)&iq)) && iq) {
+            UINT64 n = iq->lpVtbl->GetNumStoredMessages(iq);
+            static int _printed = 0;
+            for (UINT64 mi = 0; mi < n && _printed < 80; mi++) {
+                SIZE_T len = 0;
+                iq->lpVtbl->GetMessage(iq, mi, NULL, &len);
+                D3D12_MESSAGE* m = (D3D12_MESSAGE*)malloc(len);
+                if (m && SUCCEEDED(iq->lpVtbl->GetMessage(iq, mi, m, &len))) {
+                    fprintf(stderr, "[D3D12-IQ][sev=%d id=%d] %s\n",
+                            (int)m->Severity, (int)m->ID, m->pDescription);
+                    _printed++;
+                }
+                free(m);
+            }
+            if (n) iq->lpVtbl->ClearStoredMessages(iq);
+            iq->lpVtbl->Release(iq);
+            fflush(stderr);
+        }
+      } }
 
     if (dumping) {
         wait_for_gpu();            /* ensure the copy finished before mapping */
@@ -3165,8 +3236,15 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * vertex program does the MVP transform (gcm/cube draws its cube this way);
      * the fixed-function fallback below applies no transform, so 3D geometry
      * ends up in object space (invisible/garbage). */
+    /* ...but only when the guest ACTUALLY HAS a vertex program. The VP path
+     * transforms via the guest's VP microcode; with no microcode loaded it can
+     * transform nothing and the draw silently produces zero pixels (it also
+     * uploads to vp_vb, leaving the fixed-function vb empty). Geometry that is
+     * already in clip space with no VP -- e.g. flOw's injected scene -- must go
+     * down the fixed-function passthrough below instead. */
     if (primitive == 5 /* CELL_GCM_PRIMITIVE_TRIANGLES */ &&
-        s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
+        s_d3d.vp_vb_mapped && s_d3d.vp_root_sig &&
+        s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
         u32 rec = s_d3d.vp_vb_offset;
         u32 emitted = upload_tris_vp(s_d3d.current_rsx_state, first, count);
         if (emitted && s_d3d.draw_count < MAX_DRAWS) {

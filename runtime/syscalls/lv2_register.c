@@ -53,6 +53,28 @@ static int64_t sys_tty_write(ppu_context* ctx)
         /* Write guest string data to host stderr */
         fwrite(vm_base + buf_ea, 1, len, stderr);
         fflush(stderr);
+        /* CRI error back-chain (YDKJ_CRIBT=1): dump the guest LR chain when a CRI
+         * null-pointer / criFs error is printed, to locate the failing call. */
+        if (getenv("YDKJ_CRIBT") && len < 4096) {
+            char tmp[256]; uint32_t n = len < 255 ? len : 255;
+            memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
+            if (strstr(tmp, "NULL pointer") || strstr(tmp, "E2004090") || strstr(tmp, "CRICRS")) {
+                static int _cb = 0; if (_cb++ < 4) {
+                    uint32_t sp = (uint32_t)ctx->gpr[1];
+                    fprintf(stderr, "[CRIBT] \"%.60s\" cia=0x%08X lr=0x%08X chain:", tmp,
+                            (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+                    for (int i = 0; i < 24 && sp && sp < 0x10000000u; i++) {
+                        uint32_t nsp; memcpy(&nsp, vm_base + sp, 4);
+                        nsp = ((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
+                        if (nsp <= sp || nsp >= 0x10000000u) break;
+                        uint32_t lr; memcpy(&lr, vm_base + nsp + 0x10, 4);
+                        lr = ((lr>>24)&0xFF)|((lr>>8)&0xFF00)|((lr<<8)&0xFF0000)|((lr<<24)&0xFF000000);
+                        fprintf(stderr, " %08X", lr); sp = nsp;
+                    }
+                    fprintf(stderr, "\n"); fflush(stderr);
+                }
+            }
+        }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title logs a PhyreEngine
          * init failure, dump the guest back-chain so we can locate the failing
          * function (the message itself goes through here, not _sys_printf). */
@@ -418,10 +440,11 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
 
-    /* Empty image (entry=0) on a cellSpurs SPU thread -> route to the HLE SPURS
-     * kernel (YDKJ_SPURSKERNEL) so group_start runs a live SPU instead of an
-     * instant no-op. */
-    if (t->entry_point == 0 && getenv("YDKJ_SPURSKERNEL")) {
+    /* Empty image (entry=0) OR the real SPURS kernel-A entry (0x818, now that
+     * _sys_spu_image_import parses the kernel ELF) on a cellSpurs SPU thread ->
+     * route to the HLE SPURS kernel (YDKJ_SPURSKERNEL) so group_start runs a live
+     * SPU instead of an instant no-op. */
+    if ((t->entry_point == 0 || t->entry_point == 0x818) && getenv("YDKJ_SPURSKERNEL")) {
         t->entry_point = YDKJ_SPURS_KERNEL_ENTRY;
         static int s_reg = 0;
         if (!s_reg) { s_reg = 1;
@@ -509,12 +532,16 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
      * whether libsre has populated it BEFORE the SPU kernel threads spawn. */
     { extern uint8_t* vm_base; static int s_d=0;
       if (vm_base && s_d++ < 4) {
-        const uint8_t* in = vm_base + 0x40009D00;
-        fprintf(stderr, "[INSTDUMP] group_start id=0x%X CellSpurs@0x40009D00 (0x140 bytes):\n", id);
+        /* Dump BOTH candidate instance addrs: the real one is 0x40009F00 (init arg);
+         * 0x40009D00 was the old hardcoded guess. See which libsre actually populated. */
+        for (uint32_t _ia = 0x40009D00; _ia <= 0x40009F00; _ia += 0x200) {
+        const uint8_t* in = vm_base + _ia;
+        fprintf(stderr, "[INSTDUMP] group_start id=0x%X CellSpurs@0x%08X (0x140 bytes):\n", id, _ia);
         for (int row=0; row<10; row++){
             fprintf(stderr, "  +0x%03X:", row*16);
             for (int i=0;i<4;i++){ int o=row*16+i*4; uint32_t w=((uint32_t)in[o]<<24)|((uint32_t)in[o+1]<<16)|((uint32_t)in[o+2]<<8)|in[o+3]; fprintf(stderr," %08X",w);}
             fprintf(stderr, "\n");
+        }
         }
         fflush(stderr);
         /* Arm a page-guard on the instance page so we catch the libsre function
@@ -677,8 +704,9 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
      * destroy so the group + threads survive, to see whether libsre then proceeds
      * (group_start) or just re-asserts. Logs the caller for diagnosis. */
     if (getenv("YDKJ_KEEPGROUP") && id == 0x1000) {
-        fprintf(stderr, "[SPU] group_destroy id=0x%X SKIPPED (YDKJ_KEEPGROUP) caller_lr=0x%08X cia=0x%08X\n",
-                id, (uint32_t)ctx->lr, (uint32_t)ctx->cia);
+        fprintf(stderr, "[SPU] group_destroy id=0x%X SKIPPED (YDKJ_KEEPGROUP) caller_lr=0x%08X cia=0x%08X r1=0x%08X r2=0x%08X\n",
+                id, (uint32_t)ctx->lr, (uint32_t)ctx->cia, (uint32_t)ctx->gpr[1], (uint32_t)ctx->gpr[2]);
+        { extern void ppu_dump_guest_stack(ppu_context*, const char*); ppu_dump_guest_stack(ctx, "group_destroy-caller"); }
         fflush(stderr);
         ctx->gpr[3] = 0;
         return 0;
@@ -1245,6 +1273,14 @@ int lv2_try_syscall(ppu_context* ctx)
     lv2_syscall_fn h = g_lv2_syscalls.handlers[num];
     if (!h || h == lv2_syscall_unimplemented)
         return 0;
+    /* YDKJ diag: full event-syscall trace (#128..141) during SPURS init to find
+     * why libsre asserts ESRCH in event_helper.c. Snapshot args BEFORE handler. */
+    uint32_t _a3 = (uint32_t)ctx->gpr[3], _a4 = (uint32_t)ctx->gpr[4], _a5 = (uint32_t)ctx->gpr[5];
     ctx->gpr[3] = (uint64_t)h(ctx);
+    if (getenv("YDKJ_GFXSCAN") && num >= 128 && num <= 141) {
+        static int _e = 0; if (_e++ < 60)
+            fprintf(stderr, "[EVT-SC] #%u(r3=0x%08X r4=0x%08X r5=0x%08X) -> 0x%08X lr=0x%08X\n",
+                    num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
+    }
     return 1;
 }

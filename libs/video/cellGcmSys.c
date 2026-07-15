@@ -138,6 +138,22 @@ static u32 s_flip_handler_opd     = 0;
 static u32 s_vblank_handler_opd   = 0;
 static u32 s_user_handler_opd     = 0;
 static u32 s_second_v_handler_opd = 0;
+/* YDKJ_HANDLERFIX: the handler OPD's code word (*(opd)) gets clobbered to 0 by a
+ * mislifted store, so g_ps3_guest_caller reads code=0 -> "not registered" and the
+ * game's per-flip/vblank callback never fires -> render/advance loop stalls. We
+ * capture the code at Set*Handler time (OPD still valid) and restore the OPD word
+ * before each invocation if it's been clobbered. */
+extern u32 vm_read32(unsigned int);
+static u32 s_flip_handler_code    = 0;
+static u32 s_vblank_handler_code  = 0;
+static void ydkj_restore_handler_opd(u32 opd, u32 code) {
+    if (!getenv("YDKJ_HANDLERFIX") || !opd || !code) return;
+    extern u8* vm_base; if (!vm_base) return;
+    if (vm_read32(opd) == 0) {
+        u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
+        static int _n=0; if(_n++<6) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
+    }
+}
 /* Legacy host-typed slots kept around for any caller still treating
  * these as host pointers. New code should use the _opd slots. */
 static CellGcmFlipHandler    s_flip_handler    = NULL;
@@ -498,6 +514,8 @@ u32 cellGcmGetFlipStatus(void)
 void cellGcmTickVBlank(void)
 {
     s_vblank_count++;
+    if (getenv("YDKJ_HANDLERTRACE")) { static int _n=0; if(_n++<4) fprintf(stderr,"[GCM-TICK] VBlank #%llu vblank_handler_opd=0x%08X flip_handler_opd=0x%08X caller=%p\n",(unsigned long long)s_vblank_count,s_vblank_handler_opd,s_flip_handler_opd,(void*)g_ps3_guest_caller); }
+    ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
     if (s_vblank_handler_opd && g_ps3_guest_caller) {
         g_ps3_guest_caller(s_vblank_handler_opd,
                            (uint64_t)s_vblank_count, 0, 0, 0);
@@ -509,6 +527,8 @@ void cellGcmTickFlip(void)
     /* A display refresh: the pending flip is now complete (unblocks a guest
      * cellGcmSetWaitFlip). */
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    if (getenv("YDKJ_HANDLERTRACE")) { static int _n=0; if(_n++<4) fprintf(stderr,"[GCM-TICK] Flip flip_handler_opd=0x%08X (invoked=%d)\n",s_flip_handler_opd,(s_flip_handler_opd && g_ps3_guest_caller)?1:0); }
+    ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
     if (s_flip_handler_opd && g_ps3_guest_caller) {
         g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0);
     }
@@ -912,6 +932,7 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
     printf("[cellGcmSys] SetFlipHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_flip_handler_opd = (u32)(size_t)handler;
     s_flip_handler = handler;
+    { u32 c = s_flip_handler_opd ? vm_read32(s_flip_handler_opd) : 0; if (c) s_flip_handler_code = c; }
 }
 
 /* NID: 0xA547ADDE */
@@ -920,6 +941,7 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
     printf("[cellGcmSys] SetVBlankHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_vblank_handler_opd = (u32)(size_t)handler;
     s_vblank_handler = handler;
+    { u32 c = s_vblank_handler_opd ? vm_read32(s_vblank_handler_opd) : 0; if (c) s_vblank_handler_code = c; }
 }
 
 /* NID: 0xF9BFCDA3 */

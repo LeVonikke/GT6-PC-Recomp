@@ -395,6 +395,23 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
     /* Poll fresh state */
     pad_poll_backend();
 
+    /* YDKJ_INJECT_PAD: the game's wait loop polls the pad (cellPadSetActDirect /
+     * GetData) -- if it's parked on a "press button" prompt after loading, no
+     * host input means it waits forever. Inject a real button PULSE (CROSS+START+
+     * CIRCLE) so it advances. Legit input simulation, not forged pixels. */
+    if (getenv("YDKJ_INJECT_PAD") && port_no < PAD_MAX_HOST_PORTS) {
+        static long _pc = 0; _pc++;
+        const char* be = getenv("YDKJ_PAD_BTN"); u16 btn = be ? (u16)strtoul(be,0,0) : 0x0008u; /* default START */
+        long delay = 3000; const char* de = getenv("YDKJ_PAD_DELAY"); if(de) delay = strtol(de,0,0);
+        /* Delay past init, then a single clean pulse every ~180 calls (press 15, release 165). */
+        if (_pc > delay) {
+            long ph = (_pc - delay) % 180;
+            if (ph < 15) s_host_state[port_no].buttons |= btn;
+            else         s_host_state[port_no].buttons &= ~btn;
+            s_host_state[port_no].connected = 1;
+        }
+    }
+
     if (port_no >= PAD_MAX_HOST_PORTS || (!s_host_state[port_no].connected && port_no != 0)) {
         goto emit;   /* data stays zeroed -> len=0 */
     }
