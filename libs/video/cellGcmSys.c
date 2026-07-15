@@ -506,6 +506,15 @@ void cellGcmTickFlip(void)
  * the recompiled code to update it via vm_write). Once that's fixed (+ the title
  * runs past its early self-exit to actually draw), parse get..put here with
  * rsx_process_command_buffer so the game's clears/draws render. */
+/* NV406E_SET_REFERENCE (FIFO method 0x50): the RSX writes the reference value to
+ * the control register's `ref` field (control_ea+0x8). cellGcmFinish / the game's
+ * fence loops poll it for CPU<->RSX sync; without it they spin forever. Called
+ * from rsx_process_method as the drained FIFO is parsed. */
+void cellGcm_rsx_set_reference(u32 val)
+{
+    if (s_control_ea) vm_write32(s_control_ea + 0x8, val);
+}
+
 void cellGcm_rsx_process_fifo(void)
 {
     static rsx_state s_state;
