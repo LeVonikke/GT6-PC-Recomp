@@ -388,11 +388,13 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         /* Control register in GUEST memory: cellGcmGetControlRegister must hand the
          * title a guest EA, not &s_control (a host pointer it would truncate to a
          * garbage guest addr like 0xC708C708). {put,get,ref}. */
-        s_control_ea = galloc ? galloc(16, 16) : 0;
+        /* Allocate a generous, fully-zeroed control block: the title reads fields
+         * past {put,get,ref} (e.g. _jsGcmFifoReadReference reads a reference at
+         * +0x48 via the fifo struct), and a 16-byte alloc left those as garbage
+         * that never satisfied the FIFO-init wait-for-reference==0 loop. */
+        s_control_ea = galloc ? galloc(0x100, 16) : 0;
         if (s_control_ea) {
-            gwrite32(s_control_ea + 0x0, 0);            /* put */
-            gwrite32(s_control_ea + 0x4, 0);            /* get */
-            gwrite32(s_control_ea + 0x8, 0);            /* ref */
+            for (u32 o = 0; o < 0x100; o += 4) gwrite32(s_control_ea + o, 0);
         }
         fprintf(stderr, "[GCM] SetupContext ctx_ea=0x%08X cmdbuf=0x%08X cmdSize=0x%X ioAddr=0x%08X ctrl_ea=0x%08X\n", cdata, cmdbuf, cmdSize, ioAddress, s_control_ea);
     }
