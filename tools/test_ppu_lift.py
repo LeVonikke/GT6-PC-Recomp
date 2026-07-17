@@ -80,6 +80,13 @@ def cmpi_form(op, bf, l, ra, imm):
 def vx_form(xo, vd, va, vb):
     return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | xo
 
+def fp_x_form(xo, bt, rc=0):   # opcd-63 X-form FPSCR bit ops (mtfsb0/mtfsb1/mtfsfi); RA/RB unused
+    return (63 << 26) | (bt << 21) | (xo << 1) | rc
+
+def spr_form(xo, rt, spr_num):   # mfspr/mtspr; the 10-bit spr field is two 5-bit halves swapped
+    spr_raw = ((spr_num & 0x1F) << 5) | ((spr_num >> 5) & 0x1F)
+    return (31 << 26) | (rt << 21) | (spr_raw << 11) | (xo << 1)
+
 # ---------------------------------------------------------------------------
 # PowerISA reference semantics (independent of the lifter). 64-bit registers;
 # CA per the 64-bit operation (PowerISA v2.03, the manual in the repo root).
@@ -637,6 +644,56 @@ def build_vcases():
 build_vcases()
 
 # ---------------------------------------------------------------------------
+# Decode/lift-only checks: FPSCR bit ops (mtfsb0/mtfsb1/mtfsfi) and the
+# VRSAVE mfspr/mtspr pair. Their correct lift is a leading "/* ... */"
+# comment (a visible no-op, since FPSCR/VRSAVE are unmodeled), which is
+# indistinguishable from an unhandled instruction to the CASES driver above
+# (its "code.startswith('/*')" skip heuristic would drop them from the
+# generated C file either way), so verify them here directly against
+# ppu_disasm.decode and PPULifter._translate instead.
+# ---------------------------------------------------------------------------
+
+def check_decode_and_lift():
+    lifter = PPULifter()
+    dummy = LiftedFunction(name="conf", start_addr=0, end_addr=0x10000)
+    fails = [0]
+
+    def check(label, word, expect_mn, operand_substr=None, code_substr=None):
+        insn = ppu_disasm.decode(word, 0x30000)
+        mn = insn.mnemonic.rstrip(".")
+        if mn != expect_mn:
+            print(f"FAIL {label}: decoded as {insn.mnemonic} {insn.operands} "
+                  f"(word {word:#010x}), want {expect_mn}")
+            fails[0] += 1
+            return
+        if operand_substr and operand_substr not in insn.operands:
+            print(f"FAIL {label}: operands {insn.operands!r} missing {operand_substr!r}")
+            fails[0] += 1
+            return
+        code = lifter._translate(insn, dummy)
+        if code.startswith("/* TODO"):
+            print(f"FAIL {label}: lifter fell through to the unhandled catch-all: {code}")
+            fails[0] += 1
+            return
+        if code_substr and code_substr not in code:
+            print(f"FAIL {label}: lifted code {code!r} missing {code_substr!r}")
+            fails[0] += 1
+            return
+        print(f"[fpscr/vrsave] ok {label}: {insn.mnemonic} {insn.operands} -> {code}")
+
+    check("mtfsb0", fp_x_form(70, 5), "mtfsb0", code_substr="unmodeled")
+    check("mtfsb1", fp_x_form(38, 5), "mtfsb1", code_substr="unmodeled")
+    check("mtfsfi", fp_x_form(134, 5), "mtfsfi", code_substr="unmodeled")
+    check("mfspr VRSAVE", spr_form(339, 3, 256), "mfspr",
+          operand_substr="VRSAVE", code_substr="ctx->gpr[3] = 0")
+    check("mtspr VRSAVE", spr_form(467, 3, 256), "mtspr",
+          operand_substr="VRSAVE", code_substr="unmodeled")
+
+    n_ok = 5 - fails[0]
+    print(f"[fpscr/vrsave] {n_ok} checks passed, {fails[0]} FAILED")
+    return fails[0] == 0
+
+# ---------------------------------------------------------------------------
 # C driver generation
 # ---------------------------------------------------------------------------
 
@@ -826,6 +883,8 @@ def main():
     ap.add_argument("--emit", action="store_true", help="only write the C file")
     args = ap.parse_args()
 
+    decode_ok = check_decode_and_lift()
+
     os.makedirs(os.path.join(ROOT, "scratch"), exist_ok=True)
     cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")   # preamble is C++ (extern "C")
     epath = os.path.join(ROOT, "scratch", "ppu_conformance.exe")
@@ -855,7 +914,7 @@ def main():
             print(ln)
     if r.returncode == 2:
         print("COMPILE FAILED -- see", log)
-    sys.exit(0 if r.returncode == 0 else 1)
+    sys.exit(0 if (r.returncode == 0 and decode_ok) else 1)
 
 if __name__ == "__main__":
     main()

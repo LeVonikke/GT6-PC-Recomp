@@ -193,7 +193,7 @@ tests (`runtime/spu/tests/`: sum, shufb, DMA, brsl-return).
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **97 modules complete, 1 partial (media decode), 250+ files, 70,000+ lines of code.**
+We're building HLE implementations based on RPCS3's module system. **97 modules complete, 1 partial (media decode), 283 files, ~74,000 lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -217,7 +217,7 @@ We're building HLE implementations based on RPCS3's module system. **97 modules 
 | **Fibers** | cellFiber (PPU fibers via Windows Fibers/ucontext) | ✅ Complete |
 | **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
 | **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
-| **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps), RSX command processor (NV47xx parsing, state tracking, backend callbacks), null backend (Win32 window) | ✅ Complete |
+| **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps, FIFO walker + ring recycle), RSX command processor (NV47xx parsing, state tracking, backend callbacks), **live D3D12 backend** (executes the title's real NV4097 vertex/fragment programs — indexed draws, per-draw VP constants + textures, render-to-texture, MRT, FP predication), null backend (Win32 window) | ✅ Complete |
 | **SPURS** | cellSpurs (management APIs, event flags, task/workload tracking), cellSpursJq (job queues with wait/signal), cellDaisy (real ring buffer FIFO) | ✅ Complete |
 | **Core Runtime** | cellSysutil (BGM, cache, disc), cellSysmodule, sysPrxForUser (real lwmutex/lwcond/threads) | ✅ Complete |
 | **Media Pipeline** | cellPamf (real PAMF header + stream descriptor parsing), cellDmux (callback sequencing), cellVdec/cellAdec (PICOUT/PCMOUT callbacks, no actual decode — needs FFmpeg), cellSail (state machine) | 🔨 Partial |
@@ -285,7 +285,7 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 | **flOw** (thatgamecompany) | NPUA80001 | 92K functions, game reaches main() init, module loading + sysutil callbacks working, trampoline system for split-function chains, ~10K TODOs, D3D12 backend ready | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
 | **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 33K functions lifted, CRT init + HLE framework wired, indirect call dispatch | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
 | **The Simpsons Arcade Game** (Konami) | NPUB30563 | 14.7K functions; boots through CRT + GCM init with a live D3D12 window; a Konami arcade *emulator* EBOOT that routes rendering through CRI middleware on SPURS SPU tasks — drove the SPU recompilation work; blocked on the SPU-task pipeline | [sp00nznet/simpsonsarcade-ps3](https://github.com/sp00nznet/simpsonsarcade-ps3) |
-| **You Don't Know Jack** (Jellyvision/THQ) | BLUS30569 | 5,859 functions; **boots the full init stack to its main game loop** and runs a live D3D12 clear+flip at 60 Hz. Scaleform Flash UI + FMOD audio — a menu/UI-heavy title, an ideal recomp target. Frontier: GCM ring-wrap flush callback + a `0xC708C708` scene-dispatch poison gate the first real draws | [sp00nznet/youdontknowjack](https://github.com/sp00nznet/youdontknowjack) |
+| **You Don't Know Jack** (Jellyvision/THQ) | BLUS30569 | 5,859 functions; **boots the full init stack and renders** — a real double-buffered flip loop through the live D3D12 backend (~2,300 guest flip requests in 40 s, alternating buffers). Scaleform Flash UI + FMOD audio — a menu/UI-heavy title, an ideal recomp target. The `0xC708C708` scene-dispatch poison and the GCM ring-wrap wedge that used to gate the first draws are both fixed (real command-buffer-full callback → drain + ring recycle). Frontier: the SPURS/CRI task pipeline — the LLE `libsre` SPU-kernel path currently only comes up in Debug builds | [sp00nznet/youdontknowjack](https://github.com/sp00nznet/youdontknowjack) |
 
 Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
 
@@ -338,6 +338,34 @@ ps3recomp is built by a growing community. See **[CONTRIBUTORS.md](CONTRIBUTORS.
 for who did what — thank you, everyone.
 
 ## Changelog
+
+### v0.7.0 — *"First Draw"* (July 2026)
+<!-- TODO(maintainer): version + codename are a guess -- rename freely. -->
+*The RSX draw engine lands. [@sagemono](https://github.com/sagemono)'s renderer executes the title's own NV4097 vertex and fragment programs on D3D12, and **You Don't Know Jack now renders** — a real double-buffered flip loop, verified by booting it. Plus [@canersaka](https://github.com/canersaka)'s PPU/SPU correctness batch, and the SPU image-import path SPURS titles need before any SPU work can run.*
+
+**Rendering**
+- **Live D3D12 draw engine** — executes the guest's real vertex program (pixel-perfect dbgfont text), then guest fragment-program pipelines, per-draw VP constants and textures, indexed draws, render-to-texture, MRT, multi-unit textures, FP predication/branches, float RTs, and a VS cache keyed by ucode hash — *[@sagemono](https://github.com/sagemono)* (#43, #76)
+- **Present correctness** — present only on guest flip (partial-frame flicker), present at the clear boundary (ring-wrap blink), flips ordered against the drain, honest flip status — *[@sagemono](https://github.com/sagemono)*
+- **GCM FIFO ring recycle on wrap** — the command ring never recycled (the context callback OPD was left null), so titles wedged ~200 frames in and the render path aborted with the infamous `0xC708C708`. A real command-buffer-full callback now drains and resets the ring — *[@sagemono](https://github.com/sagemono)*
+
+**Lift & decode**
+- **`blrl` dispatched as an indirect call** — it was lumped with `blr` and emitted a bare `return;`, dropping the call *and* skipping the frame epilogue, so `r1` leaked the frame size on every function-descriptor call — *[@sagemono](https://github.com/sagemono)* (#42)
+- **EBOOT (`ET_EXEC`) import parsing** — the lib-stub table was only reachable via the PRX `module_info` path, so every retail main executable reported 0 imports; now located via `PT_PROC_PRX_PARAM`. Minecraft: 0 → 345 NIDs across 30 modules — *[@sagemono](https://github.com/sagemono)* (#41)
+- **`lift_function` indexed by address** — an O(refs·N) mid-function pass hung the lifter indefinitely after "100% lifted" on large titles; now bisect over a cached sorted index — *[@sagemono](https://github.com/sagemono)* (#41)
+- **Rotate-by-0 undefined behaviour** — `v >> (64 - n)` at n=0 is UB, and clang miscompiled the `clrldi` truncation idiom every 32-bit address cast lowers to — *[@sagemono](https://github.com/sagemono)* (#41)
+- **Lifter torture suite** — 3,793 KATs against an independent PPC model — *[@sagemono](https://github.com/sagemono)* (#64)
+- **VMX element-wise ops read big-endian lanes** — values were byte-reversed on x86, so every float lane op quietly computed on the wrong data — *[@canersaka](https://github.com/canersaka)* (#74)
+- **D-form loads/stores treat `rA=0` as a literal zero base**, not `GPR[0]` (#72); **update forms write back `rA`** for indexed stores (#71) and FP loads/stores (#73) — dropping the write-back leaves `rA` stale and corrupts every subsequent `(rA)`-relative access — *[@canersaka](https://github.com/canersaka)*
+- **`lmw`/`stmw`** (#68), **`mulldo`** overflow form (#70), **`stvlx`/`stvrx`/`stvlxl`/`stvrxl`** Cell unaligned vector stores (#61), **value-verified CAS** for `lwarx`/`stwcx` and `ldarx`/`stdcx` (#62), and an **FP correctness batch** — `fcmpu` NaN ordering, `fcti` saturation, single rounding, `vctsxs`/`vctuxs` (#60) — *[@canersaka](https://github.com/canersaka)*
+- **`fpscr` bit ops + `vrsave` decoded as visible no-ops** — `mtfsb0`/`mtfsb1`/`mtfsfi` were undecoded and emitted as a raw `.word`, an invisible dropped instruction — *[@canersaka](https://github.com/canersaka)* (#69)
+- **SPU**: `brsl` target parse broken by the disasm link-register fix, so every call lifted as a silent no-op (#58); `bisl`/`bisled` target register; single-round `fma`/`fms`/`fnms`, `fesd`/`frds` from the left word slot, `fi`/`frest`/`frsqest` interpolation (#51) — *[@canersaka](https://github.com/canersaka)*
+
+**Runtime & lv2**
+- **`sys_spu_image_import` implemented + SPU-image syscall numbers fixed** — import was mis-numbered 157 (that's `_sys_spu_image_import`) and collided with `SYS_SPU_IMAGE_CLOSE`, so a title's import call dispatched to the close stub and the image struct was left zeroed (entry=0 → matched no fallback → the SPU thread "instantly completed"). Replaced the zero-init stub with a real SPU-ELF32 `PT_LOAD` → `sys_spu_segment[]` parser — *[@sagemono](https://github.com/sagemono)* (#57)
+- **`_sys_spu_image_import` (sysPrxForUser NID `0xEBE5F72F`)** — the user-space wrapper `libsre` invokes during `cellSpursInitialize`; previously unresolved, so the SPURS SPU kernel image was never parsed and the SPU threads came up at entry 0
+- **18 lv2 syscall numbers corrected** against the SDK's own `sys/syscall.h` (475.001) — the authoritative table. Three were live collisions: the lwmutex block sat on `SYS_RAW_SPU_CREATE_INTERRUPT_TAG`/`SET_INT_MASK`/`GET_INT_MASK` (150–152) and lwcond on `SYS_SPU_IMAGE_OPEN` (156). Now 125/125 match the SDK, 0 duplicates — *[@canersaka](https://github.com/canersaka)* (#65)
+- **`sys_mutex_trylock`** recursive fast path pairs the host critical section (#67); **`sys_spu_thread_group_create`** reads r5 as priority and the name from the attr struct (#66) — *[@canersaka](https://github.com/canersaka)*
+- **PS3 process-entry registers** (TLS descriptor + page size) and a function registry sized for >64k-function titles — *[@sagemono](https://github.com/sagemono)*
 
 ### v0.6.7 — *"Fine Print"* (July 2026)
 *The second half of the two-port review pass: [@canersaka](https://github.com/canersaka)'s remaining decode/ABI/timing fixes plus a lifter/HLE audit toolkit, and the title-agnostic robustness fixes from [@JonathanDC64](https://github.com/JonathanDC64)'s port that could be ported and build-verified cleanly.*
