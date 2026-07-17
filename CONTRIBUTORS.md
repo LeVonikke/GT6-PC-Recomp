@@ -91,6 +91,29 @@ sub-millisecond timeouts for event-flags/semaphores/mutexes (#50), corrected HLE
 ABI signatures across cellPamf/Sail/Http/Ssl/Net/sysNet/sceNpTrophy/cellGameData
 (#55), and a lifter/HLE audit toolkit + lv2 sync stress test (#56).
 
+*Also incorporated (unreleased)* — a PPU/SPU correctness batch, several of which
+were silent-miscompile classes rather than crashes:
+- **VMX element-wise ops read big-endian lanes** — values were byte-reversed on
+  x86, so every float lane op quietly computed on the wrong data (#74).
+- **D-form loads/stores treat `rA=0` as a literal zero base**, not `GPR[0]` (#72).
+- **Update forms write back `rA`** — indexed stores (#71) and FP loads/stores
+  (#73); dropping the write-back leaves `rA` stale and corrupts every subsequent
+  `(rA)`-relative access.
+- **`lmw`/`stmw`** load/store multiple word (#68), **`mulldo`** overflow form
+  (#70), and **`stvlx`/`stvrx`/`stvlxl`/`stvrxl`** Cell unaligned vector stores
+  (#61).
+- **Value-verified CAS** for `lwarx`/`stwcx` and `ldarx`/`stdcx` (#62).
+- **FP correctness batch** — `fcmpu` NaN ordering, `fcti` saturation, single
+  rounding, `vctsxs`/`vctuxs` (#60); plus the objdump decoder audit that found 5
+  missing VMX float ops.
+- **SPU**: `brsl` target parse broken by the disasm link-register fix — every call
+  lifted as a silent no-op (#58); `bisl`/`bisled` target register is the last
+  operand; single-round `fma`/`fms`/`fnms`, `fesd`/`frds` from the left word slot,
+  and `fi`/`frest`/`frsqest` base+step interpolation (#51).
+- **lv2**: `sys_mutex_trylock` recursive fast path pairs the host critical section
+  (#67); `sys_spu_thread_group_create` reads r5 as priority and the name from the
+  attr struct (#66).
+
 ### Jonathan Del Corpo — [@JonathanDC64](https://github.com/JonathanDC64)
 Correctness and robustness fixes distilled from a **Demon's Souls** port that
 stress-tested the toolkit against a ~106k-function title. The title-agnostic wins
@@ -135,6 +158,48 @@ Real-controller correctness surfaced by a DualShock-as-XInput bring-up
 - **analog-Y centering** — reflect the inverted Y about 128 (`256 - x`) instead
   of `255 - x`, which turned a centered stick into 127 (`0x7F`, aliasing
   SELECT+START self-exit + TRIANGLE).
+
+The **RSX draw engine** and the toolchain work behind it, developed across a
+homebrew TUI (cellmark), vkcube, wave, and a PSL1GHT/Tiny3D bring-up
+(*unreleased*):
+
+*Rendering*
+- **2D/dbgfont pipeline + vertex-program capture**, then **executing the title's
+  real NV4097 vertex program** on D3D12 for pixel-perfect text (#43) — grown from
+  there into guest fragment-program pipelines, per-draw textures and VP constants,
+  indexed draws, render-to-texture, MRT, multi-unit textures, FP predication and
+  branches, float RTs, and a VS cache keyed by ucode hash.
+- **Present correctness** — present only on guest flip (partial-frame flicker),
+  present at the clear boundary (ring-wrap blink), flips ordered against the
+  drain, honest flip status, synced non-blocking flips.
+- **FIFO ring recycle on wrap** — the command ring never recycled (the callback
+  OPD was null), wedging ~200 frames in; a real command-buffer-full callback now
+  drains and resets it.
+- **`cellGcmSetFlipCommand` context argument**, `MapMainMemory` never handing out
+  IO offset 0 (FIFO collision), back-end label byte-swap, and discrete-GPU
+  selection by default.
+
+*Lifter & toolchain*
+- **`blrl` dispatched as an indirect call** — it was lumped with `blr` and emitted
+  a bare `return;`, dropping the call *and* skipping the frame epilogue, so `r1`
+  leaked the frame size on every function-descriptor call (#42).
+- **EBOOT (`ET_EXEC`) import parsing** — the lib-stub table was only reachable via
+  the PRX module_info path, so every retail main executable reported 0 imports;
+  now located via `PT_PROC_PRX_PARAM`. Minecraft: 0 → 345 NIDs across 30 modules
+  (#41).
+- **`lift_function` indexed by address** — an O(refs·N) mid-function pass hung the
+  lifter indefinitely after "100% lifted" on large titles (~11.6k refs × 3M
+  instructions); now bisect over a cached sorted index (#41).
+- **Rotate-by-0 undefined behaviour** in the rotate helpers — `v >> (64 - n)` at
+  n=0 is UB, and clang miscompiled the `clrldi` truncation idiom that every 32-bit
+  address/index cast lowers to (#41).
+- **Function-registry sizing** for >64k-function titles, jump-table switches as
+  in-function computed gotos, multi-TOC jump-table discovery, and callee-save
+  detection that rejects a reused save slot / scratch spill.
+- **Lifter torture suite** — 3793 KATs against an independent PPC model (#64),
+  plus the fused-fmadd / PPC NaN / `mfspr`/`mtspr` semantics it surfaced.
+- **`sys_spu_image_import`** implemented (SPU ELF → entry point + segment table)
+  and the SPU image syscall numbers corrected (#57).
 
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
