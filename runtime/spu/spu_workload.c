@@ -22,6 +22,18 @@
  * YDKJ_CRI_RESUME poll-loop watches this to know real work arrived. */
 int g_cri_video_dma = 0;
 
+/* Game-provided lifted SPU symbol used only by the ydkj CRI-taskset diagnostic
+ * path below (image 22 + YDKJ_CRI_TASKSET). Weak default so titles that don't
+ * ship that SPU image still link; a game that lifts it supplies the strong def.
+ *
+ * MSVC has no __attribute__((weak)) and the runtime lib builds under MSVC (the
+ * per-game exe is clang-cl). Under MSVC we simply omit the default, which is
+ * exactly the pre-existing behaviour -- a title that doesn't ship the image gets
+ * an unresolved external, same as before this default was added. */
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((weak)) void tsp_spu_func_00000A00(spu_context* c) { (void)c; }
+#endif
+
 /* ---- fingerprint ------------------------------------------------------- */
 
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
@@ -280,8 +292,8 @@ static void spu_async_run(spu_async_job* j)
                 p[6]=(uint8_t)(inst>>8);  p[7]=(uint8_t)inst;   /* lo32 */
                 fprintf(stderr, "[cri] YDKJ_CRI_TASKSET: loaded taskset policy@0xA00, LS[0x1C0]=inst, running policy entry (img23)\n");
                 fflush(stderr);
-                /* Run the taskset policy entry instead of the cri task entry. */
-                extern int32_t spu_run_lifted_job_abi(void(*)(spu_context*), uint8_t*, uint32_t, int, int, uint32_t*);
+                /* Run the taskset policy entry instead of the cri task entry.
+                 * (spu_run_lifted_job_abi is declared in spu_lifted_job.h.) */
                 int32_t prc = spu_run_lifted_job_abi(tsp_spu_func_00000A00, ls,
                                                      j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0);
                 fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);

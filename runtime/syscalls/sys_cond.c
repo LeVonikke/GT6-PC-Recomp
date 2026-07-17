@@ -67,10 +67,12 @@ int64_t sys_cond_create(ppu_context* ctx)
     uint32_t attr_addr   = LV2_ARG_PTR(ctx, 2);
 
     /* Validate the associated mutex */
-    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-    if (!g_sys_mutexes[mutex_id - 1].active)
-        return (int64_t)(int32_t)CELL_ESRCH;
+    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX) {
+        if(getenv("YDKJ_SYNCLOG")) fprintf(stderr,"[SYNC] sys_cond_create FAIL: mutex_id=%u out of range -> ESRCH (cond var not created -> worker will spin on null)\n",mutex_id);
+        return (int64_t)(int32_t)CELL_ESRCH; }
+    if (!g_sys_mutexes[mutex_id - 1].active) {
+        if(getenv("YDKJ_SYNCLOG")) fprintf(stderr,"[SYNC] sys_cond_create FAIL: mutex_id=%u INACTIVE -> ESRCH (cond var not created -> worker spins on null)\n",mutex_id);
+        return (int64_t)(int32_t)CELL_ESRCH; }
 
     cond_table_lock();
 
@@ -152,6 +154,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
     fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu) tid=%llu lr=0x%08X\n", cond_id, (unsigned long long)timeout_us,
             (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    /* YDKJ_THREADGATE: creating thread is blocking -> let gated workers run. */
+    { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
 #ifdef _WIN32
     if (cond_id == 7) {
         static int _n = 0;

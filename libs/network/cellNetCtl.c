@@ -238,9 +238,10 @@ s32 cellNetCtlGetNatInfo(CellNetCtlNatInfo* natInfo)
 
     natInfo = GUEST_PTR(natInfo, CellNetCtlNatInfo*);
     natInfo->size        = ps3_bswap32((u32)sizeof(CellNetCtlNatInfo));
-    natInfo->nat_type    = ps3_bswap32((u32)CELL_NET_CTL_NATINFO_NAT_TYPE_2); /* moderate */
-    natInfo->stun_status = 0;
     natInfo->upnp_status = 0;
+    natInfo->stun_status = 0;
+    natInfo->nat_type    = ps3_bswap32((u32)CELL_NET_CTL_NATINFO_NAT_TYPE_2); /* moderate */
+    natInfo->mapped_addr = 0;
 
     printf("[cellNetCtl] GetNatInfo() -> NAT Type 2\n");
     return CELL_OK;

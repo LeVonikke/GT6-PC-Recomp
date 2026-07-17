@@ -790,6 +790,27 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.operands = f"r{rd}, r{ra}, r{rb}"
             return result
 
+        # Cell unaligned vector STORES (were previously undecoded, so any
+        # vector store using them fell through to the op31_x fallback and got
+        # lifted as a TODO no-op -- a silent memory non-write, not just a
+        # wrong value).
+        if xo_full == 647:  # stvlx (Store Vector Left Indexed)
+            result.mnemonic = "stvlx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 679:  # stvrx (Store Vector Right Indexed)
+            result.mnemonic = "stvrx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 903:  # stvlxl
+            result.mnemonic = "stvlxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 935:  # stvrxl
+            result.mnemonic = "stvrxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+
         # Fall through – unknown ext opcode 31
         result.mnemonic = f"op31_x{xo_full}"
         result.operands = f"r{rd}, r{ra}, r{rb}"
@@ -935,9 +956,13 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         vmx_vx = {
             # Float arithmetic
             10: "vaddfp", 74: "vsubfp",
-            266: "vrefp", 330: "vrsqrtefp",
             1034: "vmaxfp", 1098: "vminfp",
-            714: "vrfim",  # round to FP integer toward -inf (floor)
+            # Float estimate family (vD, vB; step-64 XOs). vexptefp/vlogefp were
+            # decoding as vmx_x394/x458 -- found by diffing against spu/ppu-lv2-objdump
+            # over 17M instructions of retail code (objdump_audit.py).
+            266: "vrefp", 330: "vrsqrtefp", 394: "vexptefp", 458: "vlogefp",
+            # Round to FP integer (vD, vB; step-64 XOs): nearest / zero / +inf / -inf.
+            522: "vrfin", 586: "vrfiz", 650: "vrfip", 714: "vrfim",
 
             # Integer add/sub
             0: "vaddubm", 64: "vadduhm", 128: "vadduwm",

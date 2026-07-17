@@ -135,11 +135,15 @@ typedef union CellNetCtlInfo {
     u32                 upnp_config;
 } CellNetCtlInfo;
 
+/* Field order + the trailing mapped_addr verified against the DWARF in the
+ * Pirates / What-if debug builds (dwarf_abi.py): 20 bytes, not 16, and
+ * upnp_status/nat_type are NOT adjacent-after-size. */
 typedef struct CellNetCtlNatInfo {
     u32 size;
-    u32 nat_type;
-    u32 stun_status;
     u32 upnp_status;
+    u32 stun_status;
+    u32 nat_type;
+    u32 mapped_addr;   /* in_addr, network byte order; 0 when not NAT-mapped */
 } CellNetCtlNatInfo;
 
 /* Event handler callback */

@@ -15,25 +15,9 @@
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
 static u32 s_gcm_context_ea = 0;
-
-/* Synthetic guest code EA for the FIFO command-buffer-full callback. The title's
- * inline gcmReserve calls context->callback(context, count) when `current` nears
- * `end`; cellGcmSetupContext points the context's callback OPD at this EA, and
- * ppu_sysprx.cpp registers it (ppu_register_function) -> hle_gcm_callback ->
- * cellGcm_fifo_recycle(). It is only ever a bctr target, never read as memory,
- * so overlapping the RSX label window is harmless. MUST match
- * GCM_FIFO_CALLBACK_SENTINEL_EA in ppu_sysprx.cpp.  (via sagemono's fork) */
-#define GCM_FIFO_CALLBACK_SENTINEL_EA 0x03002F00u
-/* EA the ticker's RSX drain (cellGcm_rsx_process_fifo) has consumed up to.
- * Exposed so cellGcm_fifo_recycle can wait for the RSX to catch up before
- * recycling the ring, else the frame's just-written commands would be lost. */
-volatile u32 g_gcm_fifo_drained_ea = 0;
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
 #include <stdint.h>
 
 #ifdef _WIN32
@@ -82,19 +66,47 @@ static u64 get_timestamp_ns(void)
 static int  s_gcm_initialized = 0;
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+
+/* Count of guest flip requests (SetFlipCommand / SetPrepareFlip). The present
+ * loop uses this as the frame boundary: presenting only when a flip arrived
+ * keeps partially-drained frames off screen (the ticker otherwise presents on
+ * a fixed 16ms clock, and a drain that catches the guest mid-frame -- e.g.
+ * while it's blocked in the FIFO-wrap recycle callback -- would show a
+ * clear+few-draws frame as a visible flicker). */
+static volatile u32 s_flip_request_count = 0;
+
+u32 cellGcm_flip_request_count(void)
+{
+    return s_flip_request_count;
+}
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 
 /* Display buffers */
 static CellGcmDisplayInfo s_display_buffers[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
 static int s_display_buffer_set[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
 static u32 s_current_display_buffer_id = 0;
+/* Set by the flip (guest thread, at a get==put frame boundary); consumed by
+ * the ticker, which presents the accumulated batch BEFORE draining further --
+ * presenting on a raw flip-count change raced the drain and showed empty or
+ * mixed batches (wave: black flashes, layout flicker). */
+static volatile int s_flip_pending = 0;
+
+int cellGcm_take_flip_pending(void)
+{
+    int v = s_flip_pending;
+    s_flip_pending = 0;
+    return v;
+}
+
 
 /* Configuration */
 static CellGcmConfig s_config;
+/* Offset pages (1MB) known to be LOCAL-memory-derived (set by
+ * cellGcmAddressToOffset when the guest converts a localAddress-range EA). */
+static u8 s_local_offset_page[1024];
 
 /* Command buffer control */
 static CellGcmControl s_control;
-static u32 s_control_ea = 0;   /* guest EA of the control register (see getter) */
 
 /* Offset table storage */
 static u16 s_io_address_table[65536];
@@ -126,32 +138,21 @@ static u32 s_flip_handler_opd     = 0;
 static u32 s_vblank_handler_opd   = 0;
 static u32 s_user_handler_opd     = 0;
 static u32 s_second_v_handler_opd = 0;
-
-/* Resolved {code,toc} captured when each handler is registered. The title's
- * handler OPDs (0x530D70/78/80) get their code word clobbered in guest memory
- * by a later lifted store, so re-resolving the OPD at tick time yields the TOC
- * base instead of the real handler. Capture-at-registration + dispatch by
- * code+toc runs the real lifted handler regardless. */
-extern uint32_t ppu_active_lr(void);
-extern unsigned vm_read32(unsigned long long);
-extern unsigned long long ppu_guest_call_ct(u32 code, u32 toc, u64 a0, u64 a1, u64 a2, u64 a3);
-static u32 s_flip_handler_code=0,   s_flip_handler_toc=0;
-static u32 s_vblank_handler_code=0, s_vblank_handler_toc=0;
-extern void ppu_register_opd_fixup(u32 opd, u32 code, u32 toc);
-static void capture_handler_ct(u32 opd, u32* code, u32* toc) {
-    if (opd) { *code = vm_read32(opd); *toc = vm_read32(opd + 4);
-               /* record so the game's direct calls through this OPD (whose code
-                * word later gets clobbered) still resolve to the real handler. */
-               ppu_register_opd_fixup(opd, *code, *toc); }
-    else     { *code = 0; *toc = 0; }
-}
-/* Invoke the title's flip handler. The handler OPD (0x530D70) gets its code word
- * clobbered in guest memory (read back as the TOC base 0x544370 -> "not
- * registered"), so calling via the live OPD fails. Use the {code,toc} captured at
- * registration instead; fall back to the OPD only if nothing was captured. */
-static void invoke_flip_handler(u32 head) {
-    if (s_flip_handler_code)
-        ppu_guest_call_ct(s_flip_handler_code, s_flip_handler_toc, head, 0, 0, 0);
+/* YDKJ_HANDLERFIX: the handler OPD's code word (*(opd)) gets clobbered to 0 by a
+ * mislifted store, so g_ps3_guest_caller reads code=0 -> "not registered" and the
+ * game's per-flip/vblank callback never fires -> render/advance loop stalls. We
+ * capture the code at Set*Handler time (OPD still valid) and restore the OPD word
+ * before each invocation if it's been clobbered. */
+extern u32 vm_read32(unsigned int);
+static u32 s_flip_handler_code    = 0;
+static u32 s_vblank_handler_code  = 0;
+static void ydkj_restore_handler_opd(u32 opd, u32 code) {
+    if (!getenv("YDKJ_HANDLERFIX") || !opd || !code) return;
+    extern u8* vm_base; if (!vm_base) return;
+    if (vm_read32(opd) == 0) {
+        u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
+        static int _n=0; if(_n++<6) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
+    }
 }
 /* Legacy host-typed slots kept around for any caller still treating
  * these as host pointers. New code should use the _opd slots. */
@@ -199,6 +200,27 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
 #define GCM_LABEL_GUEST_BASE  0x03000000u
 #define GCM_LABEL_STRIDE      0x10u
 static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
+
+/* GCM control register (put/get/ref). This MUST live in guest memory: the title
+ * takes the pointer from cellGcmGetControlRegister, writes `put` when it kicks
+ * the FIFO, and spins reading `get`/`ref` to know the RSX has caught up. A host
+ * pointer would be read through vm_base as a guest address and never update, so
+ * every FIFO-space / cellGcmFinish wait would hang. Placed just past the 256
+ * label slots (0x03000000..0x03001000). Fields are big-endian (vm_write32). */
+#define GCM_CONTROL_GUEST_ADDR 0x03002000u
+
+/* Synthetic guest code EA for the FIFO command-buffer-full callback. The title's
+ * inline gcmReserve calls context->callback(context, count) when `current` nears
+ * `end`; we point the context's callback OPD at this EA and register it in the
+ * PPU function table (ppu_sysprx.cpp: hle_gcm_callback) so the indirect call
+ * routes back into cellGcm_fifo_recycle(). Lives in the injected control page,
+ * never real guest code. MUST match GCM_FIFO_CALLBACK_SENTINEL_EA there. */
+#define GCM_FIFO_CALLBACK_SENTINEL_EA 0x03002F00u
+
+/* EA the ticker's RSX drain has consumed up to. Exposed so the wrap callback can
+ * wait for the RSX to catch up before recycling the ring (else the frame's
+ * just-written commands are lost). Updated in cellGcm_rsx_process_fifo. */
+volatile u32 g_gcm_fifo_drained_ea = 0;
 
 /* ---------------------------------------------------------------------------
  * Internal helpers
@@ -315,6 +337,11 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
 
     s_local_mem_allocated = 0;
     s_io_mapping_count = 0;
+    /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
+     * this every unmapped EA page silently aliased io page 0 (and vice versa),
+     * producing plausible-but-wrong offsets instead of a translation failure. */
+    memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
+    memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
     s_current_display_buffer_id = 0;
     s_flip_handler = NULL;
     s_vblank_handler = NULL;
@@ -344,6 +371,11 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
         s_io_mapping_count = 1;
     }
 
+    /* Zero the guest-visible control register (put/get/ref). */
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, 0);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, 0);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, 0);
+
     s_gcm_initialized = 1;
     return CELL_OK;
 }
@@ -359,6 +391,14 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     if (cmdSize < 0x10000)
         cmdSize = 0x10000;
 
+    /* PSL1GHT's gcmInitBody passes ioAddress = 0, expecting gcm to allocate the
+     * IO region itself (the official SDK has the app allocate and pass it).
+     * Taking the 0 literally put the FIFO command buffer at guest address 0 --
+     * the guest then wrote its command stream over low memory and every offset
+     * resolution failed. Allocate a guest region of ioSize instead. */
+    if (ioAddress == 0 && galloc)
+        ioAddress = galloc(ioSize ? ioSize : 0x100000, 0x100000);
+
     cellGcmInit(cmdSize, ioSize, ioAddress);
 
     u32 cmdbuf = ioAddress;                 /* FIFO lives at the IO region start */
@@ -367,34 +407,20 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
         gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
         gwrite32(cdata + 0x8, cmdbuf);              /* current */
-        /* Command-buffer-full callback: a guest OPD {func, toc} whose func EA is
-         * the sentinel routed to hle_gcm_callback -> cellGcm_fifo_recycle. Without
-         * a real callback the ring never recycles and the FIFO wedges (a null
-         * callback OPD deref'd guest page 0 -> the 0xC708C708 poison vcall) once
-         * `current` reaches `end`.  (via sagemono's fork) */
-        {
-            u32 opd = galloc ? galloc(8, 8) : 0;
-            if (opd) {
-                gwrite32(opd + 0x0, GCM_FIFO_CALLBACK_SENTINEL_EA);  /* func EA */
-                gwrite32(opd + 0x4, 0);                              /* toc (unused) */
-                gwrite32(cdata + 0xC, opd);                          /* callback OPD */
-            } else {
-                gwrite32(cdata + 0xC, 0);
-            }
+        /* Command-buffer-full callback: a guest OPD {func, toc} routed to
+         * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
+         * ring never recycles and the FIFO wedges once `current` reaches `end`. */
+        u32 opd = galloc ? galloc(8, 8) : 0;
+        if (opd) {
+            gwrite32(opd + 0x0, GCM_FIFO_CALLBACK_SENTINEL_EA);  /* func EA */
+            gwrite32(opd + 0x4, 0);                              /* toc (unused) */
+            gwrite32(cdata + 0xC, opd);                          /* callback OPD */
+        } else {
+            gwrite32(cdata + 0xC, 0);
         }
         if (ctx_out_addr)
             gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
         s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
-        /* Control register in GUEST memory: cellGcmGetControlRegister must hand the
-         * title a guest EA, not &s_control (a host pointer it would truncate to a
-         * garbage guest addr like 0xC708C708). {put,get,ref}. */
-        s_control_ea = galloc ? galloc(16, 16) : 0;
-        if (s_control_ea) {
-            gwrite32(s_control_ea + 0x0, 0);            /* put */
-            gwrite32(s_control_ea + 0x4, 0);            /* get */
-            gwrite32(s_control_ea + 0x8, 0);            /* ref */
-        }
-        fprintf(stderr, "[GCM] SetupContext ctx_ea=0x%08X cmdbuf=0x%08X cmdSize=0x%X ioAddr=0x%08X ctrl_ea=0x%08X\n", cdata, cmdbuf, cmdSize, ioAddress, s_control_ea);
     }
     return cdata;
 }
@@ -424,11 +450,10 @@ s32 cellGcmGetConfiguration(CellGcmConfig* config)
 /* NID: 0x8572A8E0 */
 CellGcmControl* cellGcmGetControlRegister(void)
 {
-    /* Return the GUEST EA (the HLE adapter passes the return straight to r3, which
-     * the title uses as a guest pointer). Returning &s_control (host) would give
-     * the title a 64-bit host pointer truncated to a garbage guest addr. */
-    if (s_control_ea) return (CellGcmControl*)(size_t)s_control_ea;
-    return &s_control;
+    /* Return the GUEST address of the control register (not &s_control, a host
+     * pointer). The recompiled title reads/writes it through vm_base, so it must
+     * be a guest EA for put/get/ref to actually flow. */
+    return (CellGcmControl*)(uintptr_t)GCM_CONTROL_GUEST_ADDR;
 }
 
 /* ---------------------------------------------------------------------------
@@ -452,10 +477,13 @@ void cellGcmSetFlipMode(u32 mode)
 /* NID: 0xC44D8F34 */
 void cellGcmSetWaitFlip(void)
 {
-    /*
-     * Block until the current flip completes.  In the stub we consider
-     * flips to be instantaneous.
-     */
+    /* Block until the pending flip completes (the present thread marks it done
+     * via cellGcmTickFlip, ~once per display refresh). This throttles the title
+     * to vsync; without it the guest loops unthrottled and many frames batch
+     * into a single host present -> the console text stacks/duplicates. */
+    __declspec(dllimport) void __stdcall Sleep(unsigned long);
+    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+        Sleep(1);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 }
 
@@ -471,10 +499,10 @@ u32 cellGcmGetFlipStatus(void)
     /* Avoid host-calling the guest OPDs directly (they're not valid host
      * function pointers). Use cellGcmTickVBlank() / TickFlip() instead,
      * which dispatch via g_ps3_guest_caller — see below. */
-    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING) {
-        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-        s_last_flip_time = get_timestamp_ns();
-    }
+    /* Report the CURRENT status; cellGcmTickFlip (the ticker's 60Hz vblank
+     * beat) completes pending flips. The old self-completing version made
+     * every wait-for-flip loop exit on its first poll, so titles ran
+     * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
     return s_flip_status;
 }
 
@@ -486,16 +514,23 @@ u32 cellGcmGetFlipStatus(void)
 void cellGcmTickVBlank(void)
 {
     s_vblank_count++;
-    if (s_vblank_handler_code) {
-        ppu_guest_call_ct(s_vblank_handler_code, s_vblank_handler_toc,
-                          (uint64_t)s_vblank_count, 0, 0, 0);
+    if (getenv("YDKJ_HANDLERTRACE")) { static int _n=0; if(_n++<4) fprintf(stderr,"[GCM-TICK] VBlank #%llu vblank_handler_opd=0x%08X flip_handler_opd=0x%08X caller=%p\n",(unsigned long long)s_vblank_count,s_vblank_handler_opd,s_flip_handler_opd,(void*)g_ps3_guest_caller); }
+    ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+    if (s_vblank_handler_opd && g_ps3_guest_caller) {
+        g_ps3_guest_caller(s_vblank_handler_opd,
+                           (uint64_t)s_vblank_count, 0, 0, 0);
     }
 }
 
 void cellGcmTickFlip(void)
 {
-    if (s_flip_handler_code) {
-        ppu_guest_call_ct(s_flip_handler_code, s_flip_handler_toc, 1, 0, 0, 0);
+    /* A display refresh: the pending flip is now complete (unblocks a guest
+     * cellGcmSetWaitFlip). */
+    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    if (getenv("YDKJ_HANDLERTRACE")) { static int _n=0; if(_n++<4) fprintf(stderr,"[GCM-TICK] Flip flip_handler_opd=0x%08X (invoked=%d)\n",s_flip_handler_opd,(s_flip_handler_opd && g_ps3_guest_caller)?1:0); }
+    ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
+    if (s_flip_handler_opd && g_ps3_guest_caller) {
+        g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0);
     }
 }
 
@@ -506,43 +541,236 @@ void cellGcmTickFlip(void)
  * the recompiled code to update it via vm_write). Once that's fixed (+ the title
  * runs past its early self-exit to actually draw), parse get..put here with
  * rsx_process_command_buffer so the game's clears/draws render. */
+/* Translate an RSX IO offset to a guest EA via the offset table (1MB pages,
+ * populated by cellGcmInit / cellGcmMapMainMemory / MapEaIoAddress). */
+static u32 gcm_io2ea(u32 io)
+{
+    u32 page = io >> 20;
+    if (page >= 65536) return 0;
+    u16 ea_page = s_ea_address_table[page];
+    if (ea_page == 0xFFFF) return 0;
+    return ((u32)ea_page << 20) | (io & 0xFFFFFu);
+}
+
+/* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
+ * recycle path teleports these when it resets a ring without a JUMP command. */
+unsigned long long ps3_ms_now(void)
+{
+#ifdef _WIN32
+    return (unsigned long long)GetTickCount64();
+#else
+    return 0;
+#endif
+}
+
+static u32 s_fifo_getoff  = 0;
+static u32 s_fifo_calloff = 0;
+
+/* ---------------------------------------------------------------------------
+ * 2D transfer engines (FIFO subchannels != 0).
+ *
+ * libgcm binds: sub 1/6 = NV0039 (m2mf buffer copy), sub 2 = NV3062 (context
+ * surface 2D), sub 3 = NV309E (swizzled surface), sub 4 = NV308A (image from
+ * CPU / inline transfer), sub 5 = NV3089 (scaled image).
+ *
+ * cellGcmSetFragmentProgramParameter patches a fragment program's inline
+ * constants by emitting NV3062 (destination surface) + NV308A (COLOR data
+ * words) through the FIFO -- it does NOT CPU-write the ucode copy. Without
+ * this engine the patched constants stay zero in local memory (demosaic: all
+ * its texture-size constants -> UVs scaled by 0 -> uniform output).
+ * -----------------------------------------------------------------------*/
+extern u32 cellGcmResolveLocated(int local, u32 offset);
+
+static struct {
+    u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
+    u32 color_fmt;    /* NV3062 0x0300 SET_COLOR_FORMAT             */
+    u32 pitch;        /* NV3062 0x0304 SET_PITCH (dst in bits 16-31) */
+    u32 dst_offset;   /* NV3062 0x030C SET_OFFSET_DESTIN            */
+    u32 point;        /* NV308A 0x0304 SET_POINT ((y<<16)|x)        */
+    u32 size_out;     /* NV308A 0x0308 SET_SIZE_OUT                 */
+} s_gcm2d;
+
+static void gcm_2d_method(u32 subch, u32 method, u32 data)
+{
+    /* Subchannel bindings are libgcm-version-specific (SET_OBJECT binds are
+     * not tracked): demosaic's SDK emits dest-surface on sub 3 and image-from-
+     * CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 / 0xA400
+     * headers); other versions use the classic 2 / 4. Accept both. */
+    if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
+        switch (method) {
+        case 0x0184: case 0x0188: s_gcm2d.dst_dma = data; return;
+        case 0x0300: s_gcm2d.color_fmt  = data; return;
+        case 0x0304: s_gcm2d.pitch      = data; return;
+        case 0x030C: s_gcm2d.dst_offset = data; return;
+        }
+        return;
+    }
+    if (subch == 4 || subch == 5) {         /* NV308A image from CPU */
+        switch (method) {
+        case 0x0304: s_gcm2d.point    = data; return;
+        case 0x0308: s_gcm2d.size_out = data; return;
+        case 0x030C: return;                /* SIZE_IN */
+        }
+        if (method >= 0x0400 && method <= 0x07FC) {
+            /* COLOR data word: write into the destination surface. Inline
+             * transfers use format Y32 (4 bytes/px, one row per point.y).
+             * DMA 0xFEED0000 = local memory, 0xFEED0001 = main memory. */
+            u32 idx = (method - 0x0400) >> 2;
+            u32 px  = (s_gcm2d.point & 0xFFFF) + idx;
+            u32 py  = s_gcm2d.point >> 16;
+            u32 dst_pitch = s_gcm2d.pitch >> 16;
+            int local = (s_gcm2d.dst_dma != 0xFEED0001u);
+            u32 base = cellGcmResolveLocated(local, s_gcm2d.dst_offset);
+            { static int _it = 0;
+              if (_it++ < 6)
+                  printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
+                         base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
+                         s_gcm2d.dst_dma, px, py, dst_pitch, data); }
+            vm_write32(base + py * dst_pitch + px * 4, data);
+            return;
+        }
+        return;
+    }
+    /* NV0039 / NV309E / NV3089: not implemented yet -- log first sightings. */
+    static int warned = 0;
+    if (warned++ < 8)
+        printf("[cellGcmSys] FIFO subch %u method 0x%04X (unhandled 2D engine)\n",
+               subch, method);
+}
+
+/* Present gate for the ticker: a flip is ready once the drain has consumed
+ * everything up to put. The guest blocks in its own WaitFlip right after
+ * flipping, so the FIFO holds EXACTLY the completed frame -- no guest-side
+ * blocking needed (the old spin serialized two vsync-class waits per frame
+ * and halved the frame rate). Call AFTER draining. */
+int cellGcm_take_flip_pending_synced(void)
+{
+    if (!s_flip_pending) return 0;
+    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+    if (get != put) return 0;   /* frame not fully drained yet */
+    s_flip_pending = 0;
+    return 1;
+}
+
 void cellGcm_rsx_process_fifo(void)
 {
+    { static unsigned _n = 0; static unsigned long long _t0 = 0;
+      extern unsigned long long ps3_ms_now(void);
+      _n++;
+      if (getenv("GCM_RATE")) {
+          unsigned long long now = ps3_ms_now();
+          if (_t0 == 0) _t0 = now;
+          if (now - _t0 >= 2000) {
+              fprintf(stderr, "[RATE] drains/sec=%.0f\n", _n * 1000.0 / (now - _t0));
+              _n = 0; _t0 = now;
+          }
+      } }
     static rsx_state s_state;
     static int  s_inited = 0;
-    static u32  s_get    = 0;     /* guest EA we've drained up to */
+    extern u32 g_rsx_last_reference;
 
     if (!s_gcm_context_ea) return;
-    if (!s_inited) { rsx_state_init(&s_state); s_get = s_config.ioAddress; s_inited = 1; }
+    if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
 
-    /* The title's cellGcm macros write methods to the context's `current` pointer
-     * (context+0x8) and advance it. Read it (vm_read32 byte-swaps BE->host). */
-    u32 current = vm_read32(s_gcm_context_ea + 0x8);
-    if (current < s_get) s_get = s_config.ioAddress;   /* wrapped */
-    g_gcm_fifo_drained_ea = s_get;                      /* publish drain progress */
-    if (current <= s_get) return;                       /* nothing new */
+    /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
+     * offset in the control register), decoding method headers and following
+     * JUMP/CALL/RET control words. The old linear drain copied context->current
+     * onward and treated a JUMP as end-of-buffer -- fine for titles that write
+     * one flat ring (cellmark), but PSL1GHT/Tiny3D immediately JUMPs into its
+     * own command ring, so everything after the jump (including the reference
+     * writes its waits spin on) silently never executed. */
+    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
 
-    { static int _f=0; if (_f++ < 24) fprintf(stderr, "[GCM] fifo drain ctx=0x%08X get=0x%08X current=0x%08X words=%u\n", s_gcm_context_ea, s_get, current, (current - s_get)/4); }
-    u32 words = (current - s_get) / 4;
-    if (words > 0x40000u) words = 0x40000u;             /* cap 1MB/frame */
+    if (getenv("GCM_DRAINDBG")) {
+        static int n = 0;
+        if (n++ % 60 == 0)
+            printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
+                   s_fifo_getoff, put, vm_read32(GCM_CONTROL_GUEST_ADDR + 8),
+                   vm_read32(s_gcm_context_ea + 0x8));
+    }
 
-    /* Byte-swap the BE command words into a host buffer (the parser reads host
-     * endian); vm_read32 does the swap per word. */
-    static u32 cmds[0x40000];
-    for (u32 i = 0; i < words; i++)
-        cmds[i] = vm_read32(s_get + i * 4);
+    int budget = 0x100000;                    /* words per tick cap */
+    while (s_fifo_getoff != put && budget-- > 0) {
+        u32 ea = gcm_io2ea(s_fifo_getoff);
+        if (!ea) break;
+        u32 w = vm_read32(ea);
+        u32 type = w >> 29;
 
-    rsx_process_command_buffer(&s_state, cmds, words * 4);
-    s_get += words * 4;
-    g_gcm_fifo_drained_ea = s_get;                      /* RSX has consumed up to here */
+        if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
+            /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
+             * this word into the FIFO instead of calling any import. Fire the
+             * flip (status/count/handler) and STOP this drain so the ticker's
+             * flip-gated present shows exactly the completed frame -- draining
+             * on would mix the next frame's head into the batch (wave: every
+             * frame split across 4 presents, layout flashing/zooming). */
+            extern s32 cellGcmSetFlipCommand(u32 bufferId);
+            s_fifo_getoff += 4;
+            cellGcmSetFlipCommand(w & 0xFFu);
+            break;
+        }
+
+        if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+            s_fifo_getoff = w & 0x1FFFFFFCu;
+            continue;
+        }
+        if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+            s_fifo_calloff = s_fifo_getoff + 4;
+            s_fifo_getoff  = w & 0x1FFFFFFCu;
+            continue;
+        }
+        if (w == 0x00020000u) {                /* RET */
+            s_fifo_getoff = s_fifo_calloff;
+            s_fifo_calloff = 0;
+            continue;
+        }
+        if (type == 0 || type == 2) {          /* method (incrementing / NI) */
+            u32 count  = (w >> 18) & 0x7FF;
+            u32 method = w & 0x1FFCu;
+            u32 subch  = (w >> 13) & 7;
+            for (u32 i = 0; i < count; i++) {
+                u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                if (!dea) break;
+                u32 m = (type == 0) ? method + i * 4 : method;
+                if (subch == 0)
+                    rsx_process_method(&s_state, m, vm_read32(dea));
+                else
+                    gcm_2d_method(subch, m, vm_read32(dea));
+            }
+            s_fifo_getoff += 4 + count * 4;
+            continue;
+        }
+        { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
+            fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
+        s_fifo_getoff += 4;                    /* unknown word: skip */
+    }
+
+    /* Publish progress: get chases put; ref reflects the last SET_REFERENCE
+     * (cellGcmFinish / wait-label spins read these big-endian). The wrap
+     * recycle path also polls the drained EA. */
+    g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, g_rsx_last_reference);       /* ref */
 }
 
 /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
- * context->callback(context, count) (routed here via the synthetic OPD +
- * hle_gcm_callback) when the ring's `current` nears `end`. Real libgcm flushes,
- * waits for the RSX `get` to catch up, then recycles `current` to `begin`. We
- * wait for the ticker's drain to reach `current` (bounded) then reset the ring.
- * (via sagemono's fork) */
+ * context->callback(context, count) (routed here via the synthetic OPD) when the
+ * ring's `current` nears `end`. Real libgcm flushes, waits for the RSX `get` to
+ * pass, then recycles `current` to `begin`. We mirror that: wait (bounded) for
+ * the ticker drain to consume everything up to `current`, then reset current to
+ * begin. Runs on the guest thread; the ticker owns all rendering, so we only
+ * pointer-shuffle here (the drain's own wrap-detect handles s_get). Without this
+ * the ring never recycles and the whole pipeline wedges once the FIFO wraps
+ * (~200 frames at the 256KB default), which looked like a GPU/driver hang. */
+static u32 gcm_ea2io(u32 ea)
+{
+    u32 page = ea >> 20;
+    if (page >= 65536) return 0xFFFFFFFFu;
+    u16 io_page = s_io_address_table[page];
+    if (io_page == 0xFFFF) return 0xFFFFFFFFu;
+    return ((u32)io_page << 20) | (ea & 0xFFFFFu);
+}
+
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
     if (!ctx_ea) return;
@@ -550,28 +778,39 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
 
-    /* Wait for the RSX drain to catch up to `current` so no commands are lost.
-     * Bounded (~2s) so a stalled ticker degrades to dropped commands, not a
-     * permanent hang. */
+    if (getenv("CELLMARK_BLINKDBG"))
+        printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
+
+    /* Do what the SDK's default command-buffer-full callback does: append a
+     * JUMP-to-begin at the write head and move `put` to begin. The FIFO walker
+     * consumes the tail, follows the jump, and idles at begin; then it's safe
+     * for the guest to write from begin (that region was consumed long ago). */
+    u32 io_begin = gcm_ea2io(begin);
+    if (io_begin != 0xFFFFFFFFu) {
+        vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
+    }
+
+    /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
+     * no commands are lost; a stalled ticker degrades to dropped commands. */
     int spins = 0;
-    while (g_gcm_fifo_drained_ea < current && spins < 2000) { Sleep(1); spins++; }
+    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
     if (spins >= 2000) {
         static int warned = 0;
         if (warned++ < 4)
-            fprintf(stderr, "[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X current=0x%08X)\n",
-                    g_gcm_fifo_drained_ea, current);
+            printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X)\n",
+                   g_gcm_fifo_drained_ea, begin);
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
 }
 
 /* NID: 0xDC09357E */
-extern uint32_t ppu_active_lr(void);
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height)
 {
-    printf("[cellGcmSys] SetDisplayBuffer(id=%u, offset=0x%X, pitch=%u, %ux%u) caller_lr=0x%08X\n",
-           bufferId, offset, pitch, width, height, ppu_active_lr());
+    printf("[cellGcmSys] SetDisplayBuffer(id=%u, offset=0x%X, pitch=%u, %ux%u)\n",
+           bufferId, offset, pitch, width, height);
 
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
@@ -585,6 +824,17 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
     return CELL_OK;
 }
 
+/* Backend query (not a guest API): is this raw RSX offset a registered
+ * display buffer? Used to split display draws (-> backbuffer) from
+ * offscreen render-to-texture passes. */
+int cellGcmOffsetIsDisplay(u32 offset)
+{
+    for (int i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++)
+        if (s_display_buffer_set[i] && s_display_buffers[i].offset == offset)
+            return 1;
+    return 0;
+}
+
 /* NID: 0xEAA52F23 */
 s32 cellGcmSetFlipCommand(u32 bufferId)
 {
@@ -594,16 +844,29 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetFlipCommand(bufferId=%u)\n", bufferId);
 
     s_current_display_buffer_id = bufferId;
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
+     * until the present thread's cellGcmTickFlip marks it done (vsync). */
+    s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
+    s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
-    /* Use the captured {code,toc} (the live OPD's code word is clobbered). */
-    invoke_flip_handler(0);  /* head 0 = primary display */
+    /* Invoke via OPD resolution, not a raw call into guest code. */
+    if (s_flip_handler_opd && g_ps3_guest_caller)
+        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0);  /* head 0 = primary display */
 
     return CELL_OK;
+}
+
+/* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
+ * gcmSetFlip import (NID 0xDC09357E) lands here; without it vkcube's flip was
+ * a no-op, GetFlipStatus never cleared, and init timed out into exit(-1). */
+s32 cellGcmSetFlip(void* context, u32 bufferId)
+{
+    (void)context;   /* command context — flip is immediate in HLE */
+    return cellGcmSetFlipCommand(bufferId);
 }
 
 /* NID: 0xD01B570F */
@@ -634,11 +897,14 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     s_current_display_buffer_id = bufferId;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
-    /* Use the captured {code,toc} (the live OPD's code word is clobbered to the
-     * TOC base, so resolving the OPD yields an unregistered code). */
-    invoke_flip_handler(0);
+    /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
+     * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
+     * jumps into guest code and crashes. */
+    if (s_flip_handler_opd && g_ps3_guest_caller)
+        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0);
 
     return CELL_OK;
 }
@@ -663,27 +929,19 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
      * the legacy host-typed value too for any callers still using
      * the old API style. Real dispatch goes through
      * cellGcmDispatchVBlank()/DispatchFlip() via g_ps3_guest_caller. */
+    printf("[cellGcmSys] SetFlipHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_flip_handler_opd = (u32)(size_t)handler;
     s_flip_handler = handler;
-    capture_handler_ct(s_flip_handler_opd, &s_flip_handler_code, &s_flip_handler_toc);
-    /* Diagnostic: arm a page-guard on the handler OPD to catch the raw store that
-     * clobbers its code word to the TOC base (YDKJ_GUARD). */
-    if (getenv("YDKJ_GUARD") && s_flip_handler_opd) {
-        extern void ppu_guard_page(u32 guest_ea);
-        ppu_guard_page(s_flip_handler_opd);
-    }
-    printf("[cellGcmSys] SetFlipHandler(opd=0x%08X) code=0x%08X toc=0x%08X\n",
-           s_flip_handler_opd, s_flip_handler_code, s_flip_handler_toc);
+    { u32 c = s_flip_handler_opd ? vm_read32(s_flip_handler_opd) : 0; if (c) s_flip_handler_code = c; }
 }
 
 /* NID: 0xA547ADDE */
 void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
 {
+    printf("[cellGcmSys] SetVBlankHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_vblank_handler_opd = (u32)(size_t)handler;
     s_vblank_handler = handler;
-    capture_handler_ct(s_vblank_handler_opd, &s_vblank_handler_code, &s_vblank_handler_toc);
-    printf("[cellGcmSys] SetVBlankHandler(opd=0x%08X) code=0x%08X toc=0x%08X\n",
-           s_vblank_handler_opd, s_vblank_handler_code, s_vblank_handler_toc);
+    { u32 c = s_vblank_handler_opd ? vm_read32(s_vblank_handler_opd) : 0; if (c) s_vblank_handler_code = c; }
 }
 
 /* NID: 0xF9BFCDA3 */
@@ -723,6 +981,8 @@ s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
 }
 
 /* NID: 0xDB769B32 */
+static u32 gcm_io_alloc(u32 size);   /* defined below */
+
 s32 cellGcmAddressToOffset(u32 address, u32* offset)
 {
     /* `offset` is a GUEST address; write big-endian via vm_write32. */
@@ -730,10 +990,17 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     if (!off_ea)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    /* Local memory: offset = address - localBase */
+    /* Local memory: offset = address - localBase. Record the offset page as
+     * LOCAL-derived so cellGcmResolveOffset can disambiguate it from an IO
+     * (main-memory) offset with the same page number -- the two offset spaces
+     * overlap, and a title with a large IO region (gcm/cube: 16MB) otherwise
+     * gets its VRAM vertex/texture/FP reads resolved into the empty command
+     * buffer. */
     if (address >= s_config.localAddress &&
         address < s_config.localAddress + s_config.localSize) {
-        vm_write32(off_ea, address - s_config.localAddress);
+        u32 loff = address - s_config.localAddress;
+        if ((loff >> 20) < sizeof(s_local_offset_page)) s_local_offset_page[loff >> 20] = 1;
+        vm_write32(off_ea, loff);
         return CELL_OK;
     }
 
@@ -752,29 +1019,40 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
         return CELL_OK;
     }
 
-    printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
-#ifdef _WIN32
-    /* Trace the caller when the address is near-null (a null render object's
-     * field, e.g. 0x28) so we can find which render-setup object is uninitialized.
-     * Resolve each host frame to the guest func_ via function_table (no symbols). */
-    if (address < 0x10000) {
-        extern const struct { unsigned long long addr; void (*func)(void*); const char* name; } function_table[];
-        extern const unsigned long long function_table_count;
-        char* mb=(char*)GetModuleHandleA(0); void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
-        char ln[900]; int p=snprintf(ln,sizeof ln,"[gcm-a2o] near-null addr=0x%08X guest-callers:",address);
-        for(int i=0;i<fr && i<10;i++){
-            uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
-            for(unsigned long long k=0;k<function_table_count;k++){
-                uintptr_t h=(uintptr_t)function_table[k].func;
-                if(h<=tgt && h>bh){ bh=h; bg=function_table[k].addr; }
-            }
-            if(bg) p+=snprintf(ln+p,sizeof(ln)-p," func_%08X+0x%llX",bg,(unsigned long long)(tgt-bh));
-        }
-        fprintf(stderr,"%s\n",ln);
+    /* Auto-map unmapped main memory. On real hardware PSL1GHT pre-maps its
+     * whole RSX heap in gcmInitBody, so its libraries never call MapMainMemory
+     * before handing an EA to the RSX (Tiny3D's command ring lives in an
+     * sys_mmapper region). Mirror that by mapping the 1MB page on first use. */
+    if (address < 0x40000000u) {
+        u32 ea_page = address & ~0xFFFFFu;
+        u32 io      = gcm_io_alloc(0x100000u);
+        populate_offset_table(ea_page, io, 0x100000u);
+        printf("[cellGcmSys] AddressToOffset: auto-mapped ea 0x%08X -> io 0x%08X\n",
+               ea_page, io);
+        vm_write32(off_ea, io | (address & 0xFFFFFu));
+        return CELL_OK;
     }
-#endif
+
+    printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
     vm_write32(off_ea, 0);
     return CELL_GCM_ERROR_FAILURE;
+}
+
+/* IO-offset space bump allocator for main-memory mappings. Starts PAST the
+ * Init command-buffer region: handing out io 0 (the old s_local_mem_allocated
+ * bump, which begins at 0) remapped the FIFO's own io page -- demosaic's
+ * cellGcmMapMainMemory(sys heap) got offset 0, io2ea(0) then resolved into its
+ * heap (all zeros) and the RSX walker consumed every frame's commands as
+ * no-ops (no draws, label fence never written, guest waited forever). */
+static u32 s_io_alloc_next = 0;
+static u32 gcm_io_alloc(u32 size)
+{
+    if (s_io_alloc_next == 0)
+        s_io_alloc_next = (s_config.ioSize + 0xFFFFFu) & ~0xFFFFFu;
+    if (s_io_alloc_next < 0x100000u) s_io_alloc_next = 0x100000u;
+    u32 io = s_io_alloc_next;
+    s_io_alloc_next += (size + 0xFFFFFu) & ~0xFFFFFu;
+    return io;
 }
 
 /* NID: 0x2A6FBA9C */
@@ -793,9 +1071,8 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
 
     printf("[cellGcmSys] MapMainMemory(ea=0x%08X, size=0x%X)\n", ea, size);
 
-    /* Find a free IO offset region (bump allocate from local_mem_allocated) */
-    u32 io_offset = s_local_mem_allocated;
-    s_local_mem_allocated += size;
+    /* Allocate a fresh IO region past the Init command-buffer window. */
+    u32 io_offset = gcm_io_alloc(size);
 
     IoMapping* mapping = find_free_mapping();
     if (!mapping) {
@@ -895,6 +1172,47 @@ s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea)
     printf("[cellGcmSys] WARNING: IoOffsetToAddress failed for 0x%08X\n", ioOffset);
     vm_write32(ea_ea, 0);
     return CELL_GCM_ERROR_FAILURE;
+}
+
+/* Resolve an RSX FIFO offset (from a vertex-array / texture / surface method)
+ * to a guest effective address the backend can read via vm_base + addr.
+ *
+ * An RSX offset refers to either IO-mapped *main* memory or *local* video
+ * memory, distinguished on hardware by a per-object location bit that the
+ * command stream no longer carries by the time the backend sees it. Resolve by
+ * table: if the offset's 1MB page is IO-mapped, it's main memory; otherwise it
+ * is local video memory (localAddress + offset). IO mappings are sparse (the
+ * command/IO window is a few MB) while local objects sit high in the local
+ * heap, so this disambiguates every real case — only offsets inside the small
+ * IO window are treated as main. */
+u32 cellGcmResolveOffset(u32 offset)
+{
+    u32 page = offset >> 20;
+    /* A page the guest derived from a LOCAL EA resolves to VRAM even when the
+     * IO table also covers that page number (overlapping offset spaces). */
+    if (page < sizeof(s_local_offset_page) && s_local_offset_page[page])
+        return s_config.localAddress + offset;
+    if (page < 65536) {
+        u16 ea_page = s_ea_address_table[page];
+        if (ea_page != 0 && ea_page != 0xFFFF)
+            return ((u32)ea_page << 20) | (offset & 0xFFFFF);
+    }
+    return s_config.localAddress + offset;
+}
+
+/* Location-aware resolve. RSX offsets are TWO overlapping number spaces --
+ * LOCAL (VRAM, ea = localAddress + offset) and MAIN (IO-mapped, via the
+ * offset table). cellGcmResolveOffset guesses table-first, which breaks when
+ * a title's IO region is large enough to cover the same page numbers as its
+ * local allocations (gcm/cube: ioSize 16MB, FP ucode at local 0xB90000 --
+ * table hit returned the empty command-buffer EA instead of VRAM). Callers
+ * that KNOW the location (texture format bits, SET_SHADER_PROGRAM bits) must
+ * use this. `local` != 0 -> local memory. */
+u32 cellGcmResolveLocated(int local, u32 offset)
+{
+    if (local)
+        return s_config.localAddress + offset;
+    return cellGcmResolveOffset(offset);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1040,21 +1358,25 @@ s32 cellGcmUnbindZcull(u8 index)
  * Misc
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x107BF789 */
-/* Real ABI: uint32_t cellGcmGetTiledPitchSize(uint32_t size) -- ONE arg, the
- * aligned tiled pitch is the RETURN VALUE (r3). The previous 2-arg form treated
- * r4 as an out-pointer and wrote the pitch through it; at the title's call site
- * r4 still held the caller's CellVideoOutResolution* (from the preceding
- * cellVideoOutGetResolution), so it overwrote width/height with the pitch ->
- * width became 0 -> every downstream tile/display-buffer setup went garbage. */
+/* NID: 0x107BF789
+ * SDK prototype (cell/gcm.h): uint32_t cellGcmGetTiledPitchSize(const uint32_t size)
+ * -- returns the pitch BY VALUE in r3 (no out-pointer!). The old signature here
+ * took (size, u32* pitch-out) and returned a status code, so every caller got 0
+ * / an error code as its "pitch" -- gcm/cube's `bne` on the result then skipped
+ * its entire config+framebuffer-alloc block (GetConfiguration never ran, local
+ * memory base stayed 0, AddressToOffset(0) auto-mapped a bogus IO alias, and the
+ * FIFO teleported into it). Returns 0 only for size > max, like hardware. */
 u32 cellGcmGetTiledPitchSize(u32 size)
 {
+    u32 r = 0;
     /* Smallest valid tiled pitch >= size (RSX supports only specific pitches). */
-    for (int i = 0; i < s_valid_pitch_count; i++) {
-        if (s_valid_pitches[i] >= size)
-            return s_valid_pitches[i];
+    if (size) {
+        for (int i = 0; i < s_valid_pitch_count; i++) {
+            if (s_valid_pitches[i] >= size) { r = s_valid_pitches[i]; break; }
+        }
     }
-    return s_valid_pitches[s_valid_pitch_count - 1];
+    { static int _n=0; if (_n++<4) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
+    return r;
 }
 
 /* NID: 0xBC982946 */
@@ -1103,13 +1425,20 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 }
 
 /* Internal flip commands — called directly by some games */
-s32 _cellGcmSetFlipCommand(u32 bufferId)
+/* libgcm's internal exports pass the command context FIRST -- taking
+ * bufferId as arg1 made the range check eat the context pointer, so the
+ * flip counter never advanced (wave: presents free-ran 4x per frame,
+ * layout flashing/zooming). */
+s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
+    (void)ctx;
     return cellGcmSetFlipCommand(bufferId);
 }
 
-s32 _cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue)
+s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
+                                        u32 labelIndex, u32 labelValue)
 {
+    (void)ctx;
     return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
 }
 
@@ -1174,6 +1503,11 @@ void cellGcmTerminate(void)
     s_queue_handler    = NULL;
     s_local_mem_allocated = 0;
     s_io_mapping_count = 0;
+    /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
+     * this every unmapped EA page silently aliased io page 0 (and vice versa),
+     * producing plausible-but-wrong offsets instead of a translation failure. */
+    memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
+    memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
     s_current_display_buffer_id = 0;
     s_last_flip_time = 0;
 }
