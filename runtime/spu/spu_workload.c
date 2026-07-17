@@ -24,8 +24,15 @@ int g_cri_video_dma = 0;
 
 /* Game-provided lifted SPU symbol used only by the ydkj CRI-taskset diagnostic
  * path below (image 22 + YDKJ_CRI_TASKSET). Weak default so titles that don't
- * ship that SPU image still link; a game that lifts it supplies the strong def. */
+ * ship that SPU image still link; a game that lifts it supplies the strong def.
+ *
+ * MSVC has no __attribute__((weak)) and the runtime lib builds under MSVC (the
+ * per-game exe is clang-cl). Under MSVC we simply omit the default, which is
+ * exactly the pre-existing behaviour -- a title that doesn't ship the image gets
+ * an unresolved external, same as before this default was added. */
+#if defined(__clang__) || defined(__GNUC__)
 __attribute__((weak)) void tsp_spu_func_00000A00(spu_context* c) { (void)c; }
+#endif
 
 /* ---- fingerprint ------------------------------------------------------- */
 
