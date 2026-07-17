@@ -74,7 +74,7 @@ extern "C" {
 #define SYS_RWLOCK_TRYRLOCK            123
 #define SYS_RWLOCK_RUNLOCK             124
 #define SYS_RWLOCK_WLOCK               125
-#define SYS_RWLOCK_TRYWLOCK            126
+#define SYS_RWLOCK_TRYWLOCK            148
 #define SYS_RWLOCK_WUNLOCK             127
 
 #define SYS_EVENT_QUEUE_CREATE          128
@@ -102,18 +102,20 @@ extern "C" {
 #define SYS_EVENT_FLAG_CANCEL           132
 #define SYS_EVENT_FLAG_GET              139
 
-#define SYS_LWMUTEX_CREATE              150
-#define SYS_LWMUTEX_DESTROY             151
-#define SYS_LWMUTEX_LOCK               152
-#define SYS_LWMUTEX_TRYLOCK            153
-#define SYS_LWMUTEX_UNLOCK             154
+/* lv2 lightweight primitives are the _sys_lw* slow-path syscalls (95-99,
+ * 111-117); the old 150-160 values squatted on sys_raw_spu_* (150-154)
+ * and sys_spu_image_open/import (156/157). */
+#define SYS_LWMUTEX_CREATE              95
+#define SYS_LWMUTEX_DESTROY             96
+#define SYS_LWMUTEX_LOCK                97
+#define SYS_LWMUTEX_UNLOCK              98
+#define SYS_LWMUTEX_TRYLOCK             99
 
-#define SYS_LWCOND_CREATE               155
-#define SYS_LWCOND_DESTROY              156
-#define SYS_LWCOND_WAIT                 157
-#define SYS_LWCOND_SIGNAL               158
-#define SYS_LWCOND_SIGNAL_ALL           159
-#define SYS_LWCOND_SIGNAL_TO            160
+#define SYS_LWCOND_CREATE               111
+#define SYS_LWCOND_DESTROY              112
+#define SYS_LWCOND_WAIT                 113   /* _sys_lwcond_queue_wait */
+#define SYS_LWCOND_SIGNAL               115
+#define SYS_LWCOND_SIGNAL_ALL           116
 
 /* Timer */
 #define SYS_TIMER_CREATE                70
@@ -134,11 +136,11 @@ extern "C" {
 #define SYS_MEMORY_ALLOCATE             348
 #define SYS_MEMORY_FREE                 349
 #define SYS_MEMORY_ALLOCATE_FROM_CONTAINER 350
-#define SYS_MEMORY_GET_PAGE_ATTRIBUTE   351   /* 0x15F (was wrongly 358; verified vs RPCS3 lv2.cpp) */
+#define SYS_MEMORY_GET_PAGE_ATTRIBUTE   351   /* 0x15F (was wrongly 358; verified vs rpcs3/rpcs3/Emu/Cell/lv2/sys_memory.h) */
 #define SYS_MEMORY_GET_USER_MEMORY_SIZE 352
-#define SYS_MEMORY_CONTAINER_CREATE     353
-#define SYS_MEMORY_CONTAINER_DESTROY    354
-#define SYS_MEMORY_CONTAINER_GET_SIZE   355
+#define SYS_MEMORY_CONTAINER_CREATE     324
+#define SYS_MEMORY_CONTAINER_DESTROY    325
+#define SYS_MEMORY_CONTAINER_GET_SIZE   343
 
 #define SYS_MMAPPER_ALLOCATE_ADDRESS     330
 #define SYS_MMAPPER_FREE_ADDRESS         331
@@ -148,12 +150,19 @@ extern "C" {
 #define SYS_MMAPPER_UNMAP_SHARED_MEMORY  335
 #define SYS_MMAPPER_SEARCH_AND_MAP      337
 
-/* SPU management — canonical PS3 lv2 syscall numbers. (Verified against a real
- * title: cellSpursInitialize calls 170=group_create, 172=thread_initialize,
- * 171=group_destroy on rollback. The previous table put GROUP_START at 172 and
- * THREAD_INITIALIZE at 181, so the title's thread_initialize(172) was misrouted
- * to group_start_handler -> "group not found" -> -1 -> cellSpurs init failed.) */
+/* SPU management — numbers verified against the real lv2 table (RPCS3
+ * lv2.cpp 155-252). The old block was wrong almost everywhere (e.g.
+ * THREAD_INITIALIZE was registered at 181 while the real 172 fell on
+ * GROUP_START — Sony's SPURS init failed silently on the id mismatch). */
+#define SYS_SPU_IMAGE_OPEN              156
+#define SYS_SPU_IMAGE_IMPORT            157   /* _sys_spu_image_import */
+#define SYS_SPU_IMAGE_CLOSE             158   /* _sys_spu_image_close */
+#define SYS_SPU_IMAGE_GET_SEGMENTS      159   /* _sys_spu_image_get_segments */
+
+#define SYS_SPU_THREAD_GET_EXIT_STATUS  165
+#define SYS_SPU_THREAD_SET_ARGUMENT     166
 #define SYS_SPU_INITIALIZE              169
+
 #define SYS_SPU_THREAD_GROUP_CREATE     170
 #define SYS_SPU_THREAD_GROUP_DESTROY    171
 #define SYS_SPU_THREAD_INITIALIZE       172
@@ -165,23 +174,20 @@ extern "C" {
 #define SYS_SPU_THREAD_GROUP_JOIN       178
 #define SYS_SPU_THREAD_GROUP_SET_PRIORITY 179
 #define SYS_SPU_THREAD_GROUP_GET_PRIORITY 180
-#define SYS_SPU_THREAD_GROUP_CONNECT_EVENT 181
-#define SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT 182
-#define SYS_SPU_THREAD_SET_ARGUMENT     183
-#define SYS_SPU_THREAD_GET_EXIT_STATUS  184
+
+#define SYS_SPU_THREAD_WRITE_LS         181
+#define SYS_SPU_THREAD_READ_LS          182
+#define SYS_SPU_THREAD_WRITE_SNR        184
+#define SYS_SPU_THREAD_SET_SPU_CFG      187
+#define SYS_SPU_THREAD_GET_SPU_CFG      188
+#define SYS_SPU_THREAD_GROUP_CONNECT_EVENT    185
+#define SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT 186
+#define SYS_SPU_THREAD_WRITE_SPU_MB     190
 #define SYS_SPU_THREAD_CONNECT_EVENT    191
 #define SYS_SPU_THREAD_DISCONNECT_EVENT 192
-
-#define SYS_SPU_THREAD_WRITE_LS         229
-#define SYS_SPU_THREAD_READ_LS          230
-#define SYS_SPU_THREAD_WRITE_SNR        231
-#define SYS_SPU_THREAD_BIND_QUEUE       235
-#define SYS_SPU_THREAD_UNBIND_QUEUE     236
-#define SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS 185
-
-#define SYS_SPU_IMAGE_OPEN              156
-#define SYS_SPU_IMAGE_IMPORT            157   /* _sys_spu_image_import (RPCS3 lv2.cpp) */
-#define SYS_SPU_IMAGE_CLOSE             158   /* was mis-numbered 157 -> import hit the close stub */
+#define SYS_SPU_THREAD_BIND_QUEUE       193
+#define SYS_SPU_THREAD_UNBIND_QUEUE     194
+#define SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS 251
 
 /* PRX (module) management */
 #define SYS_PRX_LOAD_MODULE             480
@@ -195,10 +201,10 @@ extern "C" {
 #define SYS_PRX_LINK_LIBRARY            488
 #define SYS_PRX_UNLINK_LIBRARY          489
 #define SYS_PRX_QUERY_LIBRARY           490
-#define SYS_PRX_GET_MODULE_LIST         491
-#define SYS_PRX_GET_MODULE_INFO         492
-#define SYS_PRX_GET_MODULE_ID_BY_NAME   493
-#define SYS_PRX_GET_MODULE_ID_BY_ADDRESS 494
+#define SYS_PRX_GET_MODULE_LIST         494
+#define SYS_PRX_GET_MODULE_INFO         495
+#define SYS_PRX_GET_MODULE_ID_BY_NAME   496
+#define SYS_PRX_GET_MODULE_ID_BY_ADDRESS 461
 
 /* File system */
 #define SYS_FS_OPEN                     801
