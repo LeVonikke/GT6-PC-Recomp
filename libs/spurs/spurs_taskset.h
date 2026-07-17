@@ -20,11 +20,12 @@
 
 #include <stdint.h>
 
-/* BE guest-memory accessors (defined in runtime/ppu/ppu_loader.cpp). */
-uint32_t vm_read32(uint64_t ea);
-uint64_t vm_read64(uint64_t ea);
-void     vm_write32(uint64_t ea, uint32_t v);
-void     vm_write64(uint64_t ea, uint64_t v);
+/* BE guest-memory accessors (defined in runtime/ppu/ppu_loader.cpp).
+ * Signatures match runtime/ppu/ppu_memory.h (32-bit guest EA). */
+uint32_t vm_read32(uint32_t ea);
+uint64_t vm_read64(uint32_t ea);
+void     vm_write32(uint32_t ea, uint32_t v);
+void     vm_write64(uint32_t ea, uint64_t v);
 
 /* ---- CellSpursTaskset (main memory, 128-byte aligned) --------------------
  * The PM reads the task bitsets to pick a ready task and the TaskInfo array for
