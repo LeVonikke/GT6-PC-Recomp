@@ -359,6 +359,15 @@ class PPULifter:
         # Firmware-import stub: replace the whole body with an HLE dispatch.
         nid = self.hle_stub_nids.get(start)
         if nid is not None:
+            # The real PPU import stub does `std r2, 0x28(r1)` (saves the CALLER's
+            # TOC to the ABI TOC-save slot) before tail-calling the resolved target,
+            # so the caller can restore its TOC with `ld r2, 0x28(r1)` afterward.
+            # Skipping it leaves that slot uninitialized -> the caller reloads r2
+            # from garbage (seen as r2=0x00000004) -> every subsequent TOC-relative
+            # load reads bad memory (e.g. scene-root globals -> func_0036E868 walks
+            # a null root -> infinite recursion / stack overflow). Replicate it.
+            func.body_lines.append(
+                "    vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);  /* stub: std r2,0x28(r1) */")
             func.body_lines.append(
                 "    vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);  /* stub: std r2,0x28(r1) */")
             func.body_lines.append(
@@ -909,6 +918,12 @@ class PPULifter:
         if mn in idx_store_map:
             helper = idx_store_map[mn]
             rs_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            # Indexed update forms (stbux/sthux/stwux): EA = ra+rb, then ra = EA.
+            # Mirror the indexed-LOAD handler above -- dropping the base write-back
+            # leaves ra stale and corrupts every subsequent (ra)-relative access.
+            if mn.endswith("ux") and ra_i != "0":
+                return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
+                        f"{helper}(ea, ctx->gpr[{rs_i}]); ctx->gpr[{ra_i}] = ea; }}")
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             return f"{helper}({ea}, ctx->gpr[{rs_i}]);"
 
@@ -1168,6 +1183,9 @@ class PPULifter:
                 else:
                     body = (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
+                # Update-form (lfsu/lfdu): EA = (rA)+disp, then rA = EA.
+                # Dropping this base write-back leaves rA stale and corrupts every
+                # subsequent (rA)-relative access (systemic C++ object-field corruption).
                 if mn in ("lfsu", "lfdu"):
                     body += f" ctx->gpr[{base}] = ctx->gpr[{base}] + {disp};"
                 return body
@@ -1187,6 +1205,9 @@ class PPULifter:
                 else:
                     body = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
                             f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
+                # Update-form (stfsu/stfdu): EA = (rA)+disp, then rA = EA.
+                # Dropping this base write-back is what let stfsu-initialized color
+                # fields clobber the object vtable at (rA)+0 -> under-construction crash.
                 if mn in ("stfsu", "stfdu"):
                     body += f" ctx->gpr[{base}] = ctx->gpr[{base}] + {disp};"
                 return body
@@ -2613,20 +2634,44 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             continue
         # `lwzx rD, rA, rB` computes MEM(rA + rB); the table-base register may be
         # EITHER operand — gcc emits both `lwzx rD, base, idx` and the swapped
-        # `lwzx rD, idx, base`. Try each candidate; the real base is the one
-        # loaded TOC-relative via `lwz base, disp(r2)`. (Hardcoding p[2] as the
-        # base silently skipped every dispatcher with the operands swapped.)
-        r_val = p[0]
-        disp = None; r_base = None
-        for cand in (p[1], p[2]):
+        # `lwzx rD, idx, base`. Try each candidate for the table-base register.
+        #
+        # The base is loaded either directly TOC-relative (`lwz base, d(r2)`) or
+        # via ONE level of indirection through a TOC global — gcc's PIC switch
+        # idiom `lwz mid, d1(r2); lwz base, d2(mid)`, so the table pointer lives
+        # in a data global at *(TOC+d1) and the table at *(that + d2). Only
+        # matching the direct form silently dropped every two-level dispatcher
+        # (109 of 130 here), leaving each switch lifted as a failing bctr.
+        def _lwz_of(reg):
+            """Most-recent `lwz reg, disp(rA)` in the window -> (disp, rA_name)."""
             for w in reversed(win):
                 if w.mnemonic == 'lwz':
                     a = [x.strip() for x in w.operands.split(',')]
-                    if len(a) == 2 and a[0] == cand and '(r2)' in a[1]:
-                        disp = mem_disp(a[1]); r_base = cand; break
-            if disp is not None:
-                break
-        if disp is None or not toc:
+                    if len(a) == 2 and a[0] == reg and '(' in a[1]:
+                        d = mem_disp(a[1])
+                        rA = a[1].split('(')[1].rstrip(')').strip()
+                        return (d, rA)
+            return None
+        r_val = p[0]
+        r_base = None; table_base = None
+        for cand in (p[1], p[2]):
+            ld = _lwz_of(cand)
+            if ld is None:
+                continue
+            d_base, rA = ld
+            if d_base is None:
+                continue
+            if rA == 'r2' and toc:                       # one-level: lwz base, d(r2)
+                table_base = read_u32((toc + d_base) & 0xFFFFFFFF)
+            else:                                        # two-level: base <- global <- TOC
+                mid = _lwz_of(rA)
+                if mid is not None and mid[0] is not None and mid[1] == 'r2' and toc:
+                    midval = read_u32((toc + mid[0]) & 0xFFFFFFFF)
+                    if midval is not None:
+                        table_base = read_u32((midval + d_base) & 0xFFFFFFFF)
+            if table_base is not None:
+                r_base = cand; break
+        if table_base is None or not toc:
             continue
         # offset table iff an `add rC, *, r_base` combines the loaded value + base
         is_offset = any(
@@ -2634,9 +2679,6 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             [x.strip() for x in w.operands.split(',')][0] == rC and
             r_base in [x.strip() for x in w.operands.split(',')][1:]
             for w in win)
-        table_base = read_u32((toc + disp) & 0xFFFFFFFF)
-        if table_base is None:
-            continue
         # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
         count = None
         for w in reversed(win):
