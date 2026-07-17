@@ -133,7 +133,7 @@ static u32 s_second_v_handler_opd = 0;
  * base instead of the real handler. Capture-at-registration + dispatch by
  * code+toc runs the real lifted handler regardless. */
 extern uint32_t ppu_active_lr(void);
-extern unsigned vm_read32(unsigned long long);
+/* vm_read32 comes from ppu_memory.h (uint32_t EA); no local extern. */
 extern unsigned long long ppu_guest_call_ct(u32 code, u32 toc, u64 a0, u64 a1, u64 a2, u64 a3);
 static u32 s_flip_handler_code=0,   s_flip_handler_toc=0;
 static u32 s_vblank_handler_code=0, s_vblank_handler_toc=0;
@@ -388,11 +388,13 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         /* Control register in GUEST memory: cellGcmGetControlRegister must hand the
          * title a guest EA, not &s_control (a host pointer it would truncate to a
          * garbage guest addr like 0xC708C708). {put,get,ref}. */
-        s_control_ea = galloc ? galloc(16, 16) : 0;
+        /* Allocate a generous, fully-zeroed control block: the title reads fields
+         * past {put,get,ref} (e.g. _jsGcmFifoReadReference reads a reference at
+         * +0x48 via the fifo struct), and a 16-byte alloc left those as garbage
+         * that never satisfied the FIFO-init wait-for-reference==0 loop. */
+        s_control_ea = galloc ? galloc(0x100, 16) : 0;
         if (s_control_ea) {
-            gwrite32(s_control_ea + 0x0, 0);            /* put */
-            gwrite32(s_control_ea + 0x4, 0);            /* get */
-            gwrite32(s_control_ea + 0x8, 0);            /* ref */
+            for (u32 o = 0; o < 0x100; o += 4) gwrite32(s_control_ea + o, 0);
         }
         fprintf(stderr, "[GCM] SetupContext ctx_ea=0x%08X cmdbuf=0x%08X cmdSize=0x%X ioAddr=0x%08X ctrl_ea=0x%08X\n", cdata, cmdbuf, cmdSize, ioAddress, s_control_ea);
     }
@@ -506,6 +508,15 @@ void cellGcmTickFlip(void)
  * the recompiled code to update it via vm_write). Once that's fixed (+ the title
  * runs past its early self-exit to actually draw), parse get..put here with
  * rsx_process_command_buffer so the game's clears/draws render. */
+/* NV406E_SET_REFERENCE (FIFO method 0x50): the RSX writes the reference value to
+ * the control register's `ref` field (control_ea+0x8). cellGcmFinish / the game's
+ * fence loops poll it for CPU<->RSX sync; without it they spin forever. Called
+ * from rsx_process_method as the drained FIFO is parsed. */
+void cellGcm_rsx_set_reference(u32 val)
+{
+    if (s_control_ea) vm_write32(s_control_ea + 0x8, val);
+}
+
 void cellGcm_rsx_process_fifo(void)
 {
     static rsx_state s_state;
@@ -515,26 +526,47 @@ void cellGcm_rsx_process_fifo(void)
     if (!s_gcm_context_ea) return;
     if (!s_inited) { rsx_state_init(&s_state); s_get = s_config.ioAddress; s_inited = 1; }
 
-    /* The title's cellGcm macros write methods to the context's `current` pointer
-     * (context+0x8) and advance it. Read it (vm_read32 byte-swaps BE->host). */
-    u32 current = vm_read32(s_gcm_context_ea + 0x8);
-    if (current < s_get) s_get = s_config.ioAddress;   /* wrapped */
-    g_gcm_fifo_drained_ea = s_get;                      /* publish drain progress */
-    if (current <= s_get) return;                       /* nothing new */
+    /* The RSX submit pointer is control->put (IO offset); the jsGcm FIFO path
+     * (_jsGcmFifoFlush) and the inline context path both advance it. The FIFO is
+     * a ring built with JUMP commands, so we must WALK it following jumps from
+     * get to put -- a linear drain hits the first JUMP header and then garbage. */
+    u32 put_ea = s_control_ea ? s_config.ioAddress + vm_read32(s_control_ea + 0x0)
+                              : vm_read32(s_gcm_context_ea + 0x8);
+    { u32 cur = vm_read32(s_gcm_context_ea + 0x8); if (cur > put_ea) put_ea = cur; }
 
-    { static int _f=0; if (_f++ < 24) fprintf(stderr, "[GCM] fifo drain ctx=0x%08X get=0x%08X current=0x%08X words=%u\n", s_gcm_context_ea, s_get, current, (current - s_get)/4); }
-    u32 words = (current - s_get) / 4;
-    if (words > 0x40000u) words = 0x40000u;             /* cap 1MB/frame */
+    if (getenv("RD_FIFO_DBG")) { static int _n=0; if(_n++<10)
+        fprintf(stderr,"[FIFO] ctrl_ea=0x%08X put_off=0x%08X put_ea=0x%08X get=0x%08X cur=0x%08X ref=0x%08X | fifo[0..4]=%08X %08X %08X %08X\n",
+            s_control_ea, s_control_ea?vm_read32(s_control_ea):0, put_ea, s_get,
+            vm_read32(s_gcm_context_ea+0x8), s_control_ea?vm_read32(s_control_ea+0x8):0,
+            vm_read32(s_config.ioAddress), vm_read32(s_config.ioAddress+4), vm_read32(s_config.ioAddress+8), vm_read32(s_config.ioAddress+12)); }
 
-    /* Byte-swap the BE command words into a host buffer (the parser reads host
-     * endian); vm_read32 does the swap per word. */
-    static u32 cmds[0x40000];
-    for (u32 i = 0; i < words; i++)
-        cmds[i] = vm_read32(s_get + i * 4);
+    if (s_get == put_ea) return;                        /* caught up */
 
-    rsx_process_command_buffer(&s_state, cmds, words * 4);
-    s_get += words * 4;
-    g_gcm_fifo_drained_ea = s_get;                      /* RSX has consumed up to here */
+    u32 pos = s_get;
+    int guard = 0;
+    while (pos != put_ea && guard++ < 8000000) {
+        u32 header = vm_read32(pos);
+        pos += 4;
+        u32 type = (header >> 29) & 0x7;
+        if (type == 1) {                                /* JUMP: redirect (ring) */
+            pos = s_config.ioAddress + (header & 0x1FFFFFFC);
+            continue;
+        }
+        if (type == 0 || type == 2) {                   /* increasing / non-incr methods */
+            u32 method   = ((header >> 2) & 0x7FF) << 2;
+            u32 num_data = (header >> 18) & 0x7FF;
+            int incr     = (type == 0);
+            for (u32 i = 0; i < num_data && pos != put_ea; i++) {
+                u32 data = vm_read32(pos);
+                pos += 4;
+                rsx_process_method(&s_state, incr ? method + i * 4 : method, data);
+            }
+        }
+        /* type 3 (call/return) not yet used by this title */
+    }
+    s_get = pos;
+    g_gcm_fifo_drained_ea = s_get;
+    if (s_control_ea) vm_write32(s_control_ea + 0x4, vm_read32(s_control_ea + 0x0)); /* get = put */
 }
 
 /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls

@@ -31,31 +31,60 @@ extern "C" {
 #define CELL_GEM_STATUS_READY          1
 #define CELL_GEM_STATUS_CALIBRATING    2
 
-/* Types */
+/* Types. Layouts verified against the DWARF in the Gears of War 3 / og-LBP debug
+ * builds (dwarf_abi.py) -- the previous definitions were wrong on every one:
+ * CellGemState was 58 bytes vs the real 192, CellGemInfo.port was u16 not u32,
+ * and CellGemAttribute was missing memoryPtr (and used a host void* where the
+ * guest ABI has a 4-byte EA). Pointer fields are guest EAs (u32), per the
+ * u32-guest-address convention used across the other structs. */
 typedef struct CellGemAttribute {
     u32 version;
     u32 maxConnect;
-    void* spursAddr;
-    u8  spu[8];
-} CellGemAttribute;
+    u32 memoryPtr;      /* guest EA */
+    u32 spursAddr;      /* guest EA (CellSpurs*) */
+    u8  spu[8];         /* spu_priorities */
+} CellGemAttribute;     /* 24 bytes */
 
 typedef struct CellGemInfo {
     u32 maxConnect;
     u32 nowConnect;
     u32 status[CELL_GEM_MAX_NUM];
-    u16 port[CELL_GEM_MAX_NUM];
-} CellGemInfo;
+    u32 port[CELL_GEM_MAX_NUM];
+} CellGemInfo;          /* 40 bytes */
+
+typedef struct CellGemPadData {
+    u16 digitalButtons;
+    u16 analogT;
+} CellGemPadData;       /* 4 bytes */
+
+typedef struct CellGemExtPortData {
+    u16 status;
+    u16 digital1;
+    u16 digital2;
+    u16 analogRightX;
+    u16 analogRightY;
+    u16 analogLeftX;
+    u16 analogLeftY;
+    u8  custom[6];
+} CellGemExtPortData;   /* 20 bytes */
 
 typedef struct CellGemState {
-    float pos[4];    /* x, y, z, w */
-    float quat[4];   /* quaternion orientation */
-    u32 padData;
-    u32 extData;
-    u64 timestamp;
-    float temperature;
-    float accel[4];
-    float gyro[4];
-} CellGemState;
+    float pos[4];          /* +0x00 */
+    float vel[4];          /* +0x10 */
+    float accel[4];        /* +0x20 */
+    float quat[4];         /* +0x30 (quaternion orientation) */
+    float angvel[4];       /* +0x40 */
+    float angaccel[4];     /* +0x50 */
+    float handlePos[4];    /* +0x60 */
+    float handleVel[4];    /* +0x70 */
+    float handleAccel[4];  /* +0x80 */
+    CellGemPadData     pad;         /* +0x90 */
+    CellGemExtPortData ext;         /* +0x94 */
+    u64   timestamp;       /* +0xA8 (system_time_t) */
+    float temperature;     /* +0xB0 */
+    float cameraPitchAngle;/* +0xB4 */
+    u32   trackingFlags;   /* +0xB8 */
+} CellGemState;            /* 192 bytes */
 
 /* Functions */
 s32 cellGemInit(const CellGemAttribute* attr);

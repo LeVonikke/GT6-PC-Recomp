@@ -885,6 +885,18 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             if (r29 && r29 < 0x10000000u) { uint8_t* p=(uint8_t*)vm_to_host(r29);
               fprintf(stderr,"     [r29+0x00..0x30]:"); for(int i=0;i<0x34;i+=4) fprintf(stderr," %02X%02X%02X%02X",p[i],p[i+1],p[i+2],p[i+3]); fprintf(stderr,"\n"); }
         } }
+        /* Titles busy-wait on a not-yet-created (or, via the 141/142 syscall
+         * collision, a usleep-that-lands-here) flag, hot-spinning at 100% and
+         * starving the RSX FIFO-drain / producer thread that would satisfy the
+         * condition -- making progress timing-dependent (e.g. rubberducky's
+         * cellGcmFinish ref-sync). Yield so the busy-wait is cooperative and the
+         * other thread gets to run; still returns ESRCH. ponytail: a scheduling
+         * yield, not a semantic change; the real fix is the syscall-number table. */
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
         return (int64_t)(int32_t)CELL_ESRCH;
     }
     { static int _a=0; if(_a++<8) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }

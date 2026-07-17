@@ -17,6 +17,7 @@
 #include "rsx_commands.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv */
 
 /* ---------------------------------------------------------------------------
  * Global backend
@@ -256,6 +257,9 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
+    /* NV406E_SET_REFERENCE (FIFO method 0x50): update the control register's ref
+     * so cellGcmFinish / fence loops that poll control->ref advance. */
+    if (method == 0x50) { extern void cellGcm_rsx_set_reference(u32); cellGcm_rsx_set_reference(data); return 0; }
     { static int _rt=-1; if(_rt<0) _rt=getenv("YDKJ_RSXTRACE")?1:0;
       if(_rt){ static int _m=0; if(_m++<250) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX

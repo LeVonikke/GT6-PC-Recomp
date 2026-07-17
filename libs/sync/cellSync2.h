@@ -108,9 +108,18 @@ typedef struct CellSync2Queue {
     u8 _opaque[CELL_SYNC2_QUEUE_SIZE];
 } CellSync2Queue;
 
+/* Real 128-byte ABI, verified against the What-if debug-build DWARF (dwarf_abi.py).
+ * The old 8-byte {maxPushWaiters,maxPopWaiters} layout put both fields where the SDK
+ * keeps sdkVersion/threadTypes; the waiters are u16 at +0x10/+0x12. */
 typedef struct CellSync2QueueAttribute {
-    u32 maxPushWaiters;
-    u32 maxPopWaiters;
+    u32  sdkVersion;
+    u32  threadTypes;
+    u32  elementSize;
+    u32  depth;
+    u16  maxPushWaiters;
+    u16  maxPopWaiters;
+    char name[32];
+    u8   reserved[76];
 } CellSync2QueueAttribute;
 
 s32 cellSync2QueueAttributeInitialize(CellSync2QueueAttribute* attr);
