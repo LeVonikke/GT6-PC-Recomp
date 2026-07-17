@@ -25,6 +25,12 @@
 
 static rsx_backend* s_backend = NULL;
 
+/* Last NV406E_SET_REFERENCE value seen in the FIFO. The title writes a
+ * reference then spins on the GCM control register's `ref` field until the RSX
+ * reports it as reached; cellGcmSys mirrors this into the guest control
+ * register after each drain so those waits (cellGcmFinish / wait-label) unblock. */
+u32 g_rsx_last_reference = 0;
+
 void rsx_set_backend(rsx_backend* backend)
 {
     s_backend = backend;
@@ -75,6 +81,10 @@ void rsx_state_init(rsx_state* state)
     /* Default alpha test */
     state->alpha_func = 0x0207; /* ALWAYS */
     state->alpha_ref = 0;
+
+    /* Default shader control: 32-bit colour exports (r0..) -- matches every
+     * title that never programs the register. */
+    state->shader_control = CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS;
 
     /* Mark everything dirty */
     state->surface_dirty = 1;
@@ -131,6 +141,10 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_TARGET:
+        { static int _ct=0; if (_ct++ < 24 && getenv("RTT_DUMP"))
+            fprintf(stderr, "[RSXCT] color_target=0x%X offA=0x%X offB=0x%X offC=0x%X offD=0x%X%s",
+                    data, state->surface_color_offset[0], state->surface_color_offset[1],
+                    state->surface_color_offset[2], state->surface_color_offset[3], "\n"); }
         state->color_target = data;
         state->surface_dirty = 1;
         return 0;
@@ -274,11 +288,20 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       if (method == 0x1D70) {
         extern void vm_write32(uint32_t a, uint32_t v);
-        vm_write32(0x03000000u + (s_sem_off & 0x00FFFFFFu), data);
-        { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence)\n", 0x03000000u+(s_sem_off&0xFFFFFF), data); }
+        /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
+         * quirk); libgcm's cellGcmSetWriteBackEndLabel PRE-swaps to compensate
+         * (SDK gcm_implementation_sub.h: "// swap byte 0 and 2"). Writing the
+         * FIFO value verbatim left the label byte-swapped, so gcmutil's
+         * cellGcmUtilFinish poll (label 255 == sLabelVal, starts at 1) compared
+         * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
+         * Apply the same swap the hardware does so the pre-swap cancels out. */
+        u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+        vm_write32(0x03000000u + (s_sem_off & 0x00FFFFFFu), val);
+        { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", 0x03000000u+(s_sem_off&0xFFFFFF), val, data); }
         return 0;
       } }
-    if (method >= 0x200 && method <= 0x23C)
+    if ((method >= 0x200 && method <= 0x23C) ||
+        (method >= 0x280 && method <= 0x28C))
         return process_surface_method(state, method, data);
 
     /* Texture methods: 0x1A00..0x1A00 + 16*0x20 - 1 */
@@ -294,6 +317,21 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return process_vertex_attrib_method(state, method, data);
 
     /* Viewport */
+    /* Viewport transform: window = ndc*scale + offset. The z lane is the
+     * GL->[0,1] depth remap (offset.z=0.5/scale.z=0.5); without honoring it,
+     * GL-convention projections (SDK gcm samples) get their near-camera
+     * geometry clipped by D3D's 0<=z<=w rule (gcm/cube: missing polygons). */
+    if (method >= 0x0A20 && method < 0x0A30) {
+        u32 f = data; float v; memcpy(&v, &f, 4);
+        state->viewport_offset[(method - 0x0A20) >> 2] = v;
+        return 0;
+    }
+    if (method >= 0x0A30 && method < 0x0A40) {
+        u32 f = data; float v; memcpy(&v, &f, 4);
+        state->viewport_scale[(method - 0x0A30) >> 2] = v;
+        return 0;
+    }
+
     if (method == NV4097_SET_VIEWPORT_HORIZONTAL) {
         state->viewport_x = data & 0xFFFF;
         state->viewport_w = (data >> 16) & 0xFFFF;
@@ -454,9 +492,30 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_SET_TRANSFORM_PROGRAM_LOAD) {
-        /* Vertex program load slot — index into vertex program instruction memory */
+        /* Vertex program load slot — instruction index (each = 16 bytes).
+         * Following NV4097_SET_TRANSFORM_PROGRAM words fill from here. */
         state->transform_program_load = data;
+        state->vp_ucode_write = data * 16;
         state->shader_dirty = 1;
+        return 0;
+    }
+
+    /* NV4097_SET_TRANSFORM_PROGRAM[0..31] — a run of 32-bit vertex-program
+     * microcode words appended at the current write cursor. Capture them so the
+     * backend can decompile the real VP (4 words = one NV40 instruction). */
+    if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
+        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
+        u32 w = state->vp_ucode_write;
+        if (w + 4 <= sizeof(state->vp_ucode)) {
+            /* data is host-endian already; store as little-endian bytes. */
+            state->vp_ucode[w+0] = (u8)(data);
+            state->vp_ucode[w+1] = (u8)(data >> 8);
+            state->vp_ucode[w+2] = (u8)(data >> 16);
+            state->vp_ucode[w+3] = (u8)(data >> 24);
+            state->vp_ucode_write = w + 4;
+            if (w + 4 > state->vp_ucode_bytes) state->vp_ucode_bytes = w + 4;
+            state->vp_dirty = 1;
+        }
         return 0;
     }
     if (method == NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) {
@@ -483,6 +542,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         if (slot < RSX_MAX_VERTEX_CONSTANTS) {
             float f;
             memcpy(&f, &data, 4);
+            { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
+              static int _n=0; if(_en && _n++<64) fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); }
             state->vertex_constants[slot][lane] = f;
             if (!state->vertex_constants_dirty) {
                 state->vertex_constants_lo = slot;
@@ -557,17 +618,29 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    if (method == NV4097_SET_SHADER_CONTROL) {
+        { static int _sc=0; if (_sc++ < 12 && getenv("RTT_DUMP"))
+            fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }
+        state->shader_control = data;
+        state->shader_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_INDEX_ARRAY_ADDRESS) {
+        state->index_array_offset = data;
+        return 0;
+    }
+    if (method == NV4097_SET_INDEX_ARRAY_DMA) {
+        state->index_array_dma = data;
+        return 0;
+    }
     if (method == NV4097_DRAW_INDEX_ARRAY) {
-        /*
-         * Draw indexed command:
-         *   [23:0]  index buffer offset (in indices, not bytes)
-         *   [31:24] count - 1
-         */
-        u32 index_offset = data & 0xFFFFFF;
+        /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
+        u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
+        { static int _d=0; if (_d++ < 8) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
         if (s_backend && s_backend->draw_indexed)
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
-                                    index_offset, count);
+                                    first, count);
         return 0;
     }
 
@@ -580,6 +653,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_SET_SCISSOR_VERTICAL) {
         state->scissor_y = data & 0xFFFF;
         state->scissor_h = (data >> 16) & 0xFFFF;
+        return 0;
+    }
+
+    /* NV406E_SET_REFERENCE (0x0050): the title writes a reference value it then
+     * spins on (cellGcmFinish / cellGcmSetWaitLabel). Record the latest so the
+     * GCM control register can report completion back to the guest and unblock
+     * the spin. Class 0 (software) method, no subchannel state needed here. */
+    if (method == 0x0050) {
+        g_rsx_last_reference = data;
         return 0;
     }
 

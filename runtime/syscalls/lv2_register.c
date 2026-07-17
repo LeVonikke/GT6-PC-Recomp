@@ -53,6 +53,28 @@ static int64_t sys_tty_write(ppu_context* ctx)
         /* Write guest string data to host stderr */
         fwrite(vm_base + buf_ea, 1, len, stderr);
         fflush(stderr);
+        /* CRI error back-chain (YDKJ_CRIBT=1): dump the guest LR chain when a CRI
+         * null-pointer / criFs error is printed, to locate the failing call. */
+        if (getenv("YDKJ_CRIBT") && len < 4096) {
+            char tmp[256]; uint32_t n = len < 255 ? len : 255;
+            memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
+            if (strstr(tmp, "NULL pointer") || strstr(tmp, "E2004090") || strstr(tmp, "CRICRS")) {
+                static int _cb = 0; if (_cb++ < 4) {
+                    uint32_t sp = (uint32_t)ctx->gpr[1];
+                    fprintf(stderr, "[CRIBT] \"%.60s\" cia=0x%08X lr=0x%08X chain:", tmp,
+                            (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+                    for (int i = 0; i < 24 && sp && sp < 0x10000000u; i++) {
+                        uint32_t nsp; memcpy(&nsp, vm_base + sp, 4);
+                        nsp = ((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
+                        if (nsp <= sp || nsp >= 0x10000000u) break;
+                        uint32_t lr; memcpy(&lr, vm_base + nsp + 0x10, 4);
+                        lr = ((lr>>24)&0xFF)|((lr>>8)&0xFF00)|((lr<<8)&0xFF0000)|((lr<<24)&0xFF000000);
+                        fprintf(stderr, " %08X", lr); sp = nsp;
+                    }
+                    fprintf(stderr, "\n"); fflush(stderr);
+                }
+            }
+        }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title logs a PhyreEngine
          * init failure, dump the guest back-chain so we can locate the failing
          * function (the message itself goes through here, not _sys_printf). */
@@ -297,15 +319,23 @@ static int64_t sys_spu_initialize_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_group_create(out_id_ea, num, name_ea, attr_ea) */
+/* sys_spu_thread_group_create(out_id_ea, num, prio, attr_ea)
+ *
+ * lv2 signature per RPCS3's sys_spu.h (oracle, no code copied): r5 is the
+ * group PRIORITY (an int), NOT a name pointer. The name lives inside the
+ * attribute struct, sys_spu_thread_group_attribute (BE):
+ *   +0 u32 nsize (name length incl. NUL), +4 u32 name ptr, +8 s32 type.
+ * The previous version read r5 directly as name_ea, so it could never
+ * read a real group name (it dereferenced the priority integer as a
+ * pointer) and never captured the priority at all. */
 static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 {
     extern uint8_t* vm_base;
     uint32_t out_ea   = (uint32_t)ctx->gpr[3];
     uint32_t num      = (uint32_t)ctx->gpr[4];
-    uint32_t name_ea  = (uint32_t)ctx->gpr[5];
-    fprintf(stderr, "[SPU] thread_group_create(num=%u)\n", num);
+    int32_t  prio     = (int32_t)ctx->gpr[5];
     uint32_t attr_ea  = (uint32_t)ctx->gpr[6];
+    fprintf(stderr, "[SPU] thread_group_create(num=%u prio=%d)\n", num, prio);
 
     spu_group_t* g = spu_alloc_group();
     if (!g) {
@@ -317,6 +347,14 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     if (num > 8) num = 8;
     g->num_threads = num;
 
+    int32_t  gtype   = 0;
+    uint32_t name_ea = 0;
+    if (attr_ea) {
+        uint32_t nsize = vm_read_be32(attr_ea + 0);
+        name_ea        = vm_read_be32(attr_ea + 4);
+        gtype          = (int32_t)vm_read_be32(attr_ea + 8);
+        if (!nsize) name_ea = 0;
+    }
     if (name_ea && vm_base) {
         const char* src = (const char*)(vm_base + name_ea);
         size_t i = 0;
@@ -327,8 +365,8 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 
     vm_write_be32(out_ea, g->id);
 
-    fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u name=%.31s attr=0x%08X\n",
-            g->id, num, g->name, attr_ea);
+    fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u prio=%d type=0x%X name=%.31s\n",
+            g->id, num, prio, gtype, g->name);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -402,10 +440,11 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
 
-    /* Empty image (entry=0) on a cellSpurs SPU thread -> route to the HLE SPURS
-     * kernel (YDKJ_SPURSKERNEL) so group_start runs a live SPU instead of an
-     * instant no-op. */
-    if (t->entry_point == 0 && getenv("YDKJ_SPURSKERNEL")) {
+    /* Empty image (entry=0) OR the real SPURS kernel-A entry (0x818, now that
+     * _sys_spu_image_import parses the kernel ELF) on a cellSpurs SPU thread ->
+     * route to the HLE SPURS kernel (YDKJ_SPURSKERNEL) so group_start runs a live
+     * SPU instead of an instant no-op. */
+    if ((t->entry_point == 0 || t->entry_point == 0x818) && getenv("YDKJ_SPURSKERNEL")) {
         t->entry_point = YDKJ_SPURS_KERNEL_ENTRY;
         static int s_reg = 0;
         if (!s_reg) { s_reg = 1;
@@ -493,12 +532,16 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
      * whether libsre has populated it BEFORE the SPU kernel threads spawn. */
     { extern uint8_t* vm_base; static int s_d=0;
       if (vm_base && s_d++ < 4) {
-        const uint8_t* in = vm_base + 0x40009D00;
-        fprintf(stderr, "[INSTDUMP] group_start id=0x%X CellSpurs@0x40009D00 (0x140 bytes):\n", id);
+        /* Dump BOTH candidate instance addrs: the real one is 0x40009F00 (init arg);
+         * 0x40009D00 was the old hardcoded guess. See which libsre actually populated. */
+        for (uint32_t _ia = 0x40009D00; _ia <= 0x40009F00; _ia += 0x200) {
+        const uint8_t* in = vm_base + _ia;
+        fprintf(stderr, "[INSTDUMP] group_start id=0x%X CellSpurs@0x%08X (0x140 bytes):\n", id, _ia);
         for (int row=0; row<10; row++){
             fprintf(stderr, "  +0x%03X:", row*16);
             for (int i=0;i<4;i++){ int o=row*16+i*4; uint32_t w=((uint32_t)in[o]<<24)|((uint32_t)in[o+1]<<16)|((uint32_t)in[o+2]<<8)|in[o+3]; fprintf(stderr," %08X",w);}
             fprintf(stderr, "\n");
+        }
         }
         fflush(stderr);
         /* Arm a page-guard on the instance page so we catch the libsre function
@@ -661,8 +704,9 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
      * destroy so the group + threads survive, to see whether libsre then proceeds
      * (group_start) or just re-asserts. Logs the caller for diagnosis. */
     if (getenv("YDKJ_KEEPGROUP") && id == 0x1000) {
-        fprintf(stderr, "[SPU] group_destroy id=0x%X SKIPPED (YDKJ_KEEPGROUP) caller_lr=0x%08X cia=0x%08X\n",
-                id, (uint32_t)ctx->lr, (uint32_t)ctx->cia);
+        fprintf(stderr, "[SPU] group_destroy id=0x%X SKIPPED (YDKJ_KEEPGROUP) caller_lr=0x%08X cia=0x%08X r1=0x%08X r2=0x%08X\n",
+                id, (uint32_t)ctx->lr, (uint32_t)ctx->cia, (uint32_t)ctx->gpr[1], (uint32_t)ctx->gpr[2]);
+        { extern void ppu_dump_guest_stack(ppu_context*, const char*); ppu_dump_guest_stack(ctx, "group_destroy-caller"); }
         fflush(stderr);
         ctx->gpr[3] = 0;
         return 0;
@@ -952,33 +996,97 @@ uint8_t* spu_thread_get_local_store(uint32_t tid)
 
 uint32_t spu_thread_local_store_size(void) { return SPU_LS_SIZE; }
 
-/* sys_spu_image_import(*img, *source, type) — just log entry & return success.
- * We could parse the SPU ELF header and write entry into the image struct,
- * but no real use without SPU execution; zero-initialize so downstream
- * reads see a valid-looking image. */
+static uint16_t vm_read_be16(uint32_t a)
+{
+    extern uint8_t* vm_base;
+    if (!vm_base || !a) return 0;
+    const uint8_t* p = vm_base + a;
+    return (uint16_t)((p[0] << 8) | p[1]);
+}
+
+/* sys_spu_image_import(sys_spu_image_t* img, const void* src, uint32_t type)
+ * (Lv2 System Call & Library Reference, p.108). Parse the SPU ELF at `src`
+ * (guest memory) and fill the image-management struct so the entry point and
+ * segment table are real -- previously this zeroed the struct, so every SPU
+ * thread came up with entry=0, matched no fallback, and "instantly completed"
+ * (cellmark's SPU benchmarks read 0 as a result).
+ *
+ * sys_spu_image  { u32 type; u32 entry_point; sys_spu_segment* segs; int nsegs; }
+ * sys_spu_segment{ int type; u32 ls_start; int size; u64 src_pa; }  (0x18, src@0x10)
+ * PT_LOAD -> COPY segment (src_pa = src + p_offset); a memsz>filesz tail -> a
+ * FILL(0) segment, exactly as the SDK counts them. */
 static int64_t sys_spu_image_import_handler(ppu_context* ctx)
 {
     extern uint8_t* vm_base;
     uint32_t img_ea = (uint32_t)ctx->gpr[3];
     uint32_t src_ea = (uint32_t)ctx->gpr[4];
-    uint32_t entry = 0;
-    if (img_ea && vm_base) {
+    uint32_t itype  = (uint32_t)ctx->gpr[5];   /* PROTECT(0) / DIRECT(1) */
+    (void)itype;
+
+    if (!img_ea || !src_ea || !vm_base) {
+        if (img_ea && vm_base) memset(vm_base + img_ea, 0, 16);
+        ctx->gpr[3] = (uint64_t)(int64_t)-14;  /* EFAULT */
+        return -14;
+    }
+
+    /* Validate SPU ELF32 (big-endian) magic. */
+    const uint8_t* e = vm_base + src_ea;
+    if (!(e[0] == 0x7F && e[1] == 'E' && e[2] == 'L' && e[3] == 'F')) {
         memset(vm_base + img_ea, 0, 16);
-        /* Parse the in-memory SPU ELF32 at src_ea: e_ident magic then e_entry
-         * at offset 0x18 (big-endian). Set image type=USER(1)+entry so the SPU
-         * thread has a real entry and the PPU-fallback registry can match it. */
-        if (src_ea) {
-            const uint8_t* e = vm_base + src_ea;
-            if (e[0]==0x7f && e[1]=='E' && e[2]=='L' && e[3]=='F') {
-                entry = ((uint32_t)e[0x18]<<24)|((uint32_t)e[0x19]<<16)|
-                        ((uint32_t)e[0x1A]<<8)|(uint32_t)e[0x1B];
-                uint8_t* im = vm_base + img_ea;
-                im[0]=0;im[1]=0;im[2]=0;im[3]=1;                    /* type=USER */
-                im[4]=e[0x18];im[5]=e[0x19];im[6]=e[0x1A];im[7]=e[0x1B]; /* entry */
-            }
+        fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -- not an ELF\n", img_ea, src_ea);
+        fflush(stderr);
+        ctx->gpr[3] = (uint64_t)(int64_t)-8;   /* ENOEXEC */
+        return -8;
+    }
+
+    uint32_t entry   = vm_read_be32(src_ea + 0x18);
+    uint32_t phoff   = vm_read_be32(src_ea + 0x1C);
+    uint16_t phentsz = vm_read_be16(src_ea + 0x2A);
+    uint16_t phnum   = vm_read_be16(src_ea + 0x2C);
+    if (phentsz == 0) phentsz = 0x20;
+
+    /* Build the segment array in a dedicated guest scratch region (below the
+     * TLS block at 0x0E000000). SPU images allow at most 32 segments. */
+    static uint32_t s_spu_seg_bump = 0x0D000000u;
+    uint32_t segs_ea = s_spu_seg_bump;
+    int nsegs = 0;
+
+    for (uint16_t i = 0; i < phnum && nsegs < 32; i++) {
+        uint32_t ph = phoff + (uint32_t)i * phentsz;
+        if (vm_read_be32(src_ea + ph + 0x00) != 1) continue;   /* PT_LOAD */
+        uint32_t p_off = vm_read_be32(src_ea + ph + 0x04);
+        uint32_t p_va  = vm_read_be32(src_ea + ph + 0x08);
+        uint32_t p_fsz = vm_read_be32(src_ea + ph + 0x10);
+        uint32_t p_msz = vm_read_be32(src_ea + ph + 0x14);
+
+        uint32_t seg = segs_ea + (uint32_t)nsegs * 0x18;        /* COPY */
+        vm_write_be32(seg + 0x00, 1);                           /* SYS_SPU_SEGMENT_TYPE_COPY */
+        vm_write_be32(seg + 0x04, p_va);                        /* ls_start   */
+        vm_write_be32(seg + 0x08, p_fsz);                       /* size       */
+        vm_write_be32(seg + 0x10, 0);                           /* src_pa hi  */
+        vm_write_be32(seg + 0x14, src_ea + p_off);              /* src_pa lo  */
+        nsegs++;
+
+        if (p_msz > p_fsz && nsegs < 32) {                      /* BSS tail -> FILL 0 */
+            seg = segs_ea + (uint32_t)nsegs * 0x18;
+            vm_write_be32(seg + 0x00, 2);                       /* SYS_SPU_SEGMENT_TYPE_FILL */
+            vm_write_be32(seg + 0x04, p_va + p_fsz);            /* ls_start */
+            vm_write_be32(seg + 0x08, p_msz - p_fsz);           /* size     */
+            vm_write_be32(seg + 0x10, 0);                       /* value    */
+            vm_write_be32(seg + 0x14, 0);
+            nsegs++;
         }
     }
-    fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X entry=0x%08X\n", img_ea, src_ea, entry);
+    s_spu_seg_bump += (uint32_t)nsegs * 0x18;
+    if (s_spu_seg_bump >= 0x0E000000u) s_spu_seg_bump = 0x0D000000u;  /* wrap */
+
+    vm_write_be32(img_ea + 0x00, 0);        /* type = SYS_SPU_IMAGE_TYPE_USER */
+    vm_write_be32(img_ea + 0x04, entry);    /* entry_point */
+    vm_write_be32(img_ea + 0x08, nsegs ? segs_ea : 0);  /* segs (guest EA) */
+    vm_write_be32(img_ea + 0x0C, (uint32_t)nsegs);
+
+    fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -> entry=0x%05X nsegs=%d\n",
+            img_ea, src_ea, entry, nsegs);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -1110,6 +1218,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, 169,                            sys_spu_thread_stub); /* deprecated */
     lv2_syscall_register(tbl, SYS_SPU_INITIALIZE,             sys_spu_initialize_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_OPEN,             sys_spu_image_open_handler);
+    lv2_syscall_register(tbl, SYS_SPU_IMAGE_IMPORT,           sys_spu_image_import_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_CLOSE,            sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CREATE,    sys_spu_thread_group_create_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DESTROY,   sys_spu_thread_group_destroy_handler);
@@ -1164,6 +1273,14 @@ int lv2_try_syscall(ppu_context* ctx)
     lv2_syscall_fn h = g_lv2_syscalls.handlers[num];
     if (!h || h == lv2_syscall_unimplemented)
         return 0;
+    /* YDKJ diag: full event-syscall trace (#128..141) during SPURS init to find
+     * why libsre asserts ESRCH in event_helper.c. Snapshot args BEFORE handler. */
+    uint32_t _a3 = (uint32_t)ctx->gpr[3], _a4 = (uint32_t)ctx->gpr[4], _a5 = (uint32_t)ctx->gpr[5];
     ctx->gpr[3] = (uint64_t)h(ctx);
+    if (getenv("YDKJ_GFXSCAN") && num >= 128 && num <= 141) {
+        static int _e = 0; if (_e++ < 60)
+            fprintf(stderr, "[EVT-SC] #%u(r3=0x%08X r4=0x%08X r5=0x%08X) -> 0x%08X lr=0x%08X\n",
+                    num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
+    }
     return 1;
 }

@@ -37,25 +37,37 @@ extern "C" {
  * Naming: NV4097_SET_* for 3D methods, NV3062_SET_* for 2D methods
  * -----------------------------------------------------------------------*/
 
-/* Surface / render target configuration */
-#define NV4097_SET_SURFACE_FORMAT              0x00000200
-#define NV4097_SET_SURFACE_CLIP_HORIZONTAL     0x00000204
-#define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000208
+/* Surface / render target configuration (real NV4097 numbering -- RPCS3 /
+ * nouveau. The original table here was shuffled: only COLOR_AOFFSET was
+ * right, so SET_SURFACE_COLOR_TARGET (MRT selection) was never decoded and
+ * clip dims read the format register). */
+#define NV4097_SET_SURFACE_CLIP_HORIZONTAL     0x00000200
+#define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000204
+#define NV4097_SET_SURFACE_FORMAT              0x00000208
+#define NV4097_SET_SURFACE_PITCH_A             0x0000020C
 #define NV4097_SET_SURFACE_COLOR_AOFFSET       0x00000210
-#define NV4097_SET_SURFACE_COLOR_BOFFSET       0x00000214
-#define NV4097_SET_SURFACE_COLOR_COFFSET       0x00000218
-#define NV4097_SET_SURFACE_COLOR_DOFFSET       0x0000021C
-#define NV4097_SET_SURFACE_ZETA_OFFSET         0x00000220
-#define NV4097_SET_SURFACE_COLOR_TARGET        0x00000224
-#define NV4097_SET_SURFACE_PITCH_A             0x0000022C
-#define NV4097_SET_SURFACE_PITCH_B             0x00000230
-#define NV4097_SET_SURFACE_PITCH_C             0x00000234
-#define NV4097_SET_SURFACE_PITCH_D             0x00000238
-#define NV4097_SET_SURFACE_PITCH_Z             0x0000023C
+#define NV4097_SET_SURFACE_ZETA_OFFSET         0x00000214
+#define NV4097_SET_SURFACE_COLOR_BOFFSET       0x00000218
+#define NV4097_SET_SURFACE_PITCH_B             0x0000021C
+#define NV4097_SET_SURFACE_COLOR_TARGET        0x00000220
+#define NV4097_SET_SURFACE_PITCH_Z             0x0000022C
+#define NV4097_SET_SURFACE_PITCH_C             0x00000280
+#define NV4097_SET_SURFACE_PITCH_D             0x00000284
+#define NV4097_SET_SURFACE_COLOR_COFFSET       0x00000288
+#define NV4097_SET_SURFACE_COLOR_DOFFSET       0x0000028C
 
-/* Viewport */
-#define NV4097_SET_VIEWPORT_HORIZONTAL         0x00000300
-#define NV4097_SET_VIEWPORT_VERTICAL           0x00000304
+/* SET_SURFACE_COLOR_TARGET values */
+#define CELL_GCM_SURFACE_TARGET_NONE  0x00
+#define CELL_GCM_SURFACE_TARGET_0     0x01
+#define CELL_GCM_SURFACE_TARGET_1     0x02
+#define CELL_GCM_SURFACE_TARGET_MRT1  0x13   /* A + B     */
+#define CELL_GCM_SURFACE_TARGET_MRT2  0x17   /* A + B + C */
+#define CELL_GCM_SURFACE_TARGET_MRT3  0x1F   /* A+B+C+D   */
+
+/* Viewport (real NV4097 numbering -- the old 0x300/0x304 values actually
+ * belong to the dither/alpha-test block, so viewport rects read garbage). */
+#define NV4097_SET_VIEWPORT_HORIZONTAL         0x00000A00
+#define NV4097_SET_VIEWPORT_VERTICAL           0x00000A04
 #define NV4097_SET_CLIP_MIN                    0x00000394
 #define NV4097_SET_CLIP_MAX                    0x00000398
 
@@ -64,14 +76,16 @@ extern "C" {
 #define NV4097_SET_SCISSOR_VERTICAL            0x000008C4
 
 /* Clear */
-#define NV4097_SET_COLOR_CLEAR_VALUE           0x000001D0
-#define NV4097_SET_ZSTENCIL_CLEAR_VALUE        0x000001D8
+#define NV4097_SET_COLOR_CLEAR_VALUE           0x00001D90
+#define NV4097_SET_ZSTENCIL_CLEAR_VALUE        0x00001D8C
 #define NV4097_CLEAR_SURFACE                   0x00001D94
 
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
 #define NV4097_DRAW_ARRAYS                     0x00001814
-#define NV4097_DRAW_INDEX_ARRAY                0x00001820
+#define NV4097_SET_INDEX_ARRAY_ADDRESS         0x0000181C
+#define NV4097_SET_INDEX_ARRAY_DMA             0x00001820
+#define NV4097_DRAW_INDEX_ARRAY                0x00001824
 
 /* Vertex attributes */
 #define NV4097_SET_VERTEX_DATA_ARRAY_FORMAT     0x00001740
@@ -89,7 +103,11 @@ extern "C" {
 
 /* Shader programs */
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
-#define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF0
+#define NV4097_SET_SHADER_CONTROL               0x00001D60
+/* shader_control bit: fragment colour exports come from r0/r2/r3/r4 (32-bit)
+ * instead of h0/h4/h6/h8 (half). */
+#define CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS 0x00000040
+#define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF4
 #define NV4097_SET_TRANSFORM_PROGRAM_LOAD       0x00001E9C
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
 #define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
@@ -100,36 +118,36 @@ extern "C" {
 #define RSX_MAX_VERTEX_CONSTANTS                512
 
 /* Color mask */
-#define NV4097_SET_COLOR_MASK                   0x00000028
+#define NV4097_SET_COLOR_MASK                   0x00000324
 
 /* Alpha test */
-#define NV4097_SET_ALPHA_TEST_ENABLE            0x00000104
-#define NV4097_SET_ALPHA_FUNC                   0x00000108
-#define NV4097_SET_ALPHA_REF                    0x0000010C
+#define NV4097_SET_ALPHA_TEST_ENABLE            0x00000304
+#define NV4097_SET_ALPHA_FUNC                   0x00000308
+#define NV4097_SET_ALPHA_REF                    0x0000030C
 
 /* Blending */
 #define NV4097_SET_BLEND_ENABLE                 0x00000310
-#define NV4097_SET_BLEND_FUNC_SFACTOR           0x00000344
-#define NV4097_SET_BLEND_FUNC_DFACTOR           0x00000348
-#define NV4097_SET_BLEND_EQUATION               0x0000034C
-#define NV4097_SET_BLEND_COLOR                  0x00000350
+#define NV4097_SET_BLEND_FUNC_SFACTOR           0x00000314
+#define NV4097_SET_BLEND_FUNC_DFACTOR           0x00000318
+#define NV4097_SET_BLEND_EQUATION               0x00000320
+#define NV4097_SET_BLEND_COLOR                  0x0000031C
 
 /* Depth / stencil */
-#define NV4097_SET_DEPTH_TEST_ENABLE            0x00000304
-#define NV4097_SET_DEPTH_FUNC                   0x00000308
-#define NV4097_SET_DEPTH_MASK                   0x0000030C
-#define NV4097_SET_STENCIL_TEST_ENABLE          0x00000360
-#define NV4097_SET_STENCIL_FUNC                 0x00000364
-#define NV4097_SET_STENCIL_FUNC_REF             0x00000368
-#define NV4097_SET_STENCIL_FUNC_MASK            0x0000036C
-#define NV4097_SET_STENCIL_OP_FAIL              0x00000370
-#define NV4097_SET_STENCIL_OP_ZFAIL             0x00000374
-#define NV4097_SET_STENCIL_OP_ZPASS             0x00000378
+#define NV4097_SET_DEPTH_TEST_ENABLE            0x00000A74
+#define NV4097_SET_DEPTH_FUNC                   0x00000A6C
+#define NV4097_SET_DEPTH_MASK                   0x00000A70
+#define NV4097_SET_STENCIL_TEST_ENABLE          0x00000328
+#define NV4097_SET_STENCIL_FUNC                 0x00000330
+#define NV4097_SET_STENCIL_FUNC_REF             0x00000334
+#define NV4097_SET_STENCIL_FUNC_MASK            0x00000338
+#define NV4097_SET_STENCIL_OP_FAIL              0x0000033C
+#define NV4097_SET_STENCIL_OP_ZFAIL             0x00000340
+#define NV4097_SET_STENCIL_OP_ZPASS             0x00000344
 
 /* Culling */
-#define NV4097_SET_CULL_FACE_ENABLE             0x000002BC
-#define NV4097_SET_CULL_FACE                    0x000002C0
-#define NV4097_SET_FRONT_FACE                   0x000002C4
+#define NV4097_SET_CULL_FACE_ENABLE             0x0000183C
+#define NV4097_SET_CULL_FACE                    0x00001830
+#define NV4097_SET_FRONT_FACE                   0x00001834
 
 /* Primitive types */
 #define RSX_PRIMITIVE_POINTS             1
@@ -235,8 +253,19 @@ typedef struct rsx_state {
     u32 primitive_type;
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
 
+    /* Index array (SET_INDEX_ARRAY_ADDRESS/_DMA): offset is a raw RSX offset;
+     * dma bits [3:0] = location context (0=local 1=main via CELL_GCM_DMA ids),
+     * bits [7:4] = index type (0 = u32, 1 = u16). */
+    u32 index_array_offset;
+    u32 index_array_dma;
+
     /* Shader state */
+    /* RSX viewport transform (SET_VIEWPORT_OFFSET 0x0A20 / _SCALE 0x0A30,
+     * 4 floats each): window = ndc * scale + offset (pixels; z [0,1]). */
+    float viewport_offset[4];
+    float viewport_scale[4];
     u32 shader_program;       /* fragment program address (offset | location in bits [0:1]) */
+    u32 shader_control;       /* SET_SHADER_CONTROL (0x40 = 32-bit colour exports) */
     u32 fragment_program_addr;
     u32 vertex_attrib_output_mask;
     u32 transform_program_load; /* vertex program load slot index */
@@ -253,6 +282,15 @@ typedef struct rsx_state {
     u32 vertex_constants_lo;
     u32 vertex_constants_hi;
     int vertex_constants_dirty;
+
+    /* Captured RSX vertex program microcode (NV40 ISA), filled by
+     * NV4097_SET_TRANSFORM_PROGRAM. Words are host-endian (as delivered by the
+     * FIFO parser), i.e. RPCS3 order, ready for rsx_vp_decompile. */
+    u8  vp_ucode[1024 * 16];  /* up to 1024 instructions (Tiny3D's VP exceeds 128;
+                               * truncation dropped the end bit + HPOS write) */
+    u32 vp_ucode_write;       /* byte write cursor (from SET_TRANSFORM_PROGRAM_LOAD) */
+    u32 vp_ucode_bytes;       /* highest byte written + 1 */
+    int vp_dirty;             /* program changed since last translate */
 
     /* Dirty flags for incremental state updates */
     int surface_dirty;

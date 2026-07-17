@@ -50,6 +50,14 @@ PT_NULL = 0
 PT_LOAD = 1
 PT_NOTE = 4
 PT_SCE_PPURELA = 0x700000A4
+# Main-executable (ET_EXEC) process param segments. The PRX param segment
+# points at the sys_proc_prx_param structure that describes the lib entry
+# (export) and lib stub (import) tables for a fixed EBOOT.
+PT_PROC_PARAM = 0x60000001
+PT_PROC_PRX_PARAM = 0x60000002
+
+# Magic in sys_proc_prx_param ("PRX param")
+PROC_PRX_PARAM_MAGIC = 0x1B434CEC
 
 # Section header types
 SHT_NULL = 0
@@ -92,6 +100,8 @@ PT_TYPE_NAMES = {
     PT_LOAD: "PT_LOAD",
     PT_NOTE: "PT_NOTE",
     PT_SCE_PPURELA: "PT_SCE_PPURELA",
+    PT_PROC_PARAM: "PT_PROC_PARAM",
+    PT_PROC_PRX_PARAM: "PT_PROC_PRX_PARAM",
 }
 
 # ---------------------------------------------------------------------------
@@ -655,9 +665,13 @@ class ELFFile:
         self._parse_section_headers()
         self._resolve_section_names()
 
-        # If this is a PRX, parse module info
+        # If this is a PRX, parse module info. If it is a fixed main
+        # executable (EBOOT), locate its import/export tables via the
+        # PT_PROC_PRX_PARAM segment instead.
         if self.elf_header.e_type == ET_SCE_PPURELEXEC:
             self._parse_prx_module_info()
+        else:
+            self._parse_proc_prx_param()
 
         self._parse_relocations()
 
@@ -716,6 +730,44 @@ class ELFFile:
                     except Exception:
                         pass
                 break
+
+    def _parse_proc_prx_param(self) -> None:
+        """Locate import/export tables for a fixed main executable (ET_EXEC).
+
+        A main EBOOT does not carry a PRX module_info at the head of its first
+        segment. Instead a PT_PROC_PRX_PARAM (0x60000002) program header points
+        at a sys_proc_prx_param structure:
+
+            u32 size;
+            u32 magic;         // 0x1B434CEC
+            u32 version;
+            u32 unk0;
+            u32 libentstart;   // exports (lib entry) table start vaddr
+            u32 libentend;     // exports table end vaddr
+            u32 libstubstart;  // imports (lib stub) table start vaddr
+            u32 libstubend;    // imports table end vaddr
+
+        We reuse PRXModuleInfo purely as a carrier for the four table pointers
+        and then run the shared export/import table walker.
+        """
+        rd = self._rd()
+        for ph in self.program_headers:
+            if ph.p_type != PT_PROC_PRX_PARAM or ph.p_filesz < 0x20:
+                continue
+            off = int(ph.p_offset)
+            if off + 0x20 > len(self.raw_data):
+                continue
+            if rd.u32(off + 4) != PROC_PRX_PARAM_MAGIC:
+                continue
+
+            mi = PRXModuleInfo()
+            mi.exports_start = rd.u32(off + 16)
+            mi.exports_end = rd.u32(off + 20)
+            mi.imports_start = rd.u32(off + 24)
+            mi.imports_end = rd.u32(off + 28)
+            self.module_info = mi
+            self._parse_exports_imports()
+            return
 
     def _parse_exports_imports(self) -> None:
         mi = self.module_info

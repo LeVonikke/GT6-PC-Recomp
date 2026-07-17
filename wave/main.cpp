@@ -70,7 +70,7 @@ static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)er->ExceptionAddress, &mod);
-    fprintf(stderr, "[CRASH] module=%p rva=0x%llX  (llvm-symbolizer --obj=ydkj_boot.exe 0x%llX)\n",
+    fprintf(stderr, "[CRASH] module=%p rva=0x%llX  (llvm-symbolizer --obj=wave.exe 0x%llX)\n",
             (void*)mod, (unsigned long long)((char*)er->ExceptionAddress - (char*)mod),
             (unsigned long long)((char*)er->ExceptionAddress - (char*)mod));
     /* Host call stack (RVAs) so the lifted caller can be symbolized. */
@@ -151,7 +151,6 @@ extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSys
 extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
-extern "C" int  cellGcm_take_flip_pending(void);  /* hoisted to file scope: clang-cl rejects block-scope extern "C" */
 
 static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 { ppu_guest_call(opd, a0, a1, a2, a3); }
@@ -161,95 +160,49 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_
  * thread so the D3D12 device + window message pump live on one thread. */
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
-extern "C" int cellGcm_take_flip_pending(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" unsigned cellGcm_flip_request_count(void);
-extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
+extern "C" int cellGcm_take_flip_pending(void);
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
-    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "You Don't Know Jack (ps3recomp)") == 0);
+    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "cellmark (ps3recomp)") == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
     unsigned last_flip = 0;
-    /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
-     * advance at ~60Hz regardless of how long present() blocks. On a hidden/occluded
-     * window DXGI Present throttles hard, which previously stalled these ticks and
-     * paced the game's main loop to ~0.5fps. Drive the ticks off REAL elapsed time
-     * and catch up in a bounded burst so present latency never slows the game. */
     ULONGLONG next_tick = GetTickCount64();
     for (;;) {
-        Sleep(4);
+        /* Fast cadence: titles fence EVERY render pass on an RSX label the
+         * drain writes; at a 16ms drain each fence cost a frame's worth of
+         * time (wave: six passes -> ~7 fps). Drain at ~2ms; vblank/flip
+         * ticks stay on 16ms beats. */
+        Sleep(2);
+        /* Flip completion at the fast cadence too: the 16ms beat is only
+         * vsync emulation and throttled the whole frame loop; the guest's
+         * flip-status wait resolves as soon as the frame actually finished. */
+        cellGcmTickFlip();
         ULONGLONG now = GetTickCount64();
-        int fired = 0;
-        while ((long long)(now - next_tick) >= 0 && fired < 240) {
+        while ((long long)(now - next_tick) >= 0) {
             cellGcmTickVBlank();
-            cellGcmTickFlip();
+            next_tick += 16;
+            if ((long long)(now - next_tick) > 1000) { next_tick = now; break; }
+        }
+        if (rsx_ok) {
+            if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
             /* Present a pending flip BEFORE draining further: the flip fires
-             * at a get==put frame boundary (guest thread), so the batch held
-             * right now is exactly the completed frame. Presenting on a raw
-             * flip-count change after the drain raced the guest's next-frame
-             * writes and showed empty or mixed batches. */
+             * at a get==put boundary, so the held batch is exactly the
+             * completed frame. */
             {
-                if (rsx_ok && cellGcm_take_flip_pending()) {
+                if (cellGcm_take_flip_pending()) {
                     rsx_d3d12_backend_present();
                     last_flip = cellGcm_flip_request_count();
                 }
             }
-            /* Drain the game's GCM FIFO every tick -- this writes the RSX sync-fence
-             * labels (e.g. @0x03000410) that the game's per-frame logic blocks on.
-             * Doing it here (not after present) keeps those fences advancing at 60Hz
-             * even when present() throttles on a hidden/occluded window. */
-            if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;                 /* ~60 Hz */
-            fired++;
-        }
-        if (fired >= 240) next_tick = now;   /* fell too far behind -> resync */
-        /* Drain at the outer ~4ms cadence too (not just the 16ms tick):
-         * titles fence EVERY render pass on an RSX label the drain writes;
-         * at 16ms per fence wave's six passes paced the guest to ~7 fps.
-         * The real RSX writes those fences in microseconds. */
-        if (rsx_ok) {
-            if (cellGcm_take_flip_pending()) {
-                rsx_d3d12_backend_present();
-                last_flip = cellGcm_flip_request_count();
-            }
-            cellGcm_rsx_process_fifo();
-        }
-        /* YDKJ_INJECT_Q3: the main thread polls q3 (load/state-complete) each frame but
-         * it's never posted (producer signals a condvar, never enqueues). Inject a q3
-         * event periodically to test whether delivering the completion advances the
-         * game's state machine to instantiate + display the (force-parsed) menu movie. */
-        if (getenv("YDKJ_INJECT_Q3")) {
-            static int s_q3=0; const char* qe=getenv("YDKJ_INJECT_Q3"); uint32_t qid=(uint32_t)strtoul(qe,0,0); if(qid==0||qid==1) qid=3;
-            if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
-              static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
-        if (rsx_ok) {
-            if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
-            if (getenv("YDKJ_PACETRACE")) {
-                static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
-                s_pf += fired; s_pres++;
-                ULONGLONG t0=GetTickCount64(); rsx_d3d12_backend_present(); ULONGLONG t1=GetTickCount64();
-                s_presms += (t1-t0);
-                if (s_win==0) s_win=now;
-                if (now - s_win >= 1000) {
-                    fprintf(stderr,"[PACE] process_fifo=%d/s  present=%d/s  present_total=%llums/s (avg %llums)\n",
-                            s_pf, s_pres, s_presms, s_pres? s_presms/s_pres:0);
-                    s_pf=0; s_pres=0; s_presms=0; s_win=now;
-                }
-            } else {
-                /* Present only on a guest flip (frame boundary). A fixed-clock
-                 * present can catch the drain mid-frame -- notably while the
-                 * guest is blocked in the FIFO-wrap recycle callback -- and
-                 * flash a partial frame (clear + a few draws). Before the
-                 * first flip present freely so the window isn't stuck white
-                 * during boot. */
-                unsigned fc = cellGcm_flip_request_count();
-                if (fc != last_flip || fc == 0) {
-                    rsx_d3d12_backend_present();
-                    last_flip = fc;
-                }
-            }
+            cellGcm_rsx_process_fifo();      /* execute the game's GCM commands */
+            /* Boot fallback: before the first flip, present freely so the
+             * window isn't stuck white. */
+            unsigned fc = cellGcm_flip_request_count();
+            if (fc == 0) rsx_d3d12_backend_present();
         }
     }
     return 0;
@@ -290,31 +243,12 @@ static void dump_threads(const char* label, HMODULE self)
                     fprintf(stderr, "[WATCHDOG]   tid %5lu BOOT rip rva=0x%llX\n",
                             (unsigned long)te.th32ThreadID,
                             (unsigned long long)((char*)ctx.Rip - (char*)self));
-                } else {
-                    char path[MAX_PATH] = "?";
-                    if (m) GetModuleFileNameA(m, path, sizeof path);
-                    const char* base = strrchr(path, '\\');
-                    fprintf(stderr, "[WATCHDOG]   tid %5lu in %s\n",
-                            (unsigned long)te.th32ThreadID, base ? base + 1 : path);
-                }
-                /* Scan the suspended thread's stack for boot-module return
-                 * addresses to reconstruct the lifted call chain — done for ALL
-                 * threads (even when RIP is parked in ntdll inside a CriticalSection
-                 * call), since that's exactly where the busy-spin's lwmutex churn
-                 * lands the main thread. Map RVAs -> func_ names via flow.map.
-                 * (some false positives expected — these are stack-scan hits.) */
-                {
+                    /* Scan the suspended thread's stack for boot-module return
+                     * addresses to reconstruct the call chain when there's no
+                     * OOB backtrace to lean on (some false positives expected). */
                     uint64_t* sp = (uint64_t*)ctx.Rsp;
-                    /* Bound the scan to the committed stack region so we never read
-                     * past the guard page (VirtualQuery gives this region's end). */
-                    MEMORY_BASIC_INFORMATION mbi;
-                    uint64_t region_end = (uint64_t)sp + 0x8000;
-                    if (VirtualQuery((LPCVOID)sp, &mbi, sizeof mbi))
-                        region_end = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
-                    int maxk = (int)((region_end - (uint64_t)sp) / 8);
-                    if (maxk > 0x20000 / 8) maxk = 0x20000 / 8;
                     int found = 0;
-                    for (int k = 0; k < maxk && found < 20; k++) {
+                    for (int k = 0; k < 0x8000 / 8 && found < 16; k++) {
                         uint64_t v = sp[k];
                         if (v < (uint64_t)self) continue;
                         HMODULE mm = NULL;
@@ -322,12 +256,17 @@ static void dump_threads(const char* label, HMODULE self)
                                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                            (LPCSTR)v, &mm);
                         if (mm == self) {
-                            fprintf(stderr, "[WATCHDOG]       tid %5lu ret rva=0x%llX\n",
-                                    (unsigned long)te.th32ThreadID,
+                            fprintf(stderr, "[WATCHDOG]       ret rva=0x%llX\n",
                                     (unsigned long long)(v - (uint64_t)self));
                             found++;
                         }
                     }
+                } else {
+                    char path[MAX_PATH] = "?";
+                    if (m) GetModuleFileNameA(m, path, sizeof path);
+                    const char* base = strrchr(path, '\\');
+                    fprintf(stderr, "[WATCHDOG]   tid %5lu in %s\n",
+                            (unsigned long)te.th32ThreadID, base ? base + 1 : path);
                 }
             }
             ResumeThread(th);
@@ -388,21 +327,14 @@ int main(int argc, char** argv)
 {
     if (argc < 2) { printf("usage: %s <EBOOT.elf>\n", argv[0]); return 2; }
 
+    /* wave is camera-optional: default the virtual camera OFF so it takes the
+     * file-based cat-image path (matches RPCS3, which has no camera). Set
+     * PS3_CAMERA=1 to feed it the synthetic EyeToy pattern instead. */
+    if (!getenv("PS3_CAMERA"))
+        _putenv("PS3_CAMERA=0");
+
 #ifdef _WIN32
-#pragma comment(lib, "winmm.lib")
-    timeBeginPeriod(1);   /* 1ms timer resolution: the default ~15.6ms granularity
-                           * inflates every sub-15ms wait (the game's event polls,
-                           * usleeps) and throttled the whole title. */
     SetUnhandledExceptionFilter(ydkj_crash_filter);
-    AddVectoredExceptionHandler(0 /*last*/, [](EXCEPTION_POINTERS* ep)->LONG{
-        if (ep->ExceptionRecord->ExceptionCode == 0xC00000FDu /*STACK_OVERFLOW*/) {
-            fprintf(stderr,"\n[STACKOVERFLOW] infinite recursion detected; backtrace (RVAs):\n");
-            HMODULE mod=GetModuleHandleA(0); void* fr[62]; USHORT n=RtlCaptureStackBackTrace(0,62,fr,0);
-            for(USHORT i=0;i<n;i++) fprintf(stderr," %llX",(unsigned long long)((char*)fr[i]-(char*)mod));
-            fprintf(stderr,"\n"); fflush(stderr); ExitProcess(7);
-        }
-        return EXCEPTION_CONTINUE_SEARCH; });
-    { ULONG g=256*1024; SetThreadStackGuarantee(&g); }  /* reserve stack so the SO handler can run */
     signal(SIGABRT, ydkj_abort_handler);
     setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: don't lose prints on kill */
 #endif
@@ -433,17 +365,12 @@ int main(int argc, char** argv)
     derive_vfs_root(argv[1]);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
 
-    fprintf(stderr,"[boot-dbg] before ppu_recomp_register\n"); fflush(stderr);
     ppu_recomp_register();   /* lifted function table -> address map */
-    fprintf(stderr,"[boot-dbg] after ppu_recomp_register; before ps3_load_prx_modules\n"); fflush(stderr);
     ps3_load_prx_modules();  /* real system PRX (libsre) -> guest RAM + exports */
-    fprintf(stderr,"[boot-dbg] after prx; before ppu_hle_init\n"); fflush(stderr);
     ppu_hle_init();          /* firmware import NID -> HLE handlers */
     ppu_sysprx_register();   /* boot-critical CRT (sys_initialize_tls, ...) */
     ppu_fs_register();       /* cellFs VFS over the real game directory */
-    fprintf(stderr,"[boot-dbg] before lv2_init_syscalls\n"); fflush(stderr);
     lv2_init_syscalls();     /* real lv2 syscall table (semaphore/memory/fs/...) */
-    fprintf(stderr,"[boot-dbg] after lv2_init_syscalls\n"); fflush(stderr);
 
     /* Install the guest-callback hook and start the synthetic RSX vblank driver
      * so the game's frame loop advances (it no-ops until the game registers its
@@ -455,9 +382,6 @@ int main(int argc, char** argv)
 #endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
-#ifdef _WIN32
-    fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
-#endif
     int rc = ppu_run(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
     return 0;

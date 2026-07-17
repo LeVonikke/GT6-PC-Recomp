@@ -22,7 +22,10 @@ scratch\\dobuild2.bat when cl is absent).
 Scope (tranche 1): integer ALU/rotate/shift/carry/compare classes -- the
 proven silent-miscompile territory. Memory ops, FP, and VMX are follow-on
 tranches (VMX semantics already have manual-verified handling; loads/stores
-need a vm stub harness).
+need a vm stub harness). A minimal vm stub now backs the FP D-form
+load/store-with-update RA writeback cases below (CASES gained optional
+in_mem/exp_mem/in_fpr/exp_fpr fields); it is self-contained on purpose and
+can grow with later memory-op tranches.
 """
 
 import argparse
@@ -203,28 +206,27 @@ def ref_divdu(a, b):
 
 # --- vupk*: AltiVec sign-extend unpacks. Element SELECTION (which half of
 # the 16 input bytes feeds the op) follows the AltiVec PEM (6-172..6-176):
-# high = storage bytes 0-7, low = storage bytes 8-15. But ppu_lifter.py's
-# vupk* handlers read/write vr[] through native (host, little-endian x86)
-# int16_t*/int32_t* casts rather than an explicit big-endian unpack -- e.g.
-# vupkhsh does `int16_t* b=(int16_t*)&ctx->vr[vb]; r[i]=(int32_t)b[i];
-# memcpy(vd, r, 16)`, so a 16-bit lane's bytes are read AND written in host
-# (LE) order, not swapped to/from the guest's big-endian element order. That
-# is this file's existing, already-upstream vupkhsh convention (matched here
-# for vupklsh/vupkhsb/vupklsb, not something this change invents), so these
-# references model that native-endian read/write exactly, using '<' (host
-# LE) struct formats -- NOT '>' -- to predict the lifter's actual output.
+# high = storage bytes 0-7, low = storage bytes 8-15. ppu_lifter.py's vupk*
+# handlers now route every multi-byte lane through the vrh/vsth (halfword
+# source of vupkhsh/vupklsh) and vsth (halfword result of vupkhsb/vupklsb)
+# big-endian accessors, matching every other multi-byte-lane VMX handler
+# (ppu: vmx element wise ops read big endian lanes fix). These references
+# therefore use '>' (true big-endian) struct formats to predict the lifter's
+# corrected output -- this used to be '<' (host LE), which modeled the
+# pre-fix byte-reversed behavior as "correct"; it wasn't, it was the same
+# class of bug this change fixes everywhere else.
 def ref_vupkhsh(vb16):
-    halfs = struct.unpack("<4h", vb16[0:8])          # high 4 halfwords, host order
-    return struct.pack("<4i", *halfs)
+    halfs = struct.unpack(">4h", vb16[0:8])          # high 4 halfwords, big-endian
+    return struct.pack(">4i", *halfs)
 def ref_vupklsh(vb16):
-    halfs = struct.unpack("<4h", vb16[8:16])         # low 4 halfwords, host order
-    return struct.pack("<4i", *halfs)
+    halfs = struct.unpack(">4h", vb16[8:16])         # low 4 halfwords, big-endian
+    return struct.pack(">4i", *halfs)
 def ref_vupkhsb(vb16):
-    bytes8 = struct.unpack("<8b", vb16[0:8])         # high 8 bytes
-    return struct.pack("<8h", *bytes8)
+    bytes8 = struct.unpack(">8b", vb16[0:8])         # high 8 bytes (byte lanes: order-agnostic)
+    return struct.pack(">8h", *bytes8)
 def ref_vupklsb(vb16):
-    bytes8 = struct.unpack("<8b", vb16[8:16])        # low 8 bytes
-    return struct.pack("<8h", *bytes8)
+    bytes8 = struct.unpack(">8b", vb16[8:16])        # low 8 bytes (byte lanes: order-agnostic)
+    return struct.pack(">8h", *bytes8)
 
 def cr_nibble_signed(a, b):
     if s64(a) < s64(b): return 8
@@ -251,10 +253,17 @@ rng = random.Random(0x59414B5A)   # deterministic
 E64 += [rng.getrandbits(64) for _ in range(4)]
 
 CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
+             # in_mem/exp_mem {addr: bytes} and in_fpr {freg: raw64 bits} /
+             # exp_fpr [(freg, raw64 bits)] back the FP update-form cases below
+             # (ctx->fpr is a double[32]; bits are compared as the raw
+             # IEEE-754 pattern via memcpy, not value).
 
-def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False):
+def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
+         in_mem=None, exp_mem=None, in_fpr=None, exp_fpr=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
-                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap))
+                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
+                      in_mem=in_mem or {}, exp_mem=exp_mem or {},
+                      in_fpr=in_fpr or {}, exp_fpr=exp_fpr or []))
 
 # VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
 # ctx->vr[] directly (no memory load/store instructions needed to exercise
@@ -262,12 +271,30 @@ def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may
 # and checks one output vector register's 16 raw bytes. The byte contents
 # are opaque here (chosen only to span sign/lane patterns); the ref_vupk*
 # functions above are what predict the lifter's actual output for a given
-# input, including its native-endian element read/write convention.
-VCASES = []   # dicts: name, word, vb_reg, vb_bytes, vd_reg, exp_bytes
+# input, including its big-endian element read/write convention.
+#
+# va_reg/va_bytes and vc_reg/vc_bytes are optional: the original harness only
+# covered unary vupk* (one input, vB); binary ops (vcmpgtsw, vadduwm, ...)
+# also seed vA, and the VA-form vmaddfp also seeds vC. Kept at the end of the
+# signature so the existing unary vcase(...) call sites above are untouched.
+VCASES = []   # dicts: name, word, vb_reg, vb_bytes, vd_reg, exp_bytes, va_reg, va_bytes, vc_reg, vc_bytes
 
-def vcase(name, word, vb_reg, vb_bytes, vd_reg, exp_bytes):
+def vcase(name, word, vb_reg, vb_bytes, vd_reg, exp_bytes,
+          va_reg=None, va_bytes=None, vc_reg=None, vc_bytes=None):
     VCASES.append(dict(name=name, word=word, vb_reg=vb_reg, vb_bytes=vb_bytes,
-                       vd_reg=vd_reg, exp_bytes=exp_bytes))
+                       vd_reg=vd_reg, exp_bytes=exp_bytes,
+                       va_reg=va_reg, va_bytes=va_bytes,
+                       vc_reg=vc_reg, vc_bytes=vc_bytes))
+
+def be_w(vals):    # N x uint32 (big-endian lane values) -> 4N raw bytes
+    return struct.pack(f">{len(vals)}I", *(v & 0xFFFFFFFF for v in vals))
+def be_h(vals):    # N x uint16 (big-endian lane values) -> 2N raw bytes
+    return struct.pack(f">{len(vals)}H", *(v & 0xFFFF for v in vals))
+def be_f(vals):    # N x float (big-endian lane values) -> 4N raw bytes
+    return struct.pack(f">{len(vals)}f", *vals)
+
+def va_form(xo6, vd, va, vb, vc):   # VA-form (vmaddfp/vnmsubfp/vsel/vperm/vsldoi/...)
+    return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | (vc << 6) | xo6
 
 def pairs(n=6):
     ps = []
@@ -476,6 +503,52 @@ def build_cases():
         case(f"add. a={a:#x} b={b:#x}", xo_form(266, R[0], R[1], R[2], rc=1),
              {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_cr=(nib, 28))
 
+    # --- FP D-form load/store-with-update RA writeback ---------------------
+    # lfsu/lfdu/stfsu/stfdu (opcodes 49/51/53/55) sat in the plain lfs/lfd/
+    # stfs/stfd handling, so the access happened but RA never got EA written
+    # back. PowerISA_V2.03_Final_Public.pdf p.129 (Load Floating-Point Single
+    # with Update), p.130 (...Double with Update), p.132 (Store
+    # Floating-Point Single with Update) and p.133 (...Double with Update)
+    # all give RA <- EA as part of the update form and all four state RA=0
+    # is itself an invalid instruction on these forms, so no rA=0 guard
+    # belongs in the update handlers.
+    pi_bits = struct.unpack(">Q", struct.pack(">d", 3.14159265358979))[0]
+    fp_val = 2.5   # exactly representable in both float and double
+    fp_double_bits = struct.unpack(">Q", struct.pack(">d", fp_val))[0]
+    fp_float_bytes = struct.pack(">f", fp_val)
+
+    # lfsu f7,0x10(r3): single-load-with-update -- checks the widened double
+    # bits AND the updated RA.
+    case("lfsu loaded single widened and ra writeback", d_form(49, 7, 3, 0x10),
+         {3: 0x4000}, [(3, 0x4010, MASK64)],
+         in_mem={0x4010: fp_float_bytes},
+         exp_fpr=[(7, fp_double_bits)])
+
+    # lfdu f8,0x40(r4): checks BOTH the loaded double bits and the updated RA.
+    case("lfdu loaded double and ra writeback", d_form(51, 8, 4, 0x40),
+         {4: 0x5000}, [(4, 0x5040, MASK64)],
+         in_mem={0x5040: struct.pack(">Q", pi_bits)},
+         exp_fpr=[(8, pi_bits)])
+
+    # stfsu f9,0x30(r5): checks BOTH the stored float bytes and the updated RA.
+    case("stfsu stored float and ra writeback", d_form(53, 9, 5, 0x30),
+         {5: 0x6000}, [(5, 0x6030, MASK64)],
+         in_fpr={9: fp_double_bits},
+         exp_mem={0x6030: fp_float_bytes})
+
+    # stfdu f11,0x20(r12): double-store-with-update -- checks BOTH the stored
+    # double bytes and the updated RA.
+    case("stfdu stored double and ra writeback", d_form(55, 11, 12, 0x20),
+         {12: 0x8000}, [(12, 0x8020, MASK64)],
+         in_fpr={11: pi_bits},
+         exp_mem={0x8020: struct.pack(">Q", pi_bits)})
+
+    # lfd f10,0x20(r6): non-update regression check -- RA must be left alone.
+    case("lfd non-update leaves ra untouched", d_form(50, 10, 6, 0x20),
+         {6: 0x7000}, [(6, 0x7000, MASK64)],
+         in_mem={0x7020: struct.pack(">Q", pi_bits)},
+         exp_fpr=[(10, pi_bits)])
+
 build_cases()
 
 def build_vcases():
@@ -498,6 +571,68 @@ def build_vcases():
     for label, vb in [("pos", vb_b_pos), ("neg", vb_b_neg), ("mix", vb_b_mix)]:
         vcase(f"vupkhsb {label}", vx_form(526, VD, 0, VB), VB, vb, VD, ref_vupkhsb(vb))
         vcase(f"vupklsb {label}", vx_form(654, VD, 0, VB), VB, vb, VD, ref_vupklsb(vb))
+
+    # --- VMX per-lane byte-order discrimination cases -----------------------
+    # (ppu: vmx element wise ops read big endian lanes fix). Each pair below
+    # is chosen so the PRE-FIX (native-cast) lifter and the POST-FIX
+    # (vrh/vrw/vrf accessor) lifter compute DIFFERENT results -- i.e. these
+    # fail on a revert of just the lifter change (see the discrimination
+    # count in the PR description), unlike an equality compare or a splat,
+    # where a byte-swap is either invariant or cancels out.
+
+    # vcmpgtsw: true 256 > 2, but a native (unswapped) 32-bit read sees BE
+    # bytes 00 00 01 00 / 00 00 00 02 as 0x00010000 / 0x02000000 -- 65536 >
+    # 33554432 is false. This is the exact audit example. Lanes 1-3 are a
+    # sanity/equal-value check (not part of the discriminating lane). xo=902
+    # with Rc=0 (bit 10 of the 11-bit xo field clear) decodes as "vcmpgtsw"
+    # with no dot -- the case name below must match exactly.
+    vcase("vcmpgtsw mixed", vx_form(902, 2, 0, 1),
+          1, be_w([2, 10, 1, 7]), 2, be_w([0xFFFFFFFF, 0, 0, 0]),
+          va_reg=0, va_bytes=be_w([256, 10, 0, 7]))
+
+    # vcmpgtsh: same 256-vs-2 audit example at halfword width (native 16-bit
+    # read of BE bytes 01 00 / 00 02 sees 0x0001 / 0x0200 -- 1 > 512 is false).
+    vcase("vcmpgtsh mixed", vx_form(838, 2, 0, 1),
+          1, be_h([2, 10, 1, 7, 5, 5, 5, 5]), 2, be_h([0xFFFF, 0, 0, 0, 0, 0, 0, 0]),
+          va_reg=0, va_bytes=be_h([256, 10, 0, 7, 5, 5, 5, 5]))
+
+    # vadduwm: values straddling a byte boundary (0xFF + 0x01 = 0x100). A
+    # native (unswapped) add sees BE bytes 00 00 00 FF / 00 00 00 01 as
+    # 0xFF000000 / 0x01000000; that sum overflows 32 bits and wraps to 0,
+    # not 0x100. (0x100+0x100 alone does NOT discriminate here -- neither
+    # representation carries across a byte boundary for that pair, so it is
+    # included only as a non-discriminating sanity lane; 0xFFFFFFFF+1 is a
+    # second, stronger discriminating lane: true result 0, native-read result
+    # 0xFFFFFF00.)
+    vcase("vadduwm canary", vx_form(128, 2, 0, 1),
+          1, be_w([0x01, 0x100, 1, 0]), 2, be_w([0x100, 0x200, 0, 0]),
+          va_reg=0, va_bytes=be_w([0xFF, 0x100, 0xFFFFFFFF, 0]))
+
+    # vmaddfp: vD = vA*vC + vB with exact 2.0-family values (2.0*3.0+1.0=7.0).
+    # A native float* cast on raw-BE storage reinterprets 2.0's bytes
+    # (40 00 00 00) as a subnormal near zero, so the pre-fix product/sum is
+    # nowhere near 7.0. Raw encoding fields: RA=vA (mult. operand 1, "va"
+    # here), RB=vC (mult. operand 2 -- the mandatory vb_reg/vb_bytes below is
+    # actually the ADD operand vB; RC=vC is the optional vc_reg/vc_bytes),
+    # per ppu_lifter.py's vmaddfp comment ("operand order is vD, vA, vC, vB").
+    vcase("vmaddfp canary", va_form(46, 2, 0, 1, 3),
+          1, be_f([1.0, 1.0, 1.0, 1.0]), 2, be_f([7.0, 7.0, 7.0, 7.0]),
+          va_reg=0, va_bytes=be_f([2.0, 2.0, 2.0, 2.0]),
+          vc_reg=3, vc_bytes=be_f([3.0, 3.0, 3.0, 3.0]))
+
+    # vspltw/vsplth of a multi-byte value: included per the audit's requested
+    # coverage, but these do NOT discriminate the bug (see ppu_lifter.py's
+    # comment on vspltw) -- a splat only copies an existing lane's raw bytes
+    # to other lanes with no arithmetic in between, so reading and writing
+    # with the same (even wrong) reinterpretation cancels out and the
+    # transferred bytes are correct either way. Kept green across the
+    # revert-and-recount step as a deliberate non-discriminating control.
+    vcase("vspltw w=1 canary", vx_form(652, 2, 1, 5),
+          5, be_w([0x12345678, 0x9ABCDEF0, 0x11111111, 0x22222222]),
+          2, be_w([0x9ABCDEF0] * 4))
+    vcase("vsplth w=3 canary", vx_form(588, 2, 3, 5),
+          5, be_h([0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x1111, 0x2222, 0x3333, 0x4444]),
+          2, be_h([0xDEF0] * 8))
 
 build_vcases()
 
@@ -549,6 +684,35 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         g_fail++;
     } else g_pass++;
 }
+static void check_mem(const char* name, uint64_t addr, const uint8_t* got, const uint8_t* want, int n) {
+    for (int i = 0; i < n; i++) {
+        if (got[i] != want[i]) {
+            printf("FAIL %s: mem[0x%llX] byte %d = 0x%02X want 0x%02X\\n",
+                   name, (unsigned long long)addr, i, got[i], want[i]);
+            g_fail++;
+            return;
+        }
+    }
+    g_pass++;
+}
+static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
+    if (got != want) {
+        printf("FAIL %s: f%d raw bits = 0x%016llX want 0x%016llX\\n",
+               name, reg, (unsigned long long)got, (unsigned long long)want);
+        g_fail++;
+    } else g_pass++;
+}
+/* vm stub over a 64 KB scratch page for the FP update-form load/store cases
+ * (RA writeback needs a real access to write RA back after); EAs are masked
+ * into it. Widths beyond what these cases need aren't provided -- add as
+ * later memory-op tranches need them. */
+#include <stdlib.h>   /* MSVC _byteswap_* */
+static uint8_t g_vm_stub[65536];
+#define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
+extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return _byteswap_ulong(v); }
+extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
+extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return _byteswap_uint64(v); }
+extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); memcpy(g_vm_stub + VMOFF(a), &v, 8); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
@@ -570,14 +734,29 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         nm = c["name"].replace('"', "'")
         out.append(f'    {{ /* case {i}: {nm} | {insn.mnemonic} {insn.operands} */')
         out.append("      memset(ctx, 0, sizeof(*ctx));")
+        if c["in_mem"] or c["exp_mem"]:
+            out.append("      memset(g_vm_stub, 0, sizeof(g_vm_stub));")
         for reg, val in c["in_regs"].items():
             out.append(f"      ctx->gpr[{reg}] = 0x{val:016X}ULL;")
         if c["in_ca"]:
             out.append("      ctx->xer |= (1u << 29);")
+        for addr, blob in c["in_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            out.append(f"      {{ static const uint8_t _m[{len(blob)}] = {{ {byts} }}; "
+                       f"memcpy(g_vm_stub + VMOFF(0x{addr:X}), _m, {len(blob)}); }}")
+        for reg, bits in c["in_fpr"].items():
+            out.append(f"      {{ uint64_t _b = 0x{bits:016X}ULL; memcpy(&ctx->fpr[{reg}], &_b, 8); }}")
         body = [f"        {code}"]
         for reg, val, mask in c["expects"]:
             body.append(f'        check_reg("{nm}", {reg}, ctx->gpr[{reg}], '
                         f"0x{val:016X}ULL, 0x{mask:016X}ULL);")
+        for addr, blob in c["exp_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            body.append(f'        {{ static const uint8_t _want[{len(blob)}] = {{ {byts} }}; '
+                        f'check_mem("{nm}", 0x{addr:X}ULL, g_vm_stub + VMOFF(0x{addr:X}), _want, {len(blob)}); }}')
+        for reg, bits in c["exp_fpr"]:
+            body.append(f'        {{ uint64_t _got; memcpy(&_got, &ctx->fpr[{reg}], 8); '
+                        f'check_fpr("{nm}", {reg}, _got, 0x{bits:016X}ULL); }}')
         if c["exp_ca"] is not None:
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
         if c["exp_cr"] is not None:
@@ -615,6 +794,14 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         out.append("      memset(ctx, 0, sizeof(*ctx));")
         out.append(f"      {{ uint8_t _vb[16] = {{ {vb_hex} }}; "
                     f"memcpy(&ctx->vr[{c['vb_reg']}], _vb, 16); }}")
+        if c.get("va_reg") is not None:
+            va_hex = ", ".join(f"0x{b:02X}" for b in c["va_bytes"])
+            out.append(f"      {{ uint8_t _va[16] = {{ {va_hex} }}; "
+                        f"memcpy(&ctx->vr[{c['va_reg']}], _va, 16); }}")
+        if c.get("vc_reg") is not None:
+            vc_hex = ", ".join(f"0x{b:02X}" for b in c["vc_bytes"])
+            out.append(f"      {{ uint8_t _vc[16] = {{ {vc_hex} }}; "
+                        f"memcpy(&ctx->vr[{c['vc_reg']}], _vc, 16); }}")
         out.append(f"      {code}")
         out.append(f"      {{ uint8_t _want[16] = {{ {want_hex} }}; "
                     f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')

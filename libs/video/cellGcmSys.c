@@ -82,6 +82,15 @@ static u64 get_timestamp_ns(void)
 static int  s_gcm_initialized = 0;
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+
+/* Guest flip-request signal for the host present thread (boot_main's ticker).
+ * s_flip_request_count counts every SetFlipCommand/SetPrepareFlip; s_flip_pending
+ * is a take-once edge so the ticker presents the completed frame exactly once per
+ * guest flip instead of on every tick (partial-frame flicker). Ported from
+ * sagemono's draw-engine present path -- deliberately independent of the FIFO
+ * control block, so it sits on top of the s_control_ea design unchanged. */
+static volatile u32 s_flip_request_count = 0;
+static volatile int s_flip_pending       = 0;
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 
 /* Display buffers */
@@ -501,6 +510,25 @@ void cellGcmTickFlip(void)
     }
 }
 
+/* Host present-thread hooks (boot_main's vblank ticker). */
+
+/* Total guest flip requests so far -- the ticker uses it to tell a fresh flip
+ * from a repeat of the one it already presented. */
+unsigned cellGcm_flip_request_count(void)
+{
+    return s_flip_request_count;
+}
+
+/* Take-once: 1 if the guest requested a flip since the last call, else 0.
+ * Clearing on read is what keeps the ticker from re-presenting a half-drawn
+ * frame every tick. */
+int cellGcm_take_flip_pending(void)
+{
+    int v = s_flip_pending;
+    s_flip_pending = 0;
+    return v;
+}
+
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
  * (boot_main vblank_ticker). Not yet active: s_control.put stays 0 because
  * cellGcmGetControlRegister returns a HOST pointer, so the title's put writes
@@ -630,6 +658,8 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
 
     s_current_display_buffer_id = bufferId;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    s_flip_pending = 1;          /* ticker: present this frame before the next drain */
+    s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
     /* Use the captured {code,toc} (the live OPD's code word is clobbered). */
@@ -666,6 +696,8 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     s_current_display_buffer_id = bufferId;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    s_flip_pending = 1;
+    s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
     /* Use the captured {code,toc} (the live OPD's code word is clobbered to the
