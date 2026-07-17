@@ -236,11 +236,22 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
                 snprintf(line,sizeof line,"    { float4 _v = (float4)(%s);%s\n",
                          rhs, saturate ? " _v = saturate(_v);" : "");
                 emit(&b, line);
-                if (vec_result && dst_out != 0x1F)
+                /* The output register o[dst_out] receives the VEC result when
+                 * vec_result selects the VEC unit OR when the SCA unit is idle
+                 * (no SCA op) so nothing else can claim the output. The old code
+                 * wrote o[] only on vec_result==1, so a VEC op targeting an
+                 * output with vec_result==0 and no paired SCA -- exactly how
+                 * vkcube's VP writes HPOS (o[0]) and the colours -- was dropped
+                 * as "CC-only", leaving o[0]=(0,0,0,1) so every vertex collapsed
+                 * to the origin (black cube). cellmark's VP either sets
+                 * vec_result or pairs a SCA op, so it is unaffected. */
+                int _sca_active = (smx|smy|smz|smw) && sca_op != 0x00;
+                int _wrote_o = (dst_out != 0x1F) && (vec_result || !_sca_active);
+                if (_wrote_o)
                     emit_store(&b, "o[%u]", dst_out & 15, m);
                 if (dst_tmp != 0x3F)
                     emit_store(&b, "r[%u]", dst_tmp & 31, m);
-                if (!vec_result && dst_tmp == 0x3F)
+                if (!_wrote_o && dst_tmp == 0x3F)
                     emit(&b, "        /* TODO: CC-only write not modeled */\n");
                 emit(&b, "    }\n");
             }

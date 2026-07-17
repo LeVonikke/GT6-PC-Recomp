@@ -257,6 +257,11 @@ class SPULifter:
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
         self.unsupported: dict[str, int] = {}
+        # brsl/brasl whose target could not be resolved and lifted as a no-op
+        # (a MISCOMPILE: the call is silently dropped). Warned loudly in the
+        # summary -- a lifted SPURS job binary shipped with every one of its
+        # calls dropped this way and the only symptom was "0 call target(s)".
+        self.unresolved_calls: list[int] = []
         self.trace = trace
         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
         # Lets multiple lifted SPU images link into one binary without collisions
@@ -334,8 +339,15 @@ class SPULifter:
         mn = insn.mnemonic
         ops = _ops(insn.operands)
         tok = None
-        if mn in ("br", "brsl", "bra", "brasl") and ops:
+        if mn in ("br", "bra") and ops:
             tok = ops[0]
+        elif mn in ("brsl", "brasl") and ops:
+            # The disasm fix that added the link register to brsl/brasl
+            # operand text ("brsl $r0, 0x5488") moved the target to the LAST
+            # operand. ops[0] was correct only for the pre-fix format ("brsl
+            # 0x5488") and silently returned None afterwards, lifting EVERY
+            # brsl call as a no-op. ops[-1] handles both formats.
+            tok = ops[-1]
         elif mn in _COND_BR and ops:
             tok = ops[-1]
         if tok and tok.startswith("0x"):
@@ -597,6 +609,7 @@ class SPULifter:
             if tgt is not None:
                 self.call_targets.add(tgt)
                 return f"{link} {self.prefix}spu_func_{tgt:08X}(ctx);"
+            self.unresolved_calls.append(addr)
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -626,14 +639,20 @@ class SPULifter:
             return ("ctx->pc = ctx->srr0; "
                     "spu_indirect_branch(ctx); return;")
         if mn in ("bisl",):
-            link_rt = insn.raw & 0x7F            # link reg dropped from operands
-            tgt_reg = _reg(ops[0])
+            link_rt = insn.raw & 0x7F
+            # Same interface break as brsl: the disasm fix added the link
+            # register to bisl operand text ("bisl $r0, $r11"), so the TARGET
+            # register is now the LAST operand. ops[0] grabbed the LINK
+            # register, so the emitted indirect call dispatched to link
+            # (= addr+4) and the callee was silently skipped. ops[-1]
+            # handles both operand formats.
+            tgt_reg = _reg(ops[-1])
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx);")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F
-            tgt_reg = _reg(ops[0])
+            tgt_reg = _reg(ops[-1])   # last operand = target (see bisl above)
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; "
@@ -853,6 +872,11 @@ def main() -> None:
     print(f"Wrote {sp}")
     print(f"  {len(lifter.functions)} function(s) lifted")
     print(f"  {len(lifter.call_targets)} call target(s)")
+    if lifter.unresolved_calls:
+        print(f"  WARNING: {len(lifter.unresolved_calls)} brsl/brasl call(s) with "
+              f"UNRESOLVED targets lifted as NO-OPS (dropped calls = miscompile!): "
+              + ", ".join(f"0x{a:X}" for a in lifter.unresolved_calls[:12])
+              + (" ..." if len(lifter.unresolved_calls) > 12 else ""))
     if lifter.unsupported:
         total = sum(lifter.unsupported.values())
         print(f"  {total} unsupported instruction(s) across "

@@ -156,6 +156,13 @@ static u32 s_next_heap_id = 1;
 void sys_process_exit(s32 exitcode)
 {
     printf("[sysPrxForUser] sys_process_exit(code=%d)\n", exitcode);
+#ifdef _WIN32
+    /* The RSX present thread runs at ~60Hz; a title that finishes in a few ms
+     * would tear down before the first frame is ever presented. Hold
+     * indefinitely with CELLMARK_HOLD so the last rendered frame is
+     * visible / capturable. */
+    if (getenv("CELLMARK_HOLD")) { for (;;) Sleep(1000); }
+#endif
     /* YDKJ_NOEXIT (diagnostic): the title self-exits after ~2 frames on a
      * teardown assert triggered by incomplete SPU/SPURS state (a timing race).
      * Ignoring the exit on the calling thread lets the render loop keep running
@@ -695,22 +702,42 @@ s32 sys_heap_destroy_heap(sys_heap_t heap)
     return CELL_ESRCH;
 }
 
+/* Guest-address bump allocator for the _sys_heap_* API. These return a GUEST
+ * effective address (the caller writes to it through the VM), so a host malloc
+ * pointer is wrong -- the guest would treat it as a 32-bit EA and fault. Hand
+ * out addresses from a dedicated guest window above the sys_memory window. */
+#define YZ_HEAP_BASE 0x50000000u
+#define YZ_HEAP_END  0x58000000u
+static u32 s_heap_bump = 0;
+
+static u32 yz_heap_alloc(u32 size, u32 align)
+{
+    if (s_heap_bump == 0) s_heap_bump = YZ_HEAP_BASE;
+    if (align < 16) align = 16;
+    s_heap_bump = (s_heap_bump + align - 1) & ~(align - 1);
+    u32 ea = s_heap_bump;
+    s_heap_bump += (size + 15) & ~15u;
+    if (s_heap_bump > YZ_HEAP_END) return 0;
+    return ea;   /* guest EA; flat VM commits pages on first access */
+}
+
 void* sys_heap_malloc(sys_heap_t heap, u32 size)
 {
     (void)heap;
-    return malloc(size);
+    return (void*)(uintptr_t)yz_heap_alloc(size, 16);
 }
 
 s32 sys_heap_free(sys_heap_t heap, void* ptr)
 {
-    (void)heap;
-    free(ptr);
+    (void)heap; (void)ptr;   /* bump allocator: no per-alloc free */
     return CELL_OK;
 }
 
 void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
 {
     (void)heap;
+    return (void*)(uintptr_t)yz_heap_alloc(size, align);
+#if 0
 #ifdef _WIN32
     return _aligned_malloc(size, align);
 #else
@@ -719,6 +746,17 @@ void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
         return NULL;
     return ptr;
 #endif
+#endif
+}
+
+/* _sys_heap_create_heap (libdbgfont / dinkum ABI): RETURNS a non-zero heap id
+ * in r3 (args name/type/blocksize/flags in r3..r6). Distinct from the out-param
+ * sys_heap_create_heap above; _sys_heap_malloc bump-allocs regardless of id. */
+u32 sys_heap_create_heap_ret(u32 name, u32 type, u32 blocksize, u32 flags)
+{
+    (void)name; (void)type; (void)blocksize; (void)flags;
+    static u32 s_hid = 0x100;
+    return s_hid++;
 }
 
 /* ---------------------------------------------------------------------------
@@ -734,11 +772,18 @@ s32 sys_prx_exitspawn_with_level(void)
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 {
     (void)flags;
+    /* name/id arrive as raw GUEST effective addresses (the generic HLE adapter
+     * forwards gpr3.. untranslated). Translate before touching memory -- else
+     * printf("%s", name) derefs a bare host address and AVs. This path first
+     * appears once real libsre is loaded (its name string lives in the libsre
+     * image at 0x3000xxxx). Same bug class as the _sys_memset fix above. */
+    const char* hname = (const char*)yz_g2h(name);
+    u32* hid = (u32*)yz_g2h(id);
     printf("[sysPrxForUser] sys_prx_get_module_id_by_name('%s')\n",
-           name ? name : "(null)");
+           hname ? hname : "(null)");
 
-    if (!id) return CELL_EFAULT;
-    *id = 0; /* fake module ID */
+    if (!hid) return CELL_EFAULT;
+    *hid = 0; /* fake module ID */
     return CELL_OK;
 }
 

@@ -100,10 +100,12 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
         u32 w2 = rsx_fp_read_word(ucode + off + 8);
         u32 w3 = rsx_fp_read_word(ucode + off + 12);
         off += 16;
-        /* A CONST source pulls an inline 16-byte constant slot. */
-        if (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
-            ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
-            ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) {
+        /* A CONST source pulls an inline 16-byte constant slot (branch
+         * instructions reuse the src words as jump offsets -- no constant). */
+        if (!(w2 & FP_BRANCH) &&
+            (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+             ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+             ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST)) {
             if (off + 16 <= max_bytes) off += 16;
         }
         if (w0 & FP_END) return off;
@@ -172,6 +174,13 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
 {
     char base[96];
     if (s->type == FP_REG_TYPE_TEMP) {
+        /* h and r are modelled as SEPARATE register files. On hardware the
+         * h pairs overlay r bit-wise (h0 = r0.xy bits, h1 = r0.zw bits), so
+         * cgc code like dbgfont's [r0.w = coverage; h0 = colour; r0.w *=
+         * h0.w] works because the h0 write leaves r0.w's bits intact --
+         * a lane-wise alias (h[N] = r[N>>1]) clobbers it (cellmark text
+         * flooded white). Value-level cross-view reads are rare; keep the
+         * files separate and select the export bank via SET_SHADER_CONTROL. */
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
         snprintf(base, sizeof(base), "%s", input_expr(input_src));
@@ -205,7 +214,8 @@ static void dest_mask(u32 op0, char* m)
     m[n] = '\0';
 }
 
-int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
+int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+                     int exports32)
 {
     if (!ucode || !out || out_size == 0) return -1;
 
@@ -220,24 +230,56 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
         "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
         "};\n"
-        "Texture2D    rsx_tex[16] : register(t0);\n"
-        "SamplerState rsx_samp[16] : register(s0);\n"
-        "float4 main(PSInput input) : SV_TARGET {\n"
+        /* 4 discrete texture/sampler registers (t0-t3/s0-s3) rather than a [16]
+         * array: the backend's root signature binds a 4-descriptor SRV table +
+         * 4 static samplers, and an array declaration would require all 16
+         * registers valid on tier-1 hardware. RSX FPs in practice use units
+         * 0-3; higher units clamp to 3 in the TEX emission below. */
+        "Texture2D    rsx_tex0 : register(t0); Texture2D rsx_tex1 : register(t1);\n"
+        "Texture2D    rsx_tex2 : register(t2); Texture2D rsx_tex3 : register(t3);\n"
+        /* Per-draw texcoord scale (b1): RSX textures with the UNnormalized
+         * flag are sampled in texel space; the backend supplies 1/size for
+         * those units and 1.0 for normalized ones. */
+        "cbuffer FPTex : register(b1) { float4 rsx_texscale[4]; float4 rsx_alphatest; };\n"
+        "SamplerState rsx_samp0 : register(s0); SamplerState rsx_samp1 : register(s1);\n"
+        "SamplerState rsx_samp2 : register(s2); SamplerState rsx_samp3 : register(s3);\n"
+        "struct PSOut { float4 c0:SV_Target0; float4 c1:SV_Target1;\n"
+        "               float4 c2:SV_Target2; float4 c3:SV_Target3; };\n"
+        "PSOut main(PSInput input) {\n"
         "    float4 r[48]; float4 h[48];\n"
         /* Fully initialise both register files: RSX programs routinely read a
          * register lane before writing it (the hardware reads undefined), but
          * HLSL rejects use-before-init (error X4000). Zero everything. */
-        "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n");
+        "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
+        /* NV40 FP condition registers: set_cond instructions latch their
+         * result; later instructions execute per-lane where the (swizzled)
+         * cc value passes the exec_if_lt/eq/gr test. */
+        "    float4 cc0 = (float4)0, cc1 = (float4)0;\n");
 
     int wrote_r0 = 0, wrote_h0 = 0;
     int count = 0;
     u32 off = 0;
+    /* Structured-branch bookkeeping (IFE): close/else points by ucode byte
+     * offset. Stacks are small -- RSX FPs nest shallowly. */
+    u32 else_offs[16]; int n_else = 0;
+    u32 end_offs[16];  int n_end = 0;
 
     while (off + 16 <= max_bytes) {
         u32 w0 = rsx_fp_read_word(ucode + off + 0);
         u32 w1 = rsx_fp_read_word(ucode + off + 4);
         u32 w2 = rsx_fp_read_word(ucode + off + 8);
         u32 w3 = rsx_fp_read_word(ucode + off + 12);
+
+        /* Close pending else/endif blocks that land at this offset. */
+        if (n_else > 0 && else_offs[n_else-1] == off) {
+            out_puts(&o, "    } else {\n");
+            n_else--;
+        }
+        while (n_end > 0 && end_offs[n_end-1] == off) {
+            out_puts(&o, "    } }\n");
+            n_end--;
+        }
+
         off += 16;
         count++;
 
@@ -251,12 +293,52 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         decode_src(w2, w2 & FP_SRC1_ABS, &s1);
         decode_src(w3, 0,                &s2);
 
+        /* Per-instruction predication (SRC0 word): exec_if_lt/eq/gr @18-20,
+         * cond swizzle @21-28, cond_mod reg @30 (set_cond target), cond reg
+         * @31 (gate source). exec=7 -> unconditional; exec=0 -> never runs. */
+        u32 exec_cond = (w1 >> 18) & 7u;
+        int cond_reg  = (int)((w1 >> 31) & 1u);
+        int cond_mod  = (int)((w1 >> 30) & 1u);
+        int set_cond  = (w0 & FP_COND_WRITE) ? 1 : 0;
+        char cswz[5];
+        {
+            static const char comp2[4] = {'x','y','z','w'};
+            for (int i = 0; i < 4; i++) cswz[i] = comp2[(w1 >> (21 + 2*i)) & 3];
+            cswz[4] = 0;
+        }
+        /* Result scale modifier (SRC1 word bits 28-30): the value is scaled
+         * before saturation/write. demosaic's parity math is floor(coord)/2
+         * then frac() -- without the /2 the parity network is constant 0. */
+        u32 scale_bits = (w2 >> 28) & 7u;
+        const char* scale = NULL;
+        switch (scale_bits) {
+        case 1: scale = " _v = _v * 2.0;";   break;
+        case 2: scale = " _v = _v * 4.0;";   break;
+        case 3: scale = " _v = _v * 8.0;";   break;
+        case 5: scale = " _v = _v * 0.5;";   break;
+        case 6: scale = " _v = _v * 0.25;";  break;
+        case 7: scale = " _v = _v * 0.125;"; break;
+        default: break;
+        }
+
+        const char* cmp = NULL;   /* NULL = unconditional */
+        switch (exec_cond) {
+        case 1: cmp = "< 0";  break;
+        case 2: cmp = "== 0"; break;
+        case 3: cmp = "<= 0"; break;
+        case 4: cmp = "> 0";  break;
+        case 5: cmp = "!= 0"; break;
+        case 6: cmp = ">= 0"; break;
+        default: break;       /* 7 unconditional, 0 never */
+        }
+
         /* Inline constant: any CONST source pulls the next 16 bytes as a
          * float4 literal and advances past it. */
         float k[4] = {0,0,0,0};
         int has_k = 0;
-        if (s0.type == FP_REG_TYPE_CONST || s1.type == FP_REG_TYPE_CONST ||
-            s2.type == FP_REG_TYPE_CONST) {
+        if (!is_branch &&
+            (s0.type == FP_REG_TYPE_CONST || s1.type == FP_REG_TYPE_CONST ||
+             s2.type == FP_REG_TYPE_CONST)) {
             if (off + 16 <= max_bytes) {
                 for (int i = 0; i < 4; i++) {
                     u32 cw = rsx_fp_read_word(ucode + off + i * 4);
@@ -273,7 +355,28 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         emit_src(&s2, input_src, k, has_k, c, sizeof(c));
 
         if (is_branch) {
-            out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
+            /* Branch opcodes live in a second table (base | 0x40): 0x42 = IFE
+             * (if/else/endif); SRC1/SRC2 carry the else and endif ucode byte
+             * offsets. Others (LOOP/REP/CAL) still unhandled. */
+            if (opcode == 0x02 /* IFE = 0x42 & 0x3F */) {
+                /* SRC1/SRC2 store the else/endif targets in words (<< 2 for
+                 * ucode byte offsets); bit 31 of SRC1 is the branch flag. */
+                u32 else_b = (w2 & 0x7FFFFFFFu) << 2;
+                u32 end_b  = (w3 & 0x7FFFFFFFu) << 2;
+                char bl[220];
+                if (cmp)
+                    snprintf(bl, sizeof(bl),
+                             "    { float4 _cs = cc%d.%s; if (any(_cs %s)) {\n",
+                             cond_reg, cswz, cmp);
+                else
+                    snprintf(bl, sizeof(bl), "    { if (true) {\n");
+                out_puts(&o, bl);
+                if (n_end < 16) end_offs[n_end++] = end_b;
+                if (else_b != end_b && else_b > off && n_else < 16)
+                    else_offs[n_else++] = else_b;
+            } else {
+                out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
+            }
             if (w0 & FP_END) break;
             continue;
         }
@@ -315,17 +418,27 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
             snprintf(rhs, sizeof(rhs),
-                     "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy * rsx_texscale[%u].xy)",
+                     tex_unit & 3u, tex_unit & 3u, a, tex_unit & 3u);
             break;
         case OP_TXP:
             snprintf(rhs, sizeof(rhs),
-                     "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
-                     tex_unit, tex_unit, a, a);
+                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy / (%s).w * rsx_texscale[%u].xy)",
+                     tex_unit & 3u, tex_unit & 3u, a, a, tex_unit & 3u);
             break;
-        case OP_KIL:
-            out_puts(&o, "    /* TODO: KIL (condition not modeled) */\n");
+        case OP_KIL: {
+            if (exec_cond != 0) {
+                char kl[220];
+                if (cmp)
+                    snprintf(kl, sizeof(kl),
+                             "    { float4 _cs = cc%d.%s; if (any(_cs %s)) discard; }\n",
+                             cond_reg, cswz, cmp);
+                else
+                    snprintf(kl, sizeof(kl), "    discard;\n");
+                out_puts(&o, kl);
+            }
             handled = 0;
-            break;
+            break; }
         default:
             out_puts(&o, "    /* TODO: unhandled FP opcode ");
             out_puts(&o, rsx_fp_opcode_name(opcode));
@@ -334,9 +447,10 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
             break;
         }
 
-        if (handled && !(w0 & FP_OUT_NONE)) {
+        if (handled && exec_cond != 0 && (!(w0 & FP_OUT_NONE) || set_cond)) {
             u32 dst_idx = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
             int dst_half = (w0 & FP_OUT_HALF) ? 1 : 0;
+            const char* rf = dst_half ? "h" : "r";
             char m[5];
             dest_mask(w0, m);
 
@@ -345,25 +459,82 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
              * a vector rhs to its .x, but NV40 writes rhs.w to dst.w. Scalar
              * results (DPx/RCP/...) replicate, which is also the hardware
              * behavior. */
-            char line[800];
+            char line[2048];
+            int pos = 0;
             const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
-            snprintf(line, sizeof(line),
-                     "    { float4 _v = (float4)(%s);%s %s[%u].%s = _v.%s; }\n",
-                     rhs, sat, dst_half ? "h" : "r", dst_idx, m, m);
+            pos += snprintf(line + pos, sizeof(line) - pos,
+                            "    { float4 _v = (float4)(%s);%s%s",
+                            rhs, scale ? scale : "", sat);
+            if (cmp)
+                pos += snprintf(line + pos, sizeof(line) - pos,
+                                " float4 _cs = cc%d.%s;", cond_reg, cswz);
+            if (!(w0 & FP_OUT_NONE)) {
+                if (cmp) {
+                    /* Per-lane predicated write: lane L updates only where
+                     * the swizzled cc lane passes the test. */
+                    for (const char* L = m; *L; L++)
+                        pos += snprintf(line + pos, sizeof(line) - pos,
+                                        " %s[%u].%c = (_cs.%c %s) ? _v.%c : %s[%u].%c;",
+                                        rf, dst_idx, *L, *L, cmp, *L, rf, dst_idx, *L);
+                } else {
+                    pos += snprintf(line + pos, sizeof(line) - pos,
+                                    " %s[%u].%s = _v.%s;", rf, dst_idx, m, m);
+                }
+            }
+            if (set_cond) {
+                if (cmp) {
+                    for (const char* L = m; *L; L++)
+                        pos += snprintf(line + pos, sizeof(line) - pos,
+                                        " cc%d.%c = (_cs.%c %s) ? _v.%c : cc%d.%c;",
+                                        cond_mod, *L, *L, cmp, *L, cond_mod, *L);
+                } else {
+                    pos += snprintf(line + pos, sizeof(line) - pos,
+                                    " cc%d.%s = _v.%s;", cond_mod, m, m);
+                }
+            }
+            snprintf(line + pos, sizeof(line) - pos, " }\n");
             out_puts(&o, line);
 
-            if (!dst_half && dst_idx == 0) wrote_r0 = 1;
-            if (dst_half  && dst_idx == 0) wrote_h0 = 1;
+            if (!(w0 & FP_OUT_NONE) && dst_idx == 0) {
+                if (dst_half) wrote_h0 = 1; else wrote_r0 = 1;
+            }
         }
 
         if (w0 & FP_END) break;
     }
 
-    /* Fragment color output: r0 (full precision) preferred, else h0. */
-    if (wrote_r0 || !wrote_h0)
-        out_puts(&o, "    return r[0];\n}\n");
+    /* Close any blocks whose end offset was never reached (defensive: a
+     * mis-decoded target must not leave the HLSL unbalanced). */
+    while (n_else-- > 0) out_puts(&o, "    } else {\n");
+    while (n_end--  > 0) out_puts(&o, "    } }\n");
+
+    /* Fragment colour outputs, selected by SET_SHADER_CONTROL: 32-bit
+     * programs export r0/r2/r3/r4, half programs h0/h4/h6/h8 (wave's water
+     * height FP writes its result to h0 and uses r0 lanes as scratch --
+     * heuristics picked r0 and the pond stayed flat forever). Unbound MRT
+     * writes are discarded. */
+    /* Colour exports: SET_SHADER_CONTROL bit 0x40 selects the 32-bit bank
+     * (r0/r2/r3/r4) vs half (h0/h4/h6/h8); fall back to whichever file the
+     * program actually wrote for c0 (PSL1GHT runs half-export control over
+     * r0-writing programs). Secondaries use the zero-init sum trick. */
+    if (exports32 ? wrote_r0 : !wrote_h0)
+        out_puts(&o, "    PSOut _po; _po.c0 = r[0];\n");
     else
-        out_puts(&o, "    return h[0];\n}\n");
+        out_puts(&o, "    PSOut _po; _po.c0 = h[0];\n");
+    out_puts(&o, "    _po.c1 = r[2] + h[4]; _po.c2 = r[3] + h[6];\n"
+                 "    _po.c3 = r[4] + h[8];\n"
+        /* Guest alpha test (D3D12 has none fixed-function): func codes are
+         * RSX 0x200+f with f: 0=NEVER 1=LESS 2=EQUAL 3=LEQUAL 4=GREATER
+         * 5=NOTEQUAL 6=GEQUAL 7=ALWAYS. */
+        "    if (rsx_alphatest.x != 0.0) {\n"
+        "        float _a = _po.c0.a, _r = rsx_alphatest.y;\n"
+        "        int _f = (int)rsx_alphatest.z;\n"
+        "        bool _p = (_f == 7) || (_f == 1 && _a < _r) || (_f == 2 && _a == _r) ||\n"
+        "                  (_f == 3 && _a <= _r) || (_f == 4 && _a > _r) ||\n"
+        "                  (_f == 5 && _a != _r) || (_f == 6 && _a >= _r);\n"
+        "        if (!_p) discard;\n"
+        "    }\n"
+        "    return _po;\n}\n");
 
     if (!o.ok) return -1;
     return count;

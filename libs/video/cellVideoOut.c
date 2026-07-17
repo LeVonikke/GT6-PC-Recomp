@@ -89,27 +89,17 @@ s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state
     memset(state, 0, sizeof(CellVideoOutState));
 
     if (videoOut == CELL_VIDEO_OUT_PRIMARY) {
-        u32 mode;
-        state->state      = 2; /* enabled */
+        state->state      = 0; /* CELL_VIDEO_OUT_OUTPUT_STATE_ENABLED (was 2=PREPARING; PhyreEngine gates render-target config on ENABLED) */
         state->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
 
-        /* Set display mode based on current resolution */
-        switch (s_resolution_id) {
-        case CELL_VIDEO_OUT_RESOLUTION_1080:
-            mode = CELL_VIDEO_OUT_DISPLAY_MODE_1920_1080_59_94HZ;
-            break;
-        case CELL_VIDEO_OUT_RESOLUTION_480:
-            mode = CELL_VIDEO_OUT_DISPLAY_MODE_720_480_59_94HZ;
-            break;
-        case CELL_VIDEO_OUT_RESOLUTION_576:
-            mode = CELL_VIDEO_OUT_DISPLAY_MODE_720_576_50HZ;
-            break;
-        case CELL_VIDEO_OUT_RESOLUTION_720:
-        default:
-            mode = CELL_VIDEO_OUT_DISPLAY_MODE_1280_720_59_94HZ;
-            break;
-        }
-        state->displayMode = ps3_bswap32(mode);  /* guest BE struct */
+        /* Fill the 8-byte displayMode struct byte-wise (endian-safe): the
+         * guest reads resolutionId/scanMode/aspect as individual bytes. */
+        (void)0;
+        state->displayMode.resolutionId = (u8)s_resolution_id;
+        state->displayMode.scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+        state->displayMode.conversion   = 0;
+        state->displayMode.aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+        state->displayMode.refreshRates = ps3_bswap16(0x0001); /* 59.94Hz flag */
     } else {
         state->state = 0; /* disabled */
     }
