@@ -21,6 +21,7 @@
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>       /* getenv, atoi (boot trace) */
 
 /* Single flat NID -> handler table (all modules share it; resolution is by
  * NID which is globally unique). Sized for the firmware import surface. */
@@ -71,12 +72,45 @@ extern "C" const char* g_last_hle_name = "";
 extern "C" uint32_t prx_resolve_export(uint32_t nid);
 extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
+extern "C" void     vm_write32(uint64_t a, uint32_t v);
+extern "C" uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
 extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
 static inline void* ps3_GetModuleHandleA(const char* m){ return GetModuleHandleA(m); }
 
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved
+     * across a cross-module call: the glink stub does `std r2,40(r1)` before jumping and
+     * the caller does `ld r2,40(r1)` after. Our HLE import stubs (`ps3_hle_call(nid);
+     * return;`) skip that, AND some handlers (cellSpurs* -> 0xAA6269A8 etc.) dispatch
+     * into lifted libsre_ns code that returns with r2 = libsre's TOC (0x30039AB0) AND
+     * clobbers the caller's reserved TOC slot at 0x28(r1) to 0. The caller's post-call
+     * `ld r2,0x28(r1)` then loads 0 -> r2=0 -> every later TOC-relative load reads a null
+     * base (e.g. func_002B03AC's `*(r2-0x4B34)` FMOD list head -> null -> infinite walk
+     * -> no draws). Snapshot the caller r2+sp now and restore BOTH the live r2 and the
+     * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
+    struct _TocGuard { ppu_context* c; uint64_t toc, sp;
+        ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc); } } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
     g_last_hle_nid = nid;
+    /* GFX-SCAN: is the menu .gfx ever inflated into guest RAM? (magic 'GFX'=47 46 58) */
+    { static long _c=0; if(getenv("YDKJ_GFXSCAN") && (++_c % 200000)==0){ extern uint8_t* vm_base;
+        int gfx=0,dds=0,png=0; for(uint32_t a=0x10000; a<0x0FF00000u; a++){
+          uint8_t m0=vm_base[a],m1=vm_base[a+1],m2=vm_base[a+2],vv=vm_base[a+3];
+          if(m0==0x47&&m1==0x46&&(m2==0x58||m2==0x43)&&(vv>=8&&vv<=12)){ if(gfx<3)fprintf(stderr,"[GFX-SCAN] GFX movie @0x%08X %c%c%c ver=%d\n",a,m0,m1,m2,vv); gfx++; }
+          else if(m0==0x44&&m1==0x44&&m2==0x53&&vv==0x20){ dds++; }
+          else if(m0==0x89&&m1==0x50&&m2==0x4E&&vv==0x47){ png++; } }
+        fprintf(stderr,"[GFX-SCAN #%ld] GFX-movies=%d DDS=%d PNG=%d\n",_c/200000,gfx,dds,png); fflush(stderr); } }
+
+    /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
+     * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
+    static int s_trace = -2;
+    if (s_trace == -2) { const char* e = getenv("PS3_HLE_TRACE"); s_trace = e ? atoi(e) : 0; }
+    if (s_trace > 0) {
+        s_trace--;
+        fprintf(stderr, "[HLETRACE] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X lr=0x%08X\n",
+                nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                (uint32_t)ctx->gpr[5], (uint32_t)ctx->lr);
+    }
     /* Bad-lock locator (FLOW_BADLOCK): sys_lwmutex_lock (0x1573DC3F) on a garbage/null
      * object (r3 < 0x10000 or high-bit set) in m_InitEntityHierarchy — host backtrace
      * to find the null global it dereferences. Map RVAs via flow.map. */
@@ -187,7 +221,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * deserializer this-ptr corruption). Drop r1 to a fresh guard slice so the
              * re-entered frame can never overlap the caller. Args are in regs (ABI);
              * results go via r3 / guest pointers, so isolating the frame is safe. */
-            { static int _ri=-1; if(_ri<0)_ri=getenv("FLOW_REENTRY_ISO")?1:0;
+            /* Default ON: without isolation the libsre fn runs at the caller's r1 and
+             * its prologue `std r2,40(r1)` clobbers the caller's reserved TOC slot at
+             * 0x28(r1) -> caller reloads r2=0 -> null TOC -> func_002B03AC spin -> no
+             * draws. Isolating r1 to a fresh slice keeps the caller frame intact.
+             * Opt out with YDKJ_NO_REENTRY_ISO=1. */
+            { static int _ri=-1; if(_ri<0){ const char* e=getenv("YDKJ_NO_REENTRY_ISO"); _ri = (e && e[0]=='1') ? 0 : 1; }
               if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull;
                 ps3_indirect_call(ctx); ctx->gpr[1]=_sr1; }
               else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
@@ -215,6 +254,52 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     if (!e || !e->handler) {
         static int logged = 0;
         if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
+        /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
+         * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
+         * protocol so it can be implemented. */
+        /* YDKJ_SAVEDATA: minimal cellSaveDataAutoLoad2 (NID 0xCDC6AEFD). The game
+         * auto-loads its "BLUS30569-AUTO-" save; unimplemented = null completion =
+         * state never transitions. Implement the no-save/new-user path: invoke the
+         * game's statCallback (r8 OPD) with a CellSaveDataStatGet{isNewData=1}, honor
+         * its result, return CELL_SAVEDATA_RET_OK(0). Legit HLE (real first-run behavior). */
+        if (nid==0xCDC6AEFDu) { static int _sdi=-1; if(_sdi<0)_sdi=getenv("YDKJ_SAVEDATA")?1:0;
+          if(_sdi){ static int _once=0; if(_once++<2){
+            uint32_t statCb=(uint32_t)ctx->gpr[8];               /* statCallback OPD */
+            uint32_t SC=0x02000000u, SG=0x02000100u, SS=0x02000900u; /* scratch structs */
+            for(uint32_t a=0x02000000u;a<0x02001000u;a+=4) vm_write32(a,0);
+            /* CellSaveDataStatGet: hddFreeSizeKB@0, isNewData@4, dir@8(dirStat), getParam@0x40 */
+            vm_write32(SG+0x00, 0x100000);   /* hddFreeSizeKB */
+            vm_write32(SG+0x04, 1);          /* isNewData = 1 (no existing save) */
+            /* copy dirName ("BLUS30569-AUTO-") into dir.dirName @ 0x08+0x18=0x20 */
+            { uint32_t src=(uint32_t)ctx->gpr[5]; for(int i=0;i<31;i++){ uint32_t w=vm_read32((src+i)&~3u); uint8_t b=(w>>((3-((src+i)&3))*8))&0xFF; vm_write32((SG+0x20+i)&~3u, (vm_read32((SG+0x20+i)&~3u) & ~(0xFFu<<((3-((SG+0x20+i)&3))*8))) | ((uint32_t)b<<((3-((SG+0x20+i)&3))*8))); if(!b)break; } }
+            fprintf(stderr,"[SAVEDATA-HLE] cellSaveDataAutoLoad2: calling game statCallback OPD=0x%08X (isNewData=1)\n",statCb);
+            uint64_t r=ppu_guest_call(statCb, SC, SG, SS, 0);
+            int32_t cbres=(int32_t)vm_read32(SC+0x00);
+            fprintf(stderr,"[SAVEDATA-HLE] statCallback returned r3=0x%llX cbResult->result=%d -> returning OK\n",(unsigned long long)r,cbres);
+            ctx->gpr[3]=0; /* CELL_SAVEDATA_RET_OK */
+            return;
+          } } }
+        if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if(_sd++<3){
+            extern uint32_t vm_read32(uint64_t);
+            uint32_t r7=(uint32_t)ctx->gpr[7], r8=(uint32_t)ctx->gpr[8];
+            uint32_t r7c=r7?vm_read32(r7):0, r8c=r8?vm_read32(r8):0;
+            fprintf(stderr,"[SAVEDATA] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X r7(statCb OPD)=0x%08X->code=func_%08X r8(fileCb OPD)=0x%08X->code=func_%08X r9=0x%08X r10=0x%08X\n",
+                nid,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6],r7,r7c,r8,r8c,(uint32_t)ctx->gpr[9],(uint32_t)ctx->gpr[10]);
+            /* if r4 is a dirName string, dump it */
+            uint32_t r4=(uint32_t)ctx->gpr[4]; if(r4>0x10000&&r4<0x10000000){ char nm[32]; for(int i=0;i<31;i++){uint32_t b=vm_read32((r4+i)&~3u); nm[i]=(char)((b>>((3-((r4+i)&3))*8))&0xFF); if(!nm[i])break;} nm[31]=0; fprintf(stderr,"[SAVEDATA]   r4 dirName='%s'\n",nm); } }
+        }
+        /* YDKJ_NETOFFLINE: unresolved network NIDs (sys_net/cellHttp/cellSysutil)
+         * default r3=0 (fake success) -> the game stores a NULL handle as an object
+         * and later virtual-calls it -> the 0xC708C708 null-vtable crash. Return a
+         * negative error instead so the game's online-content check takes its
+         * graceful OFFLINE-FAILURE path and proceeds with the local Persistent.zip. */
+        { static int _no=-1; if(_no<0)_no=getenv("YDKJ_NETOFFLINE")?1:0;
+          if(_no){ switch(nid){
+            case 0x139A9E9Bu: case 0x9FB6228Eu: case 0x05893E7Cu:
+            case 0x52AAC4FAu: case 0x9638F766u: case 0x522180BCu:
+              ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
+              return;
+          } } }
         ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
         return;
     }

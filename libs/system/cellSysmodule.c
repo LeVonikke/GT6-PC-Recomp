@@ -60,6 +60,10 @@ static const char* sysmodule_id_to_name(u16 id)
  * -----------------------------------------------------------------------*/
 
 /* NID: 0x26A6E12B */
+/* NID: 0x63FF6FF9 -- library init/teardown are no-ops in HLE. */
+s32 cellSysmoduleInitialize(void) { return CELL_OK; }
+s32 cellSysmoduleFinalize(void)   { return CELL_OK; }
+
 s32 cellSysmoduleLoadModule(u16 id)
 {
     printf("[cellSysmodule] LoadModule(id=0x%04X '%s')\n",

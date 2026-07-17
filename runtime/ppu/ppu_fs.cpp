@@ -36,6 +36,8 @@ extern "C" uint32_t ppu_vm_size;
 extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
+extern "C" char __ImageBase;
+extern "C" unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long,unsigned long,void**,unsigned long*);
 
 /* Host root that the PS3 mount points map into (dir containing PS3_GAME). */
 extern "C" const char* ppu_vfs_root = ".";
@@ -163,8 +165,23 @@ static void cellFsRead(ppu_context* ctx)
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    uint64_t raw_nbytes = ctx->gpr[5];
+    long fpos_before = ftell(g_files[fd]);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    if (getenv("YDKJ_FSDBG")) { static int _fd=0; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
+#ifdef _WIN32
+    if (getenv("YDKJ_FSDBG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)&__ImageBase; fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
+#endif
+    { static uint64_t tot=0; static int _n=0; tot+=n; if(_n++<50) fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)\n",fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],(unsigned long long)tot); }
+    if (getenv("YDKJ_TOCTRACE") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
+        fprintf(stderr, "[TOC] data.toc read into buf=0x%08X n=%zu; lr=0x%08llX; guest-stack RAs:\n", buf, n, (unsigned long long)ctx->lr);
+        uint32_t sp = (uint32_t)ctx->gpr[1];
+        for (uint32_t i = 0; i < 128 && sp + i*4 + 4 <= ppu_vm_size; i++) {
+            uint32_t a = sp + i*4; uint32_t w = (vm_base[a]<<24)|(vm_base[a+1]<<16)|(vm_base[a+2]<<8)|vm_base[a+3];
+            if (w >= 0x10000u && w < 0x600000u) fprintf(stderr, "[TOC]   ra 0x%08X (@sp+0x%X)\n", w, i*4);
+        }
+    }
     if (nread_ptr) vm_write64(nread_ptr, n);
     ctx->gpr[3] = CELL_OK;
 }
@@ -177,6 +194,27 @@ static void cellFsWrite(ppu_context* ctx)
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+    /* DIAGNOSTIC (FLOW_CFGBT=1): dump the guest back-chain when the game logs the
+     * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
+    if (getenv("FLOW_CFGBT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
+        char tmp[256]; uint32_t nn = (uint32_t)(nbytes < 255 ? nbytes : 255);
+        memcpy(tmp, vm_base + buf, nn); tmp[nn] = 0;
+        if (strstr(tmp,"config") || strstr(tmp,"Config") || strstr(tmp,"Mystery") ||
+            strstr(tmp,"downsample") || strstr(tmp,"RenderTarget")) {
+            uint32_t sp = (uint32_t)ctx->gpr[1];
+            fprintf(stderr, "[cfgbt] write \"%.60s\" lr=0x%08X sp=0x%08X\n", tmp, (uint32_t)ctx->lr, sp);
+            for (int i = 0; i < 24 && sp && sp < 0x10000000u; i++) {
+                uint32_t nsp; memcpy(&nsp, vm_base + sp, 4);
+                nsp = ((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
+                if (nsp <= sp || nsp >= 0x10000000u) break;
+                uint32_t lr; memcpy(&lr, vm_base + nsp + 0x10, 4);
+                lr = ((lr>>24)&0xFF)|((lr>>8)&0xFF00)|((lr<<8)&0xFF0000)|((lr<<24)&0xFF000000);
+                fprintf(stderr, "[cfgbt]   #%d lr=0x%08X\n", i, lr);
+                sp = nsp;
+            }
+            fflush(stderr);
+        }
+    }
     if (nwr_ptr) vm_write64(nwr_ptr, n);
     ctx->gpr[3] = CELL_OK;
 }
@@ -226,6 +264,7 @@ static void cellFsStat(ppu_context* ctx)
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
     if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
+    if (getenv("YDKJ_FSDBG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -239,6 +278,7 @@ static void cellFsFstat(ppu_context* ctx)
     long sz = ftell(g_files[fd]);
     fseek(g_files[fd], cur, SEEK_SET);
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
+    if (getenv("YDKJ_FSDBG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
     ctx->gpr[3] = CELL_OK;
 }
 

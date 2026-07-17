@@ -41,7 +41,10 @@ u32 rsx_fp_read_word(const u8* p);
  * Texture sampling and full input plumbing are partial — see the doc's
  * "Integration TODO". Unhandled opcodes emit a comment and a safe default so
  * the shader still compiles. */
-int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
+/* exports32: colour outputs come from r0/r2/r3/r4 (SET_SHADER_CONTROL bit
+ * 0x40) instead of h0/h4/h6/h8 (half-precision programs). */
+int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+                     int exports32);
 
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */

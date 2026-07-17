@@ -151,6 +151,7 @@ extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSys
 extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
+extern "C" int  cellGcm_take_flip_pending(void);  /* hoisted to file scope: clang-cl rejects block-scope extern "C" */
 
 static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 { ppu_guest_call(opd, a0, a1, a2, a3); }
@@ -160,13 +161,17 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_
  * thread so the D3D12 device + window message pump live on one thread. */
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
+extern "C" int cellGcm_take_flip_pending(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
+extern "C" unsigned cellGcm_flip_request_count(void);
+extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
     int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "You Don't Know Jack (ps3recomp)") == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
+    unsigned last_flip = 0;
     /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
      * advance at ~60Hz regardless of how long present() blocks. On a hidden/occluded
      * window DXGI Present throttles hard, which previously stalled these ticks and
@@ -180,6 +185,17 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
             cellGcmTickVBlank();
             cellGcmTickFlip();
+            /* Present a pending flip BEFORE draining further: the flip fires
+             * at a get==put frame boundary (guest thread), so the batch held
+             * right now is exactly the completed frame. Presenting on a raw
+             * flip-count change after the drain raced the guest's next-frame
+             * writes and showed empty or mixed batches. */
+            {
+                if (rsx_ok && cellGcm_take_flip_pending()) {
+                    rsx_d3d12_backend_present();
+                    last_flip = cellGcm_flip_request_count();
+                }
+            }
             /* Drain the game's GCM FIFO every tick -- this writes the RSX sync-fence
              * labels (e.g. @0x03000410) that the game's per-frame logic blocks on.
              * Doing it here (not after present) keeps those fences advancing at 60Hz
@@ -189,6 +205,25 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             fired++;
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -> resync */
+        /* Drain at the outer ~4ms cadence too (not just the 16ms tick):
+         * titles fence EVERY render pass on an RSX label the drain writes;
+         * at 16ms per fence wave's six passes paced the guest to ~7 fps.
+         * The real RSX writes those fences in microseconds. */
+        if (rsx_ok) {
+            if (cellGcm_take_flip_pending()) {
+                rsx_d3d12_backend_present();
+                last_flip = cellGcm_flip_request_count();
+            }
+            cellGcm_rsx_process_fifo();
+        }
+        /* YDKJ_INJECT_Q3: the main thread polls q3 (load/state-complete) each frame but
+         * it's never posted (producer signals a condvar, never enqueues). Inject a q3
+         * event periodically to test whether delivering the completion advances the
+         * game's state machine to instantiate + display the (force-parsed) menu movie. */
+        if (getenv("YDKJ_INJECT_Q3")) {
+            static int s_q3=0; const char* qe=getenv("YDKJ_INJECT_Q3"); uint32_t qid=(uint32_t)strtoul(qe,0,0); if(qid==0||qid==1) qid=3;
+            if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
+              static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
             if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
             if (getenv("YDKJ_PACETRACE")) {
@@ -203,7 +238,17 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                     s_pf=0; s_pres=0; s_presms=0; s_win=now;
                 }
             } else {
-                rsx_d3d12_backend_present();     /* present (may block/throttle) */
+                /* Present only on a guest flip (frame boundary). A fixed-clock
+                 * present can catch the drain mid-frame -- notably while the
+                 * guest is blocked in the FIFO-wrap recycle callback -- and
+                 * flash a partial frame (clear + a few draws). Before the
+                 * first flip present freely so the window isn't stuck white
+                 * during boot. */
+                unsigned fc = cellGcm_flip_request_count();
+                if (fc != last_flip || fc == 0) {
+                    rsx_d3d12_backend_present();
+                    last_flip = fc;
+                }
             }
         }
     }
