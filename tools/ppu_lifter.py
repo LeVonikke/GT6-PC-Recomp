@@ -3290,8 +3290,20 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                         rA = a[1].split('(')[1].rstrip(')').strip()
                         return (d, rA)
             return None
-        r_val = p[0]
+        rC = p[0]
         r_base = None; table_base = None
+        disp = None; mid_disp = None
+        # `toc` may be a single value or a list of TOC candidates (multi-TOC
+        # titles). This preliminary pass confirms which register holds the table
+        # base, the TOC displacement (`disp`) to it, and -- for the two-level
+        # (global-of-global) idiom -- the intermediate displacement (`mid_disp`).
+        # (Bug: this block used the raw `toc` list in `toc + d_base`, throwing
+        # "can only concatenate list (not int) to list"; the caller caught it and
+        # SILENTLY SKIPPED all jump-table discovery -- e.g. gcm/cube's printf
+        # _Putfld switch, mis-lifted as a bare bctr that leaked the frame. And
+        # the per-candidate loop below referenced undefined `disp`/`base_is_ld`.)
+        toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
+        _tocs = [t for t in toc_candidates if t]
         for cand in (p[1], p[2]):
             ld = _lwz_of(cand)
             if ld is None:
@@ -3299,19 +3311,25 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             d_base, rA = ld
             if d_base is None:
                 continue
-            if rA == 'r2' and toc:                       # one-level: lwz base, d(r2)
-                table_base = read_u32((toc + d_base) & 0xFFFFFFFF)
-            else:                                        # two-level: base <- global <- TOC
-                mid = _lwz_of(rA)
-                if mid is not None and mid[0] is not None and mid[1] == 'r2' and toc:
-                    midval = read_u32((toc + mid[0]) & 0xFFFFFFFF)
-                    if midval is not None:
-                        table_base = read_u32((midval + d_base) & 0xFFFFFFFF)
+            for _t in _tocs:
+                if rA == 'r2':                           # one-level: lwz base, d(r2)
+                    table_base = read_u32((_t + d_base) & 0xFFFFFFFF)
+                    if table_base is not None:
+                        disp = d_base; mid_disp = None
+                else:                                    # two-level: base <- global <- TOC
+                    mid = _lwz_of(rA)
+                    if mid is not None and mid[0] is not None and mid[1] == 'r2':
+                        midval = read_u32((_t + mid[0]) & 0xFFFFFFFF)
+                        if midval is not None:
+                            table_base = read_u32((midval + d_base) & 0xFFFFFFFF)
+                            if table_base is not None:
+                                disp = d_base; mid_disp = mid[0]
+                if table_base is not None:
+                    break
             if table_base is not None:
                 r_base = cand; break
-        if table_base is None or not toc:
+        if table_base is None or disp is None or not _tocs:
             continue
-        toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
         # offset table iff an `add rC, *, r_base` combines the loaded value + base
         is_offset = any(
             w.mnemonic == 'add' and
@@ -3339,12 +3357,10 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         for cand in toc_candidates:
             if not cand:
                 continue
-            if base_is_ld:
-                hi = read_u32((cand + disp) & 0xFFFFFFFF)
-                table_base = read_u32((cand + disp + 4) & 0xFFFFFFFF)
-                if hi:              # table addresses live in the 32-bit VA space
-                    table_base = None
-            else:
+            if mid_disp is not None:    # two-level: base <- *(*(TOC+mid)+disp)
+                midval = read_u32((cand + mid_disp) & 0xFFFFFFFF)
+                table_base = read_u32((midval + disp) & 0xFFFFFFFF) if midval else None
+            else:                       # one-level: base <- *(TOC+disp)
                 table_base = read_u32((cand + disp) & 0xFFFFFFFF)
             _dbg(all_insns[i].addr, f"cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
             if table_base is None:
