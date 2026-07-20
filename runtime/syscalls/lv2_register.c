@@ -573,6 +573,11 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
     if (!ls) return -1;
     uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
+    if (getenv("RD_SPU_ARGS") && vm_base && args_ea) {
+        fprintf(stderr, "[SPU-ARGS] tid=0x%X args@0x%08X:", tid, args_ea);
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %08X", vm_read_be32(args_ea + i*4));
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr, "[SPU-INTERP] tid=0x%X entry=0x%05X img=0x%08X args=0x%08X -> interpreting\n",
             tid, entry, t->img_ea, args_ea);
     int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1);  /* pure interp: no fast-path rejoin */

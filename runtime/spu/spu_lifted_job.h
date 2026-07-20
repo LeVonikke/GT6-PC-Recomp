@@ -36,12 +36,19 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;       /* SPU stack top, 16B aligned */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);
     /* Raw-SPU-thread ABI: sys_spu_thread_argument is 4 u64s (arg1..arg4) passed
-     * in r3..r6, each in the register's preferred doubleword (bytes 0-7). */
+     * in r3..r6. Each is a 64-bit effective address the SPU treats as the pair
+     * {word0 = EA-low, word1 = EA-high}: DMA code writes MFC_EAL from word0 and
+     * asserts (dma.h) that word1 (EA-high) is 0 (main memory is 32-bit
+     * addressable). So the low 32 bits of the guest u64 go in word0, high in
+     * word1 -- NOT the plain big-endian doubleword order (which would put the EA
+     * in word1 and trip the assert on any real pointer arg). */
     if (args_ea && vm_base) {
         for (int i = 0; i < 4; i++) {
             const uint8_t* p = vm_base + args_ea + i * 8;
-            ctx.gpr[3 + i]._u32[0] = ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
-            ctx.gpr[3 + i]._u32[1] = ((uint32_t)p[4]<<24)|((uint32_t)p[5]<<16)|((uint32_t)p[6]<<8)|p[7];
+            uint32_t hi = ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+            uint32_t lo = ((uint32_t)p[4]<<24)|((uint32_t)p[5]<<16)|((uint32_t)p[6]<<8)|p[7];
+            ctx.gpr[3 + i]._u32[0] = lo;
+            ctx.gpr[3 + i]._u32[1] = hi;
         }
     } else {
         ctx.gpr[3]._u32[0] = args_ea;

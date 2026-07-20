@@ -270,7 +270,8 @@ static int spu_step(spu_context* ctx) {
     case SPU_mfspr: case SPU_fscrrd: case SPU_fscrwr: break;
     /* control flow */
     case SPU_br: case SPU_bra: next = d.tgt; break;
-    case SPU_brsl: case SPU_brasl: DST = spu_link(pc + 4); next = d.tgt; break;
+    case SPU_brsl: case SPU_brasl: DST = spu_link(pc + 4); next = d.tgt;
+        { extern void spu_trace_call(uint32_t,uint32_t); spu_trace_call(pc, d.tgt); } break;
     case SPU_brz:  if (PREF(DST) == 0) next = d.tgt; break;
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
@@ -293,7 +294,8 @@ static int spu_step(spu_context* ctx) {
         int hit = (d.op==SPU_heq||d.op==SPU_heqi)   ? (a == rhs)
                 : (d.op==SPU_hgt||d.op==SPU_hgti)   ? ((int32_t)a > (int32_t)rhs)
                 :                                     (a > rhs);      /* hlgt/hlgti */
-        if (hit) { ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; }
+        if (hit) { extern void spu_trace_dump(uint32_t); spu_trace_dump(pc);
+                   ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; }
         break; }
     default:
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
@@ -306,6 +308,25 @@ static int spu_step(spu_context* ctx) {
 
 uint32_t g_spu_interp_last_pc = 0;
 uint64_t g_spu_interp_steps   = 0;
+
+/* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
+#define SPU_TRACE_N 32
+static struct { uint32_t from, to; } s_trace[SPU_TRACE_N];
+static unsigned s_trace_i = 0;
+void spu_trace_call(uint32_t from, uint32_t to) {
+    s_trace[s_trace_i % SPU_TRACE_N].from = from;
+    s_trace[s_trace_i % SPU_TRACE_N].to   = to;
+    s_trace_i++;
+}
+void spu_trace_dump(uint32_t at) {
+    if (!getenv("SPU_CALLTRACE")) return;
+    fprintf(stderr, "[SPU-TRACE] halt at LS 0x%05X; last %d calls (from->to):\n", at, SPU_TRACE_N);
+    unsigned n = s_trace_i < SPU_TRACE_N ? s_trace_i : SPU_TRACE_N;
+    for (unsigned k = 0; k < n; k++) {
+        unsigned idx = (s_trace_i - n + k) % SPU_TRACE_N;
+        fprintf(stderr, "   0x%05X -> 0x%05X\n", s_trace[idx].from, s_trace[idx].to);
+    }
+}
 
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
