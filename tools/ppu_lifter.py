@@ -3362,7 +3362,11 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # libxml2's xmlReportError offset-table @ 0x2B8448). */
         off_regs = {rC}
         for w in win:
-            if w.mnemonic in ('extsw', 'mr', 'clrldi', 'rldicl', 'rldic', 'extsb', 'extsh'):
+            # Only follow a sign/zero EXTEND of the loaded offset (the extra step
+            # gcc inserts, `extsw r5,r12`). Do NOT chase `mr`/`clrldi`/`rldicl`:
+            # those flow other values too and broadened is_offset enough to turn a
+            # correctly-absolute table into an offset decode -> wrong case targets.
+            if w.mnemonic in ('extsw', 'extsb', 'extsh'):
                 a = [x.strip() for x in w.operands.split(',')]
                 if len(a) >= 2 and a[1] in off_regs:
                     off_regs.add(a[0])
