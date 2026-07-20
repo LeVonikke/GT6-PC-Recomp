@@ -101,13 +101,12 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
 
     snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
     fs_normalize_sep(host_path);
-    /* If the direct <root>/USRDIR path doesn't exist, fall back to the full
-     * dev_hdd0 tree (the junction) for titles laid out that way. */
-    if (usrp) { struct stat _s; if (stat(host_path, &_s) != 0) {
-        const char* r2 = (ps3_path[0]=='/') ? ps3_path+1 : ps3_path;
-        snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, r2);
-        fs_normalize_sep(host_path);
-    } }
+    /* NOTE: do NOT stat() the direct path and fall back to the dev_hdd0 junction
+     * on failure. stat() intermittently returns ENOENT for an existing file here
+     * (a Windows transient), and the junction fallback made it WORSE -- the flaky
+     * stat sent a real open to a path that doesn't exist. The direct <root>/USRDIR
+     * layout holds the assets; a genuinely-missing direct path is handled by the
+     * caller's open retry + the extracted-dump fallback below. */
 
     /* Extracted-dump fallback: our test setups often hold a title's data at
      * <root>/extracted/USRDIR/... rather than the full /dev_hdd0/game/<ID>/USRDIR
@@ -247,7 +246,9 @@ int64_t sys_fs_open(ppu_context* ctx)
     }
 
     if (!fp) {
-        fprintf(stderr, "[sys_fs] open FAILED: %s\n", host_path);
+        { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
+          fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
+                  host_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
         return (int64_t)(int32_t)CELL_ENOENT;
     }
 
