@@ -74,6 +74,8 @@ extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+/* Weak: builds that don't link cellGcmSys.c (test harnesses) get a null and skip. */
+extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
 static inline void* ps3_GetModuleHandleA(const char* m){ return GetModuleHandleA(m); }
 
@@ -91,6 +93,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
     struct _TocGuard { ppu_context* c; uint64_t toc, sp;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc); } } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+    /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
+     * guest execution -- the vblank ticker only marks ticks pending; the handlers
+     * run here so guest code never executes concurrently on the ticker thread. */
+    if (ppu_gcm_pump) ppu_gcm_pump();
     g_last_hle_nid = nid;
     /* GFX-SCAN: is the menu .gfx ever inflated into guest RAM? (magic 'GFX'=47 46 58) */
     { static long _c=0; if(getenv("YDKJ_GFXSCAN") && (++_c % 200000)==0){ extern uint8_t* vm_base;

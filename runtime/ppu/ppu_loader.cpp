@@ -278,7 +278,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; uint32_t v
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X)\n", (uint32_t)a, __builtin_bswap32(v)); n=0;
+      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v), g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0); n=0;
 #ifdef _WIN32
         { static int64_t wa=-2; if(wa==-2){const char*e=getenv("YDKJ_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
           if(wa>=0 && (uint32_t)a==(uint32_t)wa){ static int once=0; if(!once){ once=1;
@@ -1352,6 +1352,14 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* Depth of nested guest-callback execution on this thread. ppu_guest_call uses a
+ * single per-thread scratch stack (one callback at a time), so a caller that runs
+ * guest code from inside a callback (e.g. the GCM tick pump firing from an HLE
+ * call that is itself inside a callback) must NOT nest -- it would reuse the same
+ * scratch stack. ppu_in_guest_callback() lets such callers skip while nested. */
+static __declspec(thread) int g_guest_call_depth = 0;
+extern "C" int ppu_in_guest_callback(void) { return g_guest_call_depth; }
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 {
@@ -1386,8 +1394,10 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
      * current-thread ctx. Restore the caller's. */
     ppu_context* saved_active = g_active_ctx;
     g_active_ctx = &ctx;
+    g_guest_call_depth++;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    g_guest_call_depth--;
     g_active_ctx = saved_active;
     return ctx.gpr[3];
 }
@@ -1417,8 +1427,10 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
      * so a dangling g_active_ctx after return corrupts the crash handler / diagnostics. */
     ppu_context* saved_active = g_active_ctx;
     g_active_ctx = &ctx;
+    g_guest_call_depth++;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    g_guest_call_depth--;
     g_active_ctx = saved_active;
     return ctx.gpr[3];
 }
