@@ -285,6 +285,16 @@ static int spu_step(spu_context* ctx) {
     case SPU_stop: case SPU_stopd:
         ctx->pc = next; ctx->stop_code = (uint32_t)I;
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
+    /* conditional halts (assertions): stop the SPU when the condition holds,
+     * else continue. The preferred word of ra is compared. */
+    case SPU_heq: case SPU_heqi: case SPU_hgt: case SPU_hgti:
+    case SPU_hlgt: case SPU_hlgti: {
+        uint32_t a = PREF(A), rhs = (d.op==SPU_heq||d.op==SPU_hgt||d.op==SPU_hlgt) ? PREF(B) : (uint32_t)I;
+        int hit = (d.op==SPU_heq||d.op==SPU_heqi)   ? (a == rhs)
+                : (d.op==SPU_hgt||d.op==SPU_hgti)   ? ((int32_t)a > (int32_t)rhs)
+                :                                     (a > rhs);      /* hlgt/hlgti */
+        if (hit) { ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; }
+        break; }
     default:
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
                 d.op < SPU_OP_COUNT ? spu_op_name[d.op] : "?", insn, pc);

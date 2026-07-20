@@ -109,8 +109,11 @@ typedef enum {
     SPU_hbra,
     SPU_hbrr,
     SPU_heq,
+    SPU_heqi,
     SPU_hgt,
+    SPU_hgti,
     SPU_hlgt,
+    SPU_hlgti,
     SPU_il,
     SPU_ila,
     SPU_ilh,
@@ -307,8 +310,11 @@ static const char* const spu_op_name[SPU_OP_COUNT] = {
     [SPU_hbra] = "hbra",
     [SPU_hbrr] = "hbrr",
     [SPU_heq] = "heq",
+    [SPU_heqi] = "heqi",
     [SPU_hgt] = "hgt",
+    [SPU_hgti] = "hgti",
     [SPU_hlgt] = "hlgt",
+    [SPU_hlgti] = "hlgti",
     [SPU_il] = "il",
     [SPU_ila] = "ila",
     [SPU_ilh] = "ilh",
@@ -458,14 +464,17 @@ static spu_op spu_dec_ri10(uint32_t op8) {
     case 0x4C: return SPU_cgti;
     case 0x4D: return SPU_cgthi;
     case 0x4E: return SPU_cgtbi;
+    case 0x4F: return SPU_hgti;
     case 0x5C: return SPU_clgti;
     case 0x5D: return SPU_clgthi;
     case 0x5E: return SPU_clgtbi;
+    case 0x5F: return SPU_hlgti;
     case 0x74: return SPU_mpyi;
     case 0x75: return SPU_mpyui;
     case 0x7C: return SPU_ceqi;
     case 0x7D: return SPU_ceqhi;
     case 0x7E: return SPU_ceqbi;
+    case 0x7F: return SPU_heqi;
     default: return SPU_word;
     }
 }
