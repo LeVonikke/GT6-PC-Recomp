@@ -217,15 +217,13 @@ int64_t sys_fs_open(ppu_context* ctx)
      * could not be read" abort. Retry a few times with a brief backoff for a
      * read-only open of a file that exists; deterministic and cheap. */
     if (!fp && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
-        struct stat _st;
-        if (stat(host_path, &_st) == 0) {
-            for (int _r = 0; !fp && _r < 20; _r++) {
+        for (int _r = 0; !fp && _r < 200; _r++) {
 #ifdef _WIN32
-                Sleep(1);
+            Sleep(1);
 #endif
-                fp = fopen(host_path, mode);
-            }
+            fp = fopen(host_path, mode);
         }
+        if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
     }
 
     /* If CREAT flag set and file doesn't exist, try creating it */
