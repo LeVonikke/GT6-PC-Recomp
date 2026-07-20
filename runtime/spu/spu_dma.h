@@ -203,6 +203,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     if (mfc_is_get(cmd)) {
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        /* Overlay watch: a GET into the code segment (LBP-style DMA'd code)
+         * invalidates the stale lifted functions so dispatch re-interprets. */
+        if ((lsa & SPU_LS_MASK) < g_spu_code_hi)
+            spu_code_write_watch(lsa & SPU_LS_MASK, size);
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory */
         memcpy(ea_ptr, ls_ptr, size);
