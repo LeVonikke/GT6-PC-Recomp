@@ -3241,6 +3241,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         except ValueError:
             return None
     import os as _os
+    import types
     _DBG = int(_os.environ.get("JT_DEBUG", "0"), 0)
     def _dbg(addr, msg):
         if _DBG and addr == _DBG:
@@ -3264,6 +3265,26 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             continue
         # the indexed table load
         lwzx = next((w for w in reversed(win) if w.mnemonic == 'lwzx'), None)
+        # 64-bit offset-table idiom emits `sldi rIdx,idx,2; add rT,rIdx,rBase;
+        # lwz rEnt,0(rT)` instead of `lwzx rEnt,rIdx,rBase` (gcc -O2 PPC64).
+        # Synthesize the equivalent lwzx operands (rEnt,rA,rB) so the base/offset
+        # logic below applies unchanged. Without this the switch mis-lifts to a
+        # frame-leaking bctr landing on an unlifted intra-function label
+        # (e.g. JSGCM's ._jsGcmSetStencilCullHint).
+        if lwzx is None:
+            for w in reversed(win):
+                if w.mnemonic == 'lwz':
+                    a = [x.strip() for x in w.operands.split(',')]
+                    if len(a) == 2 and '(' in a[1] and mem_disp(a[1]) == 0:
+                        rT = a[1].split('(')[1].rstrip(')').strip()
+                        add = next((v for v in reversed(win) if v.mnemonic == 'add'
+                                    and [x.strip() for x in v.operands.split(',')][0] == rT), None)
+                        if add is not None:
+                            ap = [x.strip() for x in add.operands.split(',')]
+                            lwzx = types.SimpleNamespace(
+                                mnemonic='lwzx', addr=w.addr,
+                                operands=f"{a[0]}, {ap[1]}, {ap[2]}")
+                            break
         _dbg(all_insns[i].addr, f"lwzx={'None' if lwzx is None else lwzx.operands}")
         if lwzx is None:
             continue
