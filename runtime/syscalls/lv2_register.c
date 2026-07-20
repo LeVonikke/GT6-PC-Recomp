@@ -508,6 +508,17 @@ static void* spu_fallback_thread_proc(void* arg)
         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
     }
     t->exit_status = rc;
+    /* EXPERIMENT (RD_SPU_DONE_EVENT): on SPU thread completion, deliver an event
+     * to the connected queue -- PPU code may block in sys_event_queue_receive for
+     * the SPU's completion signal (which normally comes from a WrOutIntrMbox the
+     * SPU issues before finishing). Tests whether the render hang is that wait. */
+    if (getenv("RD_SPU_DONE_EVENT") && t->connected_queue) {
+        extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        sys_event_queue_push_by_id(t->connected_queue,
+            ((uint64_t)t->tid << 32) | 0x2u, (uint64_t)(uint32_t)rc, 0, 0);
+        fprintf(stderr, "[SPU-DONE-EVT] tid=0x%X rc=0x%X -> queue=%u\n",
+                t->tid, rc, t->connected_queue);
+    }
     /* Mark complete and signal anyone waiting in group_join. */
 #ifdef _WIN32
     t->running = 0;
