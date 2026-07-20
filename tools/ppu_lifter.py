@@ -3351,11 +3351,25 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 r_base = cand; break
         if table_base is None or disp is None or not _tocs:
             continue
-        # offset table iff an `add rC, *, r_base` combines the loaded value + base
+        # offset table iff an `add ..., r_base` combines the loaded table value
+        # with the base. The loaded value flows from the lwzx dest (`rC`=p[0]) into
+        # the add, often through an intermediate `extsw`/`mr`/`clrldi`/`rldicl`
+        # (`lwzx r12,..; extsw r5,r12; add r3,r5,r_base; mtctr r3`). Track the set
+        # of registers that carry the (sign-/zero-extended) offset, then look for
+        # an `add` that combines any of them with r_base. Matching only `add rC,*`
+        # (the raw lwzx dest) missed every dispatcher with an extend in between --
+        # mis-lifting the switch as a frame-leaking bctr to an unlifted case (e.g.
+        # libxml2's xmlReportError offset-table @ 0x2B8448). */
+        off_regs = {rC}
+        for w in win:
+            if w.mnemonic in ('extsw', 'mr', 'clrldi', 'rldicl', 'rldic', 'extsb', 'extsh'):
+                a = [x.strip() for x in w.operands.split(',')]
+                if len(a) >= 2 and a[1] in off_regs:
+                    off_regs.add(a[0])
         is_offset = any(
-            w.mnemonic == 'add' and
-            [x.strip() for x in w.operands.split(',')][0] == rC and
-            r_base in [x.strip() for x in w.operands.split(',')][1:]
+            w.mnemonic == 'add' and (
+                lambda ops: r_base in ops[1:] and any(o in off_regs for o in ops[1:])
+            )([x.strip() for x in w.operands.split(',')])
             for w in win)
         # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
         count = None
