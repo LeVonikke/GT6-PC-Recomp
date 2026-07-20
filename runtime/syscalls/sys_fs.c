@@ -88,11 +88,26 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * appending a literal "app_home" directory that doesn't exist on disk. */
     const char* rel = ps3_path;
     const char* ah = strstr(ps3_path, "app_home/");
-    if (ah) rel = ah + 9;                 /* everything after "app_home/" */
+    /* Map anything from a "USRDIR/" component onward to <root>/USRDIR/... directly.
+     * This bypasses the full /dev_hdd0/game/<ID>/USRDIR install tree (which we
+     * normally provide via a filesystem junction) -- concurrent opens THROUGH a
+     * Windows junction intermittently fail (the source of the nondeterministic Cg
+     * shader "could not be read" abort). The real assets live under <root>/USRDIR,
+     * so resolve straight there. */
+    const char* usrp = strstr(ps3_path, "USRDIR/");
+    if (usrp) rel = usrp;                  /* "USRDIR/..." */
+    else if (ah) rel = ah + 9;             /* everything after "app_home/" */
     else if (rel[0] == '/') rel++;         /* otherwise just strip leading slash */
 
     snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
     fs_normalize_sep(host_path);
+    /* If the direct <root>/USRDIR path doesn't exist, fall back to the full
+     * dev_hdd0 tree (the junction) for titles laid out that way. */
+    if (usrp) { struct stat _s; if (stat(host_path, &_s) != 0) {
+        const char* r2 = (ps3_path[0]=='/') ? ps3_path+1 : ps3_path;
+        snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, r2);
+        fs_normalize_sep(host_path);
+    } }
 
     /* Extracted-dump fallback: our test setups often hold a title's data at
      * <root>/extracted/USRDIR/... rather than the full /dev_hdd0/game/<ID>/USRDIR
