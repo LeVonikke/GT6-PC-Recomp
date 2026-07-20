@@ -581,11 +581,34 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
     fprintf(stderr, "[SPU-INTERP] tid=0x%X entry=0x%05X img=0x%08X args=0x%08X -> interpreting\n",
             tid, entry, t->img_ea, args_ea);
     int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1,  /* pure interp: no fast-path rejoin */
-                                    t->tid, t->group_id);    /* identify for mbox->event delivery */
+                                    t->tid, t->group_id, 0); /* identify for mbox->event delivery */
     { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
       fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
               tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
     return sc;
+}
+
+/* Per-frame sim-SPU dispatch. The game runs its SPU jobs as persistent workers:
+ * after init they stop, then each frame the game event-port-sends a work-
+ * descriptor EA and waits on the SPU's completion queue. Re-run the SPU whose
+ * connected completion queue is `comp_queue`, feeding `work_ea` into its inbound
+ * mailbox (its first rdch InMbox), so it DMAs that frame's descriptor, computes,
+ * and signals completion -- satisfying the PPU's wait. Returns 1 if dispatched. */
+int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
+{
+    if (!getenv("RD_SPU_INTERP")) return 0;
+    for (uint32_t i = 0; i < MAX_SPU_THREADS; i++) {
+        spu_thread_t* t = &s_spu_threads[i];
+        if (!t->in_use || t->connected_queue != comp_queue || !t->img_ea) continue;
+        uint8_t* ls = spu_thread_get_or_alloc_ls(t);
+        if (!ls) return 0;
+        uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
+        fprintf(stderr, "[SPU-FRAME] tid=0x%X q=%u work=0x%08X -> re-run\n",
+                t->tid, comp_queue, work_ea);
+        spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id, work_ea);
+        return 1;
+    }
+    return 0;
 }
 
 /* sys_spu_thread_group_start(id) */

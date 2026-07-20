@@ -781,6 +781,12 @@ int64_t sys_event_port_send(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBUSY;
     }
 
+    /* Per-frame sim-SPU trigger: the game sends the work-descriptor EA (data2) to
+     * a "start" queue and waits on the SPU's completion queue (start+1). Re-run
+     * that SPU with the work EA so it produces this frame's result + completion. */
+    { extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
+      spu_dispatch_frame_by_queue((uint32_t)qidx + 1, (uint32_t)data2); }
+
     return CELL_OK;
 }
 

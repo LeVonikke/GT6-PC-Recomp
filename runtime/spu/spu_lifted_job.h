@@ -26,13 +26,19 @@ typedef void (*spu_lifted_entry_fn)(spu_context*);
  * SPU jobs run without lifting them first. The channel/DMA ABI (spu_wrch/rdch,
  * MFC) is shared, so DMA, mailboxes, and event signalling behave identically.
  * Returns the SPU's stop code. */
+/* inmbox_val: if nonzero, pre-loads the SPU inbound mailbox so the job's first
+ * `rdch SPU_RdInMbox` returns it -- this is how a persistent-worker sim SPU
+ * receives its per-frame work-descriptor EA (delivered by the game's per-frame
+ * event-port send). 0 for the initial group_start run. */
 static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc,
                                          uint32_t args_ea, int image_id,
-                                         uint32_t spu_id, uint32_t group_id)
+                                         uint32_t spu_id, uint32_t group_id,
+                                         uint32_t inmbox_val)
 {
     extern uint8_t* vm_base;
     spu_context ctx;
     spu_context_init(&ctx, 0);
+    if (inmbox_val) spu_channel_write(&ctx.ch_in_mbox, inmbox_val);
     /* Identify the context as the real thread so a WrOutMbox/WrOutIntrMbox the
      * SPU issues reaches the RIGHT connected event queue: g_spu_out_mbox_hook ->
      * ydkj_spu_out_mbox_deliver looks the thread up by spu_id. Left at 0 (the

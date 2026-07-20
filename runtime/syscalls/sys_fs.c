@@ -231,7 +231,7 @@ int64_t sys_fs_open(ppu_context* ctx)
      * could not be read" abort. Retry a few times with a brief backoff for a
      * read-only open of a file that exists; deterministic and cheap. */
     if (!fp && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
-        for (int _r = 0; !fp && _r < 200; _r++) {
+        for (int _r = 0; !fp && _r < 3000; _r++) {
 #ifdef _WIN32
             Sleep(1);
 #endif
