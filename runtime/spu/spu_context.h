@@ -143,6 +143,13 @@ typedef struct spu_context {
      * here. 0 = match any image (back-compat for single-image contexts). */
     int image_id;
 
+    /* When set, a rchcnt(SPU_RdInMbox) that finds the inbound mailbox EMPTY halts
+     * the SPU (spu_halt longjmp) instead of returning 0. Lets a persistent-worker
+     * SPU (e.g. the ducky's AsyncCopy raw SPU) run SYNCHRONOUSLY: it does its full
+     * init + ready-mailbox handshake, then parks the first time it idle-waits for
+     * a PPU command -- deterministic, no async host thread racing the PPU. */
+    int park_on_empty_inmbox;
+
     /* Decrementer (a free-running down counter) */
     uint32_t decrementer;
 

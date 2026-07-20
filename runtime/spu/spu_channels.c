@@ -367,7 +367,15 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
                   (unsigned long long)s_cnt[3],(unsigned long long)s_cnt[4],(unsigned long long)s_cnt[5],
                   (unsigned long long)s_cnt[6],(unsigned long long)s_cnt[7], channel); } }
     switch (channel) {
-    case SPU_RdInMbox:       return ctx->ch_in_mbox.count;                 /* readable */
+    case SPU_RdInMbox:
+        /* Synchronous persistent-worker park: after its handshake the SPU polls
+         * the inbound mailbox for PPU commands; if empty and parking is armed,
+         * halt (longjmp out of spu_run_with_halt) instead of spinning forever. */
+        if (ctx->park_on_empty_inmbox && ctx->ch_in_mbox.count == 0) {
+            extern void spu_halt(spu_context*);
+            spu_halt(ctx);
+        }
+        return ctx->ch_in_mbox.count;                                     /* readable */
     case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots */
     case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count;
     case SPU_RdSigNotify1:   return ctx->ch_sig_notify[0].count;
