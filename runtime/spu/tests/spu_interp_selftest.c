@@ -16,6 +16,7 @@
  * without the full runtime (spu_channels.c pulls in unrelated globals). */
 u128 spu_rdch(spu_context* c, uint32_t ch) { (void)c;(void)ch; u128 z; memset(&z,0,sizeof z); return z; }
 void spu_wrch(spu_context* c, uint32_t ch, u128 v) { (void)c;(void)ch;(void)v; }
+uint32_t spu_rchcnt(spu_context* c, uint32_t ch) { (void)c;(void)ch; return 1; }
 
 /* .text of the assembled snippet (big-endian words, verbatim). */
 static const unsigned char PROG[] = {

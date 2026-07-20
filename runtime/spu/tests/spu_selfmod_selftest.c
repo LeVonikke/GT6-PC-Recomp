@@ -18,6 +18,7 @@
 /* No channel ops here; stub the ABI so we link without the MFC world. */
 u128 spu_rdch(spu_context* c, uint32_t ch) { (void)c;(void)ch; u128 z; memset(&z,0,sizeof z); return z; }
 void spu_wrch(spu_context* c, uint32_t ch, u128 v) { (void)c;(void)ch;(void)v; }
+uint32_t spu_rchcnt(spu_context* c, uint32_t ch) { (void)c;(void)ch; return 1; }
 
 static void dummy_fn(spu_context* c) { (void)c; }
 

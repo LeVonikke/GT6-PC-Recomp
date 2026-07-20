@@ -23,6 +23,7 @@
 #include "sys_vm.h"
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
+#include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
 #include "sys_event.h"
 
 #include <stdio.h>
@@ -194,6 +195,7 @@ typedef struct {
      * the registered job expects. */
     uint32_t args_ea;
     uint32_t args_size;
+    uint32_t img_ea;         /* sys_spu_image descriptor EA (for LS segment load) */
     /* Async fallback execution. host_thread is set when group_start spawned
      * a host thread for this SPU thread's PPU fallback; finish_event is
      * signalled when the handler returns; running indicates the thread is
@@ -437,6 +439,7 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     /* Read entry point from the SPU image struct if available.
      * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
+    t->img_ea    = img_ea;
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
 
@@ -520,6 +523,54 @@ static void* spu_fallback_thread_proc(void* arg)
 #endif
 }
 
+/* Load a sys_spu_image's segments into a 256 KB local store. COPY segments
+ * (type 1) are memcpy'd from their guest source EA; FILL segments (type 2) are
+ * zeroed. Mirrors sys_spu_image_import's segment layout {type,ls_start,size,
+ * src(pa64)} (0x18 bytes each). Returns the entry point, or 0 on failure. */
+static uint32_t spu_load_image_to_ls(uint32_t img_ea, uint8_t* ls)
+{
+    if (!img_ea || !ls || !vm_base) return 0;
+    uint32_t entry = vm_read_be32(img_ea + 4);
+    uint32_t segs  = vm_read_be32(img_ea + 8);
+    uint32_t nsegs = vm_read_be32(img_ea + 12);
+    for (uint32_t s = 0; s < nsegs && s < 64; s++) {
+        uint32_t b        = segs + s * 0x18;
+        uint32_t type     = vm_read_be32(b + 0x00);
+        uint32_t ls_start = vm_read_be32(b + 0x04) & (SPU_LS_SIZE - 1);
+        uint32_t size     = vm_read_be32(b + 0x08);
+        uint32_t src_lo   = vm_read_be32(b + 0x14);
+        if (ls_start + size > SPU_LS_SIZE) size = SPU_LS_SIZE - ls_start;
+        if (type == 1 && src_lo)              /* COPY: guest EA -> LS */
+            memcpy(ls + ls_start, vm_base + src_lo, size);
+        else if (type == 2)                   /* FILL: zero */
+            memset(ls + ls_start, 0, size);
+    }
+    return entry;
+}
+
+/* PPU-fallback that runs an un-lifted SPU thread via the interpreter. Registered
+ * for the currently-instant-completing thread groups when RD_SPU_INTERP is set
+ * (see group_start). Loads the thread's image into its LS and interprets from
+ * the entry point; DMA/mailbox/event ops go through the shared channel ABI. */
+static uint8_t* spu_thread_get_or_alloc_ls(spu_thread_t* t);   /* fwd (defined below) */
+static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
+                                   uint32_t args_size, void* user)
+{
+    (void)args_size; (void)user;
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) return -1;
+    uint8_t* ls = spu_thread_get_or_alloc_ls(t);
+    if (!ls) return -1;
+    uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
+    fprintf(stderr, "[SPU-INTERP] tid=0x%X entry=0x%05X img=0x%08X args=0x%08X -> interpreting\n",
+            tid, entry, t->img_ea, args_ea);
+    int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1);  /* pure interp: no fast-path rejoin */
+    { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+      fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
+              tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
+    return sc;
+}
+
 /* sys_spu_thread_group_start(id) */
 static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
 {
@@ -563,6 +614,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (!t->in_use) continue;
         void* user = NULL;
         spu_ppu_fallback_fn fb = spu_lookup_ppu_fallback(t->entry_point, &user);
+        if (!fb && getenv("RD_SPU_INTERP") && t->img_ea) {
+            /* No lifted fallback: interpret the image instead of instant-
+             * completing. Additive + env-gated so it can't destabilize titles
+             * that rely on a registered fallback. */
+            fb = spu_interp_fallback;
+            user = NULL;
+        }
         if (!fb) {
             t->exit_status = 0;
             t->running = 0;

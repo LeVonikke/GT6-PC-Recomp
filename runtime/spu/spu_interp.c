@@ -14,6 +14,7 @@
  * into each generated spu_recomp.h — declared here to stay header-independent. */
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 
 #include "spu_interp_tables.inc"   /* spu_op enum, spu_op_name[], spu_dec_* */
 
@@ -227,10 +228,42 @@ static int spu_step(spu_context* ctx) {
     case SPU_cfltu: DST = spu_cfltu(A,I); break;
     case SPU_csflt: DST = spu_csflt(A,I); break;
     case SPU_cuflt: DST = spu_cuflt(A,I); break;
+    case SPU_frest:  DST = spu_frest(A); break;
+    case SPU_frsqest:DST = spu_frsqest(A); break;
+    case SPU_fi:     DST = spu_fi(A,B); break;
+    case SPU_fcmgt:  DST = spu_fcmgt(A,B); break;
+    case SPU_fcmeq:  DST = spu_fcmeq(A,B); break;
+    case SPU_fesd:   DST = spu_fesd(A); break;
+    case SPU_frds:   DST = spu_frds(A); break;
+    case SPU_fma:  DSTC = spu_fma(A,B,T); break;    /* RRR: dest=rc */
+    case SPU_fms:  DSTC = spu_fms(A,B,T); break;
+    case SPU_fnms: DSTC = spu_fnms(A,B,T); break;
+    /* immediate byte/halfword compares */
+    case SPU_ceqbi: DST = spu_ceqbi(A,I); break;
+    case SPU_cgtbi: DST = spu_cgtbi(A,I); break;
+    case SPU_clgtbi:DST = spu_clgtbi(A,I); break;
+    case SPU_ceqhi: DST = spu_ceqhi(A,I); break;
+    case SPU_cgthi: DST = spu_cgthi(A,I); break;
+    case SPU_clgthi:DST = spu_clgthi(A,I); break;
+    /* integer / byte extras */
+    case SPU_bg:    DST = spu_bg(A,B); break;
+    case SPU_absdb: DST = spu_absdb(A,B); break;
+    case SPU_avgb:  DST = spu_avgb(A,B); break;
+    case SPU_sumb:  DST = spu_sumb(A,B); break;
+    case SPU_mpys:  DST = spu_mpys(A,B); break;
+    case SPU_mpyhh: DST = spu_mpyhh(A,B); break;
+    case SPU_mpyhhu:DST = spu_mpyhhu(A,B); break;
+    case SPU_mpyhha:DSTC = spu_mpyhha(A,B,T); break;  /* RRR */
+    /* rotate / shift extras */
+    case SPU_rothm:    DST = spu_rothm(A,B); break;
+    case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
+    case SPU_rotqbybi: DST = spu_rotqbybi(A,B); break;
+    case SPU_rotqmbybi:DST = spu_rotqmbybi(A,B); break;
+    case SPU_shlqbybi: DST = spu_shlqbybi(A,B); break;
     /* channels */
     case SPU_wrch: spu_wrch(ctx, d.ch, DST); break;
     case SPU_rdch: DST = spu_rdch(ctx, d.ch); break;
-    case SPU_rchcnt: DST = spu_splat_u32(1); break;   /* count: 1 slot available */
+    case SPU_rchcnt: DST = spu_splat_u32(spu_rchcnt(ctx, d.ch)); break;
     /* hints / no-ops */
     case SPU_nop: case SPU_lnop: case SPU_sync: case SPU_dsync:
     case SPU_hbr: case SPU_hbra: case SPU_hbrr: case SPU_mtspr:
@@ -261,12 +294,22 @@ static int spu_step(spu_context* ctx) {
     return 0;
 }
 
+uint32_t g_spu_interp_last_pc = 0;
+uint64_t g_spu_interp_steps   = 0;
+
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
+    uint64_t steps = 0;
     for (;;) {
-        if (spu_lifted_lookup(ctx, ctx->pc)) return ctx->pc;  /* rejoin fast path */
-        if (spu_step(ctx)) return ctx->stop_code;
+        /* Rejoin the compiled fast path only for images that HAVE lifted
+         * functions (image_id >= 0). image_id < 0 = pure interpretation: an
+         * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
+         * another image's functions that happen to share an LS address. */
+        if (ctx->image_id >= 0 && spu_lifted_lookup(ctx, ctx->pc)) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        g_spu_interp_last_pc = ctx->pc;
+        steps++;
+        if (spu_step(ctx)) { g_spu_interp_steps = steps; return ctx->stop_code; }
     }
 }
 

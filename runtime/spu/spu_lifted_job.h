@@ -14,10 +14,42 @@
 #define SPU_LIFTED_JOB_H
 
 #include "spu_context.h"
+#include "spu_interp.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
 #include <stdio.h>
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
+
+/* Run an UN-LIFTED SPU image via the interpreter. Same context/LS/ABI bring-up
+ * as spu_run_lifted_job (r1 = LS top, LS in/out, raw-thread arg EA in r3), but
+ * the engine is the interpreter fetching from live local store — so a title's
+ * SPU jobs run without lifting them first. The channel/DMA ABI (spu_wrch/rdch,
+ * MFC) is shared, so DMA, mailboxes, and event signalling behave identically.
+ * Returns the SPU's stop code. */
+static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc,
+                                         uint32_t args_ea, int image_id)
+{
+    extern uint8_t* vm_base;
+    spu_context ctx;
+    spu_context_init(&ctx, 0);
+    ctx.image_id = image_id;
+    ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;       /* SPU stack top, 16B aligned */
+    if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);
+    /* Raw-SPU-thread ABI: sys_spu_thread_argument is 4 u64s (arg1..arg4) passed
+     * in r3..r6, each in the register's preferred doubleword (bytes 0-7). */
+    if (args_ea && vm_base) {
+        for (int i = 0; i < 4; i++) {
+            const uint8_t* p = vm_base + args_ea + i * 8;
+            ctx.gpr[3 + i]._u32[0] = ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+            ctx.gpr[3 + i]._u32[1] = ((uint32_t)p[4]<<24)|((uint32_t)p[5]<<16)|((uint32_t)p[6]<<8)|p[7];
+        }
+    } else {
+        ctx.gpr[3]._u32[0] = args_ea;
+    }
+    spu_interp_run(&ctx, entry_pc);
+    if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
+    return (int32_t)ctx.stop_code;
+}
 
 /* Run a lifted SPU job. `local_store` (256 KB, may be NULL) is the SPU thread's
  * local store; it is brought into the context, the job's arg EA is placed in r3
