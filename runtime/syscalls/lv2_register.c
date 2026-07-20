@@ -580,7 +580,8 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
     }
     fprintf(stderr, "[SPU-INTERP] tid=0x%X entry=0x%05X img=0x%08X args=0x%08X -> interpreting\n",
             tid, entry, t->img_ea, args_ea);
-    int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1);  /* pure interp: no fast-path rejoin */
+    int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1,  /* pure interp: no fast-path rejoin */
+                                    t->tid, t->group_id);    /* identify for mbox->event delivery */
     { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
       fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
               tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
@@ -646,6 +647,20 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         t->fb_handler = fb;
         t->fb_user    = user;
         t->running    = 1;
+        /* Interpreted sim jobs are fire-and-forget compute (DMA in -> compute ->
+         * DMA out -> stop) that don't block on PPU input mid-run. Running them on
+         * an async host thread races the PPU's own use of the results (e.g. the
+         * ducky's initShaders aborts nondeterministically). Run them SYNCHRONOUSLY
+         * here so group_start returns only after the SPU has finished and written
+         * its output -- deterministic, and matches how the PPU expects to consume
+         * the results right after start/join. (RD_SPU_INTERP_ASYNC forces the old
+         * async path if a job ever needs to overlap with the PPU.) */
+        if (fb == spu_interp_fallback && !getenv("RD_SPU_INTERP_ASYNC")) {
+            t->exit_status = fb(t->tid, t->args_ea, t->args_size, user);
+            t->running = 0;
+            instant++;
+            continue;
+        }
 #ifdef _WIN32
         /* Manual-reset event so multiple group_join callers all see "set" */
         if (!t->finish_event)

@@ -27,11 +27,20 @@ typedef void (*spu_lifted_entry_fn)(spu_context*);
  * MFC) is shared, so DMA, mailboxes, and event signalling behave identically.
  * Returns the SPU's stop code. */
 static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc,
-                                         uint32_t args_ea, int image_id)
+                                         uint32_t args_ea, int image_id,
+                                         uint32_t spu_id, uint32_t group_id)
 {
     extern uint8_t* vm_base;
     spu_context ctx;
     spu_context_init(&ctx, 0);
+    /* Identify the context as the real thread so a WrOutMbox/WrOutIntrMbox the
+     * SPU issues reaches the RIGHT connected event queue: g_spu_out_mbox_hook ->
+     * ydkj_spu_out_mbox_deliver looks the thread up by spu_id. Left at 0 (the
+     * spu_context_init default), delivery finds no thread and silently drops the
+     * event -- which is why the sim SPUs' natural completion signals never woke
+     * the waiting PPU. */
+    ctx.spu_id       = spu_id;
+    ctx.spu_group_id = group_id;
     ctx.image_id = image_id;
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;       /* SPU stack top, 16B aligned */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);
