@@ -372,15 +372,31 @@ def _reg_idx(token: str) -> str:
 # Callee-saved register save/restore (r14-r31) to/from the frame, for the
 # robust ABI-preservation pass in lift_function. Group order: SAVE -> (off, reg);
 # RESTORE -> (reg, off), so a save and its restore pair on matching (off, reg).
+def _mem_base(base):
+    """EA base register expr. The PPC d-form ra=0 means a literal 0 base, not r0;
+    since `base` is a lift-time constant, resolve it here to plain `ctx->gpr[N]`
+    (N!=0) or `0` (ra=0) instead of a runtime `((N)?ctx->gpr[N]:0)` ternary. The
+    ternary was correct but (a) redundant and (b) broke every pattern-match that
+    expects a bare `ctx->gpr[1]` stack base -- most importantly the callee-save
+    (_cs) detection, which silently no-op'd, corrupting reused-slot reloads."""
+    return "0" if str(base) == "0" else f"ctx->gpr[{base}]"
+
+
+# The r1 (stack) base can be emitted plainly (`ctx->gpr[1]`) OR, since the ra=0
+# form is lowered as a runtime ternary, as `((1) ? ctx->gpr[1] : 0)`. The
+# callee-save detection below must match BOTH, or it silently finds nothing and
+# the whole _cs entry-capture pass no-ops (600 -> 0 captures on libsre), leaving
+# reused-slot reloads reading stale/corrupt values.
+_R1 = r'(?:ctx->gpr\[1\]|\(\(1\) \? ctx->gpr\[1\] : 0\))'
 _CS_SAVE_RE = re.compile(
-    r'vm_write64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
+    r'vm_write64\(' + _R1 + r' \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
 _CS_REST_RE = re.compile(
-    r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+)\);')
+    r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(' + _R1 + r' \+ (-?0x[0-9A-Fa-f]+|-?\d+)\);')
 # Any frame-relative store (any width), capturing the offset. Used to tell a
 # spill/reload apart from a callee-save restore: a slot this body writes itself
 # is scratch, so a later load from it is NOT a callee-save restore.
 _CS_ANY_STORE_RE = re.compile(
-    r'vm_write(?:8|16|32|64)\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+),')
+    r'vm_write(?:8|16|32|64)\(' + _R1 + r' \+ (-?0x[0-9A-Fa-f]+|-?\d+),')
 # A write (assignment) to a callee-saved GPR. A `std rN,off(r1)` only preserves
 # the caller's value if rN has NOT been reassigned first; when the compiler
 # reuses a callee-save slot for a local (store a computed rN, later reload rN),
@@ -1095,7 +1111,7 @@ class PPULifter:
             if mn == "ld" and str(rd_i) == "2" and str(base) == "1" and self.toc_base:
                 return f"ctx->gpr[2] = 0x{self.toc_base:08X}ULL; /*TOCFIX ld r2,N(r1)*/"
             if disp is not None:
-                expr = f"{helper}((({base}) ? ctx->gpr[{base}] : 0) + {disp})"
+                expr = f"{helper}({_mem_base(base)} + {disp})"
                 if signed and "16" in helper:
                     expr = f"(int64_t)(int16_t){expr}"
                 line = f"ctx->gpr[{rd_i}] = {expr};"
@@ -1145,7 +1161,7 @@ class PPULifter:
             rs_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                line = f"{helper}((({base}) ? ctx->gpr[{base}] : 0) + {disp}, ctx->gpr[{rs_i}]);"
+                line = f"{helper}({_mem_base(base)} + {disp}, ctx->gpr[{rs_i}]);"
                 # Handle update forms
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
@@ -1167,7 +1183,7 @@ class PPULifter:
             rd_i = int(_reg_idx(ops[0]))
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                stmts = [f"{{ uint64_t _ea = (({base}) ? ctx->gpr[{base}] : 0) + {disp};"]
+                stmts = [f"{{ uint64_t _ea = {_mem_base(base)} + {disp};"]
                 for i, r in enumerate(range(rd_i, 32)):
                     off = f" + {i * 4}" if i else ""
                     stmts.append(f" ctx->gpr[{r}] = vm_read32(_ea{off});")
@@ -1179,7 +1195,7 @@ class PPULifter:
             rs_i = int(_reg_idx(ops[0]))
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                stmts = [f"{{ uint64_t _ea = (({base}) ? ctx->gpr[{base}] : 0) + {disp};"]
+                stmts = [f"{{ uint64_t _ea = {_mem_base(base)} + {disp};"]
                 for i, r in enumerate(range(rs_i, 32)):
                     off = f" + {i * 4}" if i else ""
                     stmts.append(f" vm_write32(_ea{off}, (uint32_t)ctx->gpr[{r}]);")
@@ -1215,7 +1231,7 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32((({base}) ? ctx->gpr[{base}] : 0) + {disp});"
+                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32({_mem_base(base)} + {disp});"
 
         # ------- Indexed Stores -------
         idx_store_map = {
@@ -1565,10 +1581,10 @@ class PPULifter:
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 if "s" in mn:
-                    body = (f"{{ uint32_t tmp = vm_read32((({base}) ? ctx->gpr[{base}] : 0) + {disp}); "
+                    body = (f"{{ uint32_t tmp = vm_read32({_mem_base(base)} + {disp}); "
                             f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
                 else:
-                    body = (f"{{ uint64_t tmp = vm_read64((({base}) ? ctx->gpr[{base}] : 0) + {disp}); "
+                    body = (f"{{ uint64_t tmp = vm_read64({_mem_base(base)} + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
                 # Update-form (lfsu/lfdu): EA = (rA)+disp, then rA = EA.
                 # Dropping this base write-back leaves rA stale and corrupts every
@@ -1606,10 +1622,10 @@ class PPULifter:
                 if mn in ("stfs", "stfsu"):
                     body = (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
                             f"memcpy(&tmp, &ftmp, 4); "
-                            f"vm_write32((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
+                            f"vm_write32({_mem_base(base)} + {disp}, tmp); }}")
                 else:
                     body = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
-                            f"vm_write64((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
+                            f"vm_write64({_mem_base(base)} + {disp}, tmp); }}")
                 # Update-form (stfsu/stfdu): EA = (rA)+disp, then rA = EA
                 # (PowerISA p.132/133). Dropping this base write-back is what let
                 # stfsu-initialized color fields clobber the object vtable at
@@ -2870,7 +2886,14 @@ class PPULifter:
         """
         defined = {f.start_addr for f in self.functions}
         # All addresses that are referenced as func_X but not yet defined
-        all_refs = (self.call_targets | self.branch_targets) - defined
+        # Include code addresses discovered in DATA (fn-ptr tables, vtables, struct
+        # fields). These are reached only by INDIRECT calls, so they appear in no
+        # static call/branch set -- without them the runtime hits
+        # `[ppu] unresolved indirect call -> 0x...` and hangs. (The pre-2026-07
+        # lifter emitted ~7k such mid-function wrappers wholesale; dropping them
+        # silently broke YDKJ: 0x202140, 0x2B69BC, 0x2DE850 ...)
+        all_refs = (self.call_targets | self.branch_targets
+                    | getattr(self, 'data_code_targets', set())) - defined
 
         if not all_refs:
             return 0
@@ -3301,10 +3324,13 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # in a data global at *(TOC+d1) and the table at *(that + d2). Only
         # matching the direct form silently dropped every two-level dispatcher
         # (109 of 130 here), leaving each switch lifted as a failing bctr.
+        # (YDKJ merge: _lwz_of also matches `ld` -- the 64-bit ELFv1 TOC form.
+        # SN loads the base with `lwz`; gcc/PSL1GHT/newlib use `ld`. Accept both,
+        # or every newlib dtoa/printf("%f") dense switch falls through.)
         def _lwz_of(reg):
-            """Most-recent `lwz reg, disp(rA)` in the window -> (disp, rA_name)."""
+            """Most-recent `lwz/ld reg, disp(rA)` in the window -> (disp, rA_name)."""
             for w in reversed(win):
-                if w.mnemonic == 'lwz':
+                if w.mnemonic in ('lwz', 'ld'):
                     a = [x.strip() for x in w.operands.split(',')]
                     if len(a) == 2 and a[0] == reg and '(' in a[1]:
                         d = mem_disp(a[1])
@@ -3375,17 +3401,58 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 lambda ops: r_base in ops[1:] and any(o in off_regs for o in ops[1:])
             )([x.strip() for x in w.operands.split(',')])
             for w in win)
-        # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
+        # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`. Match the
+        # compare on the RAW INDEX register: the lwzx index (rIdx*4) is usually a
+        # shift of the raw index (`rldic/clrlsldi rShift, rIdx, ...`), and the raw
+        # index is what the switch bounds-checks. Blindly taking the nearest
+        # cmpwi grabbed an unrelated `cmpwi r9,0` in a sibling basic block (the
+        # 30-insn address window spans both arms of a branch), where r9 is only
+        # reused as the shifted index LATER -> count=0 -> a single case decoded ->
+        # LBP sub_422A40's 0x2A-case "GMTb" dispatcher fell through to an
+        # unresolved indirect call (0x422CA0) and stalled the loader.
+        _idx_reg = p[1] if r_base == p[2] else p[2]
+        _raw_idx = _idx_reg
+        for w in reversed(win):
+            a = [x.strip() for x in w.operands.split(',')]
+            if a and a[0] == _idx_reg:
+                if (w.mnemonic in ('rldic', 'rldicl', 'rldicr', 'rlwinm',
+                                   'clrlsldi', 'sldi', 'slwi', 'clrldi')
+                        and len(a) >= 2):
+                    _raw_idx = a[1]
+                break                           # first (nearest) def of idx wins
+        # Take the LARGEST immediate compared against the raw index: the switch
+        # bounds-check (`cmplwi rIdx, COUNT`) uses the max index, while any
+        # per-case `cmpwi rIdx, k` in the window tests a specific smaller case
+        # value. Picking the nearest compare grabbed `cmpwi r7,1` (a case test)
+        # -> count=1 -> only the default case decoded. Over-counting is safe: the
+        # per-entry text-range validation below stops at the first bogus offset.
         count = None
         for w in reversed(win):
             if w.mnemonic in ('cmplwi', 'cmpwi'):
-                try:
-                    count = int(w.operands.split(',')[-1].strip(), 0)
-                except ValueError:
-                    count = None
-                break
+                a = [x.strip() for x in w.operands.split(',')]
+                _cmp_reg = a[1] if (a and a[0].startswith('cr')) else (a[0] if a else None)
+                if _cmp_reg == _raw_idx:
+                    try:
+                        _c = int(a[-1], 0)
+                    except ValueError:
+                        continue
+                    if count is None or _c > count:
+                        count = _c
         if count is None or count < 0 or count > 4096:
             count = 256
+        # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
+        # counting: the backward window spans sibling basic blocks, so it can
+        # latch a per-case test (`cmpwi rIdx, k`) instead of the real bounds
+        # check and silently truncate the table. A truncated table drops real
+        # cases, and the runtime `bctr` then lands on an unlifted mid-function
+        # address -> "unresolved indirect call" -> the caller runs on garbage.
+        # (LBP func_0038F380: a 31-entry offset table decoded as 19 because a
+        # stray `cmpwi 18` won; case 22 = 0x0038F754 fell through to the global
+        # dispatcher -- which only knows function ENTRIES, not mid-function
+        # labels -- and the boot died in a storm of vcalls through a job
+        # descriptor's name string.) The per-entry validation below already
+        # finds the true end, so scan generously and let it terminate.
+        scan = min(max(count + 1, 256), 4096)
 
         # Multi-TOC executables (e.g. LBP: two TOCs, ~3.6k/2.2k functions each)
         # load the table base relative to WHICHEVER r2 their function runs
@@ -3405,8 +3472,20 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             if table_base is None:
                 continue
             targets = []
-            for k in range(count + 1):
-                v = read_u32((table_base + k * 4) & 0xFFFFFFFF)
+            for k in range(scan):
+                ea = (table_base + k * 4) & 0xFFFFFFFF
+                # Structural end-of-table: a jump table never overlaps the code
+                # it dispatches to, so once the cursor reaches the lowest case
+                # target that lies AHEAD of the table, the table has ended. (The
+                # gcc/SN pattern puts the table immediately before its cases:
+                # LBP func_0038F380's table is 0x38F4F0..0x38F56C and case[0] IS
+                # 0x38F56C.) Forward targets only -- a table whose cases branch
+                # backwards would otherwise bound at k=0.
+                fwd = [t for t in targets if t > table_base]
+                if fwd and ea >= min(fwd):
+                    _dbg(all_insns[i].addr, f"  stop at k={k}: cursor 0x{ea:X} reached first case 0x{min(fwd):X}")
+                    break
+                v = read_u32(ea)
                 if v is None:
                     break
                 if is_offset:
@@ -3795,6 +3874,8 @@ def main() -> None:
     # mechanism lifts target..func_end, so a far end explodes the output.)
     jt_targets = set()
     jt_dispatchers: dict[int, list[int]] = {}   # {bctr_addr: [case targets]}
+    data_code_targets: set[int] = set()         # code ptrs found in data (indirect-call targets)
+    toc_candidates: list[int] = []              # raw mode has no ELF TOC; ELF path fills this below
     if not args.raw:
         try:
             seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
@@ -3852,6 +3933,24 @@ def main() -> None:
                 print(f"  TOC candidates: {', '.join(hex(t) for t in toc_candidates)}")
             tables = discover_jump_tables(all_insns, _read_u32, toc_candidates, text_lo, text_hi)
             jt_dispatchers = tables
+
+            # ---- code pointers living in DATA -------------------------------
+            # Vtables / fn-ptr tables / struct fields hold code addresses that are
+            # reached ONLY by indirect call, so they are in no static call/branch
+            # set. The mid-function tail-entry pass needs them or the runtime hits
+            # `[ppu] unresolved indirect call -> 0x...` and hangs (YDKJ: 0x202140,
+            # 0x2B69BC, 0x2DE850). Scan every NON-text segment for aligned words
+            # that point into .text. The tail-entry pass caps each span
+            # (_MAX_MID_TAIL) and skips anything already defined, so false
+            # positives cost at most a small truncated stub.
+            for v0, v1, d in seg_map:
+                if v0 <= text_lo < v1:      # skip the text segment itself
+                    continue
+                for o in range(0, len(d) - 3, 4):
+                    w = int.from_bytes(d[o:o+4], 'big')
+                    if text_lo <= w < text_hi and (w & 3) == 0:
+                        data_code_targets.add(w)
+            print(f"  data code-pointers: {len(data_code_targets)} candidate targets")
             for ts in tables.values():
                 jt_targets.update(ts)
             import bisect
@@ -3948,6 +4047,7 @@ def main() -> None:
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
+    lifter.data_code_targets = data_code_targets
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
