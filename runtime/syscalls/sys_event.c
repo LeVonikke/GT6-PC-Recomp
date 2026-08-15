@@ -3,6 +3,7 @@
  */
 
 #include "sys_event.h"
+#include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
@@ -203,9 +204,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* YDKJ_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
-    fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
-            queue_id, (unsigned long long)timeout_us,
-            (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+    if (ps3_log_verbose())
+        fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
+                queue_id, (unsigned long long)timeout_us,
+                (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
 
     /* YDKJ_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
      * exact game function the main thread is stuck polling in the flip loop. */
@@ -412,6 +414,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
+    { static int _r=0; if (getenv("RD_RECV") && _r++<60) fprintf(stderr,
+        "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
+        (unsigned long long)evt.source, (unsigned long long)evt.data1,
+        (unsigned long long)evt.data2); }
 
     /* Also write the (legacy) guest memory buffer in big-endian, for callers that
      * pass a real sys_event_t* and read from it. */
@@ -776,6 +782,12 @@ int64_t sys_event_port_send(ppu_context* ctx)
     if (event_queue_push(q, &evt) < 0) {
         return (int64_t)(int32_t)CELL_EBUSY;
     }
+
+    /* Per-frame sim-SPU trigger: the game sends the work-descriptor EA (data2) to
+     * a "start" queue and waits on the SPU's completion queue (start+1). Re-run
+     * that SPU with the work EA so it produces this frame's result + completion. */
+    { extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
+      spu_dispatch_frame_by_queue((uint32_t)qidx + 1, (uint32_t)data2); }
 
     return CELL_OK;
 }

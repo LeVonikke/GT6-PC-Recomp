@@ -15,6 +15,7 @@
 #include <time.h>
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "ps3emu/endian.h"                   /* ps3_bswap64 -- guest is big-endian */
 /* HLE args arrive as guest effective addresses; translate before deref. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
@@ -291,7 +292,8 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
 /* Fire a guest SceNpTrophyStatusCallback via the OPD in `statusCb`.
  * Callback ABI: int cb(context, status, completed, total, arg). */
 extern unsigned long long ppu_guest_call_ct(u32 code, u32 toc,
-                                            u64 a0, u64 a1, u64 a2, u64 a3);
+                                            u64 a0, u64 a1, u64 a2, u64 a3,
+                                            u64 a4, u64 a5, u64 a6, u64 a7);
 
 static void trophy_fire_status_cb(u32 statusCb, u32 arg,
                                   SceNpTrophyContext context,
@@ -304,11 +306,11 @@ static void trophy_fire_status_cb(u32 statusCb, u32 arg,
                ((u32)opd[2] <<  8) |  (u32)opd[3];
     u32 toc  = ((u32)opd[4] << 24) | ((u32)opd[5] << 16) |
                ((u32)opd[6] <<  8) |  (u32)opd[7];
-    (void)arg;  /* real game passes arg=0; ppu_guest_call_ct leaves r7=0 */
     printf("[sceNpTrophy] firing status cb: opd=0x%08X code=0x%08X toc=0x%08X "
            "status=%u (%u/%u)\n", statusCb, code, toc, status, completed, total);
     ppu_guest_call_ct(code, toc,
-                      (u64)(u32)context, (u64)status, (u64)completed, (u64)total);
+                      (u64)(u32)context, (u64)status, (u64)completed, (u64)total,
+                      (u64)arg, 0, 0, 0);
 }
 
 s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
@@ -370,8 +372,14 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
     reqSpace = GUEST_PTR(reqSpace, u64*);
 
-    /* Typical trophy pack size */
-    *reqSpace = 1024 * 1024; /* 1 MB */
+    /* Typical trophy pack size. The guest is big-endian and reads this u64
+     * back in BE order, so the value MUST be byte-swapped on write -- otherwise
+     * a host-LE 0x100000 is read as 0x0010000000000000 (2^44). LBP feeds this
+     * "required disk space" straight into its save-data free-space accounting
+     * (sub_379EC0: errB = budget - usedKB - reqSpaceKB); a garbage 2^44 makes
+     * errB underflow negative -> cellGame GameData check returns ERROR-B ->
+     * boot bails. (Same LE-write class as the cellUserInfo fix.) */
+    *reqSpace = ps3_bswap64((u64)(1024 * 1024)); /* 1 MB, big-endian */
     printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> 1MB\n", context);
     return CELL_OK;
 }

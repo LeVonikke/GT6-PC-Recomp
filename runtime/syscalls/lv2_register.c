@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>   /* calloc, free */
+#include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
 #include "lv2_syscall_table.h"
 #include "sys_ppu_thread.h"
 #include "sys_mutex.h"
@@ -23,6 +24,7 @@
 #include "sys_vm.h"
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
+#include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
 #include "sys_event.h"
 
 #include <stdio.h>
@@ -75,6 +77,44 @@ static int64_t sys_tty_write(ppu_context* ctx)
                 }
             }
         }
+        /* YDKJ_ASSERTBT: the libspurs _cellSpursIsLaunchedFromTuner assertion (which
+         * aborts the SPURS task subsystem) prints through here. Dump the guest LR +
+         * back-chain to locate the asserting function so it can be suppressed. */
+        if (getenv("YDKJ_ASSERTBT") && len < 4096) {
+            char tmp[256]; uint32_t n = len < 255 ? len : 255;
+            memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
+            if (strstr(tmp, "ASSERT") || strstr(tmp, "Tuner") || strstr(tmp, "usertrace") ||
+                strstr(tmp, "libspurs")) {
+                static int _ab = 0; if (_ab++ < 4) {
+                    uint32_t sp = (uint32_t)ctx->gpr[1];
+                    fprintf(stderr, "\n[ASSERTBT] \"%.70s\" cia=0x%08X lr=0x%08X chain:", tmp,
+                            (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+                    for (int i = 0; i < 28 && sp && sp < 0x10000000u; i++) {
+                        uint32_t nsp; memcpy(&nsp, vm_base + sp, 4);
+                        nsp = ((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
+                        if (nsp <= sp || nsp >= 0x10000000u) break;
+                        uint32_t lr; memcpy(&lr, vm_base + nsp + 0x10, 4);
+                        lr = ((lr>>24)&0xFF)|((lr>>8)&0xFF00)|((lr<<8)&0xFF0000)|((lr<<24)&0xFF000000);
+                        fprintf(stderr, " %08X", lr); sp = nsp;
+                    }
+                    fprintf(stderr, "\n"); fflush(stderr);
+                }
+            }
+        }
+        /* POOL CORRUPTION TRACE: when the game's debug allocator reports a bad
+         * block / wrong pool / zeroed sentinel, dump the host call chain (resolved
+         * to guest funcs) to find who passed/corrupted the block. */
+        if (len < 4096) {
+            char ptmp[256]; uint32_t pn = len < 255 ? len : 255;
+            memcpy(ptmp, vm_base + buf_ea, pn); ptmp[pn] = 0;
+            if (strstr(ptmp, "Pool possibly") || strstr(ptmp, "Bad signature") ||
+                strstr(ptmp, "double-deallocate") ||
+                strstr(ptmp, "out of memory on request")) {
+                extern void ppu_log_host_chain(const char*);
+                static int _pn = 0;
+                if (_pn++ < 3) { fprintf(stderr, "[POOLTRACE] %.90s\n", ptmp); ppu_log_host_chain("pool-corrupt"); }
+            }
+        }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title logs a PhyreEngine
          * init failure, dump the guest back-chain so we can locate the failing
          * function (the message itself goes through here, not _sys_printf). */
@@ -86,9 +126,12 @@ static int64_t sys_tty_write(ppu_context* ctx)
              * carrying init/error/Phyre keywords. */
             if (strstr(tmp, "PSSG") || strstr(tmp, "Init") || strstr(tmp, "App") ||
                 strstr(tmp, "fail") || strstr(tmp, "Error") || strstr(tmp, "rror") ||
-                strstr(tmp, "PSpu") || strstr(tmp, "ation")) {
+                strstr(tmp, "PSpu") || strstr(tmp, "ation") || strstr(tmp, "Mystery")) {
                 uint32_t sp = (uint32_t)ctx->gpr[1];
                 fprintf(stderr, "[pssg-bt] tty_write \"%.50s\" lr=0x%08X\n", tmp, (uint32_t)ctx->lr);
+                /* The back-chain below is unreliable under the DRAIN/fragment
+                 * model (LR slots read 0); the host-backtrace mapper is not. */
+                { extern void ppu_guest_callstack(const char*); ppu_guest_callstack("tty"); }
                 for (int i = 0; i < 28 && sp && sp < 0x10000000u; i++) {
                     uint32_t nsp; memcpy(&nsp, vm_base + sp, 4);
                     nsp = ((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
@@ -194,6 +237,7 @@ typedef struct {
      * the registered job expects. */
     uint32_t args_ea;
     uint32_t args_size;
+    uint32_t img_ea;         /* sys_spu_image descriptor EA (for LS segment load) */
     /* Async fallback execution. host_thread is set when group_start spawned
      * a host thread for this SPU thread's PPU fallback; finish_event is
      * signalled when the handler returns; running indicates the thread is
@@ -305,6 +349,25 @@ static uint32_t vm_read_be32(uint32_t guest_addr)
     const uint8_t* p = vm_base + guest_addr;
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] <<  8) | (uint32_t)p[3];
+}
+
+/* syscall 872: sys_ss_get_open_psid(CellSsOpenPSID* psid { u64 high; u64 low })
+ * Returns the console "Open PSID" (a per-console PSN/NP identity, also used for
+ * save-data/trophy keying). The prior unimplemented stub returned without
+ * touching the out-param, so the caller (an LBP 1.30 boot job) read heap
+ * garbage. Fill it — zeros, matching RPCS3's default unconfigured console_psid —
+ * and return CELL_OK. */
+static int64_t sys_ss_get_open_psid_handler(ppu_context* ctx)
+{
+    uint32_t ptr = (uint32_t)ctx->gpr[3];
+    if (ptr) {
+        vm_write_be32(ptr + 0,  0);   /* high[63:32] */
+        vm_write_be32(ptr + 4,  0);   /* high[31:0]  */
+        vm_write_be32(ptr + 8,  0);   /* low[63:32]  */
+        vm_write_be32(ptr + 12, 0);   /* low[31:0]   */
+    }
+    ctx->gpr[3] = 0;   /* CELL_OK */
+    return 0;
 }
 
 /* sys_spu_initialize(nspu, nrawspu) — one-shot global init */
@@ -437,6 +500,7 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     /* Read entry point from the SPU image struct if available.
      * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
+    t->img_ea    = img_ea;
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
 
@@ -499,12 +563,26 @@ static DWORD WINAPI spu_fallback_thread_proc(LPVOID arg)
 static void* spu_fallback_thread_proc(void* arg)
 #endif
 {
+#ifdef _WIN32
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+#endif
     spu_thread_t* t = (spu_thread_t*)arg;
     int32_t rc = 0;
     if (t->fb_handler) {
         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
     }
     t->exit_status = rc;
+    /* EXPERIMENT (RD_SPU_DONE_EVENT): on SPU thread completion, deliver an event
+     * to the connected queue -- PPU code may block in sys_event_queue_receive for
+     * the SPU's completion signal (which normally comes from a WrOutIntrMbox the
+     * SPU issues before finishing). Tests whether the render hang is that wait. */
+    if (getenv("RD_SPU_DONE_EVENT") && t->connected_queue) {
+        extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        sys_event_queue_push_by_id(t->connected_queue,
+            ((uint64_t)t->tid << 32) | 0x2u, (uint64_t)(uint32_t)rc, 0, 0);
+        fprintf(stderr, "[SPU-DONE-EVT] tid=0x%X rc=0x%X -> queue=%u\n",
+                t->tid, rc, t->connected_queue);
+    }
     /* Mark complete and signal anyone waiting in group_join. */
 #ifdef _WIN32
     t->running = 0;
@@ -518,6 +596,83 @@ static void* spu_fallback_thread_proc(void* arg)
     pthread_mutex_unlock(&t->finish_event.mu);
     return NULL;
 #endif
+}
+
+/* Load a sys_spu_image's segments into a 256 KB local store. COPY segments
+ * (type 1) are memcpy'd from their guest source EA; FILL segments (type 2) are
+ * zeroed. Mirrors sys_spu_image_import's segment layout {type,ls_start,size,
+ * src(pa64)} (0x18 bytes each). Returns the entry point, or 0 on failure. */
+static uint32_t spu_load_image_to_ls(uint32_t img_ea, uint8_t* ls)
+{
+    if (!img_ea || !ls || !vm_base) return 0;
+    uint32_t entry = vm_read_be32(img_ea + 4);
+    uint32_t segs  = vm_read_be32(img_ea + 8);
+    uint32_t nsegs = vm_read_be32(img_ea + 12);
+    for (uint32_t s = 0; s < nsegs && s < 64; s++) {
+        uint32_t b        = segs + s * 0x18;
+        uint32_t type     = vm_read_be32(b + 0x00);
+        uint32_t ls_start = vm_read_be32(b + 0x04) & (SPU_LS_SIZE - 1);
+        uint32_t size     = vm_read_be32(b + 0x08);
+        uint32_t src_lo   = vm_read_be32(b + 0x14);
+        if (ls_start + size > SPU_LS_SIZE) size = SPU_LS_SIZE - ls_start;
+        if (type == 1 && src_lo)              /* COPY: guest EA -> LS */
+            memcpy(ls + ls_start, vm_base + src_lo, size);
+        else if (type == 2)                   /* FILL: zero */
+            memset(ls + ls_start, 0, size);
+    }
+    return entry;
+}
+
+/* PPU-fallback that runs an un-lifted SPU thread via the interpreter. Registered
+ * for the currently-instant-completing thread groups when RD_SPU_INTERP is set
+ * (see group_start). Loads the thread's image into its LS and interprets from
+ * the entry point; DMA/mailbox/event ops go through the shared channel ABI. */
+static uint8_t* spu_thread_get_or_alloc_ls(spu_thread_t* t);   /* fwd (defined below) */
+static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
+                                   uint32_t args_size, void* user)
+{
+    (void)args_size; (void)user;
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) return -1;
+    uint8_t* ls = spu_thread_get_or_alloc_ls(t);
+    if (!ls) return -1;
+    uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
+    if (getenv("RD_SPU_ARGS") && vm_base && args_ea) {
+        fprintf(stderr, "[SPU-ARGS] tid=0x%X args@0x%08X:", tid, args_ea);
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %08X", vm_read_be32(args_ea + i*4));
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "[SPU-INTERP] tid=0x%X entry=0x%05X img=0x%08X args=0x%08X -> interpreting\n",
+            tid, entry, t->img_ea, args_ea);
+    int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1,  /* pure interp: no fast-path rejoin */
+                                    t->tid, t->group_id, 0); /* identify for mbox->event delivery */
+    { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+      fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
+              tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
+    return sc;
+}
+
+/* Per-frame sim-SPU dispatch. The game runs its SPU jobs as persistent workers:
+ * after init they stop, then each frame the game event-port-sends a work-
+ * descriptor EA and waits on the SPU's completion queue. Re-run the SPU whose
+ * connected completion queue is `comp_queue`, feeding `work_ea` into its inbound
+ * mailbox (its first rdch InMbox), so it DMAs that frame's descriptor, computes,
+ * and signals completion -- satisfying the PPU's wait. Returns 1 if dispatched. */
+int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
+{
+    if (!getenv("RD_SPU_INTERP")) return 0;
+    for (uint32_t i = 0; i < MAX_SPU_THREADS; i++) {
+        spu_thread_t* t = &s_spu_threads[i];
+        if (!t->in_use || t->connected_queue != comp_queue || !t->img_ea) continue;
+        uint8_t* ls = spu_thread_get_or_alloc_ls(t);
+        if (!ls) return 0;
+        uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
+        fprintf(stderr, "[SPU-FRAME] tid=0x%X q=%u work=0x%08X -> re-run\n",
+                t->tid, comp_queue, work_ea);
+        spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id, work_ea);
+        return 1;
+    }
+    return 0;
 }
 
 /* sys_spu_thread_group_start(id) */
@@ -563,6 +718,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (!t->in_use) continue;
         void* user = NULL;
         spu_ppu_fallback_fn fb = spu_lookup_ppu_fallback(t->entry_point, &user);
+        if (!fb && getenv("RD_SPU_INTERP") && t->img_ea) {
+            /* No lifted fallback: interpret the image instead of instant-
+             * completing. Additive + env-gated so it can't destabilize titles
+             * that rely on a registered fallback. */
+            fb = spu_interp_fallback;
+            user = NULL;
+        }
         if (!fb) {
             t->exit_status = 0;
             t->running = 0;
@@ -572,6 +734,20 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         t->fb_handler = fb;
         t->fb_user    = user;
         t->running    = 1;
+        /* Interpreted sim jobs are fire-and-forget compute (DMA in -> compute ->
+         * DMA out -> stop) that don't block on PPU input mid-run. Running them on
+         * an async host thread races the PPU's own use of the results (e.g. the
+         * ducky's initShaders aborts nondeterministically). Run them SYNCHRONOUSLY
+         * here so group_start returns only after the SPU has finished and written
+         * its output -- deterministic, and matches how the PPU expects to consume
+         * the results right after start/join. (RD_SPU_INTERP_ASYNC forces the old
+         * async path if a job ever needs to overlap with the PPU.) */
+        if (fb == spu_interp_fallback && !getenv("RD_SPU_INTERP_ASYNC")) {
+            t->exit_status = fb(t->tid, t->args_ea, t->args_size, user);
+            t->running = 0;
+            instant++;
+            continue;
+        }
 #ifdef _WIN32
         /* Manual-reset event so multiple group_join callers all see "set" */
         if (!t->finish_event)
@@ -1063,8 +1239,13 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
         vm_write_be32(seg + 0x00, 1);                           /* SYS_SPU_SEGMENT_TYPE_COPY */
         vm_write_be32(seg + 0x04, p_va);                        /* ls_start   */
         vm_write_be32(seg + 0x08, p_fsz);                       /* size       */
-        vm_write_be32(seg + 0x10, 0);                           /* src_pa hi  */
-        vm_write_be32(seg + 0x14, src_ea + p_off);              /* src_pa lo  */
+        /* sys_spu_segment.src is a u32 EA at +0x10 (not a BE u64 hi/lo pair):
+         * LBP's FMOD overlay loader reads read32(seg+0x10) as the DMA source,
+         * so the address must sit at +0x10. Putting it at +0x14 (as a u64 lo)
+         * left +0x10 zero -> overlays DMA'd from NULL -> empty LS -> unresolved
+         * branch. +0x14 kept = addr too, harmless for any u64-lo reader. */
+        vm_write_be32(seg + 0x10, src_ea + p_off);              /* src EA (@+0x10) */
+        vm_write_be32(seg + 0x14, src_ea + p_off);
         nsegs++;
 
         if (p_msz > p_fsz && nsegs < 32) {                      /* BSS tail -> FILL 0 */
@@ -1087,6 +1268,57 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
 
     fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -> entry=0x%05X nsegs=%d\n",
             img_ea, src_ea, entry, nsegs);
+    /* LBP_DUMP_IMPORT=<dir>: save each unique imported ELF (FMOD's runtime-
+     * materialized SPU overlay plugins) so they can be lifted + registered.
+     * Extent = max(p_off+p_fsz) over PT_LOADs, re-walked here cheaply. */
+    { const char* dd = getenv("LBP_DUMP_IMPORT");
+      if (dd && *dd) {
+          static uint32_t s_seen[16]; static int s_nseen = 0;
+          int dup = 0;
+          for (int k = 0; k < s_nseen; k++) if (s_seen[k] == src_ea) dup = 1;
+          if (!dup && s_nseen < 16) {
+              s_seen[s_nseen++] = src_ea;
+              uint32_t ext = 0x40;
+              for (uint16_t i2 = 0; i2 < phnum; i2++) {
+                  uint32_t ph2 = phoff + (uint32_t)i2 * phentsz;
+                  if (vm_read_be32(src_ea + ph2 + 0x00) != 1) continue;
+                  uint32_t end2 = vm_read_be32(src_ea + ph2 + 0x04) + vm_read_be32(src_ea + ph2 + 0x10);
+                  if (end2 > ext) ext = end2;
+              }
+              uint32_t shend = vm_read_be32(src_ea + 0x20) +
+                               (uint32_t)vm_read_be16(src_ea + 0x2E) * vm_read_be16(src_ea + 0x30);
+              if (shend > ext && shend < 0x400000) ext = shend;
+              char path[512];
+              snprintf(path, sizeof path, "%s/import_%08X.elf", dd, src_ea);
+              FILE* fo = fopen(path, "wb");
+              if (fo) { fwrite(vm_base + src_ea, 1, ext, fo); fclose(fo);
+                        fprintf(stderr, "[SPU] import dumped: %s (%u bytes)\n", path, ext); }
+          }
+      } }
+#ifdef _WIN32
+    /* LBP retries this import in a tight loop (134x observed) with no other
+     * syscall in between -- something it derives from the filled struct keeps
+     * it unsatisfied. Print the guest caller chain for the first few so the
+     * retry loop can be identified. */
+    { static int _bt_n = 0;
+      if (_bt_n++ < 3) {
+          /* Matches func_entry in the generated ppu_recomp.h. */
+          struct lv2_bt_fentry { uint64_t addr; void* func; const char* name; };
+          extern const struct lv2_bt_fentry function_table[];
+          extern const uint64_t function_table_count;
+          void* bt[24]; unsigned short fr = RtlCaptureStackBackTrace(0, 24, bt, 0);
+          char ln[800]; int p = snprintf(ln, sizeof ln, "[SPU]   import bt:");
+          for (int i = 0; i < fr; i++) {
+              uintptr_t t = (uintptr_t)bt[i]; uint32_t bg = 0; uintptr_t bh = 0;
+              for (uint64_t k = 0; k < function_table_count; k++) {
+                  uintptr_t h = (uintptr_t)function_table[k].func;
+                  if (h <= t && h > bh) { bh = h; bg = (uint32_t)function_table[k].addr; }
+              }
+              if (bg && (t - bh) < 0x14000) p += snprintf(ln + p, sizeof(ln) - p, " %08X", bg);
+          }
+          fprintf(stderr, "%s\n", ln);
+      } }
+#endif
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -1212,6 +1444,10 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
      * unimplemented return derails the CRT init table-walk into abort(). Alias it. */
     lv2_syscall_register(tbl, 988, sys_tty_write);
 
+    /* sys_ss_get_open_psid (console PSN/NP identity) — LBP 1.30 reads it during
+     * boot; the unimplemented stub left the out-param as garbage. */
+    lv2_syscall_register(tbl, 872, sys_ss_get_open_psid_handler);
+
     /* SPU syscalls — we don't execute SPU code but the PPU-side wrappers
      * need consistent IDs and out-params. See the stateful group tracker
      * above for contract notes. */
@@ -1256,9 +1492,36 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
  * -----------------------------------------------------------------------*/
 lv2_syscall_table g_lv2_syscalls;
 
+/* Firmware imports that are ALSO lv2 syscalls.
+ *
+ * A title can reach these two ways: issue the raw `sc` (-> the syscall table
+ * above) or call the sysPrxForUser userland wrapper by NID (-> ps3_hle_call).
+ * LBP does the latter, and an unregistered NID falls to the unresolved-NID
+ * stub, which returns CELL_OK WITHOUT touching the caller's out-params -- so
+ * the caller reads its own uninitialised stack as the result. For
+ * sys_spu_image_import that means a garbage sys_spu_image {segs, nsegs}, and
+ * the caller (LBP func_00483498) then walks the bogus segment array until it
+ * runs off the end of memory: on hardware that segfaults immediately, but our
+ * demand-committed flat VM answers every stray read with a zero page, so it
+ * silently swept ~3 GB of address space and hung the boot.
+ *
+ * Bridge them onto the NID path so both entries hit the same implementation.
+ * The handlers already take the ppu_context and set gpr[3] themselves. */
+extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+
+#define LV2_HLE_BRIDGE(fn_name, handler)                                       static void fn_name(ppu_context* ctx) { (void)handler(ctx); }
+
+LV2_HLE_BRIDGE(hle_sys_spu_image_import, sys_spu_image_import_handler)
+LV2_HLE_BRIDGE(hle_sys_spu_image_open,   sys_spu_image_open_handler)
+
 void lv2_init_syscalls(void)
 {
     lv2_register_all_syscalls(&g_lv2_syscalls);
+
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spu_image_import"),
+                         "sys_spu_image_import", hle_sys_spu_image_import);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spu_image_open"),
+                         "sys_spu_image_open",   hle_sys_spu_image_open);
 }
 
 /* Returns 1 (and sets gpr[3] from the handler) if `num` is a registered

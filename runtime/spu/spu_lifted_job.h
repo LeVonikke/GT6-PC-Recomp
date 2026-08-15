@@ -14,10 +14,65 @@
 #define SPU_LIFTED_JOB_H
 
 #include "spu_context.h"
+#include "spu_interp.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
+
+/* Run an UN-LIFTED SPU image via the interpreter. Same context/LS/ABI bring-up
+ * as spu_run_lifted_job (r1 = LS top, LS in/out, raw-thread arg EA in r3), but
+ * the engine is the interpreter fetching from live local store — so a title's
+ * SPU jobs run without lifting them first. The channel/DMA ABI (spu_wrch/rdch,
+ * MFC) is shared, so DMA, mailboxes, and event signalling behave identically.
+ * Returns the SPU's stop code. */
+/* inmbox_val: if nonzero, pre-loads the SPU inbound mailbox so the job's first
+ * `rdch SPU_RdInMbox` returns it -- this is how a persistent-worker sim SPU
+ * receives its per-frame work-descriptor EA (delivered by the game's per-frame
+ * event-port send). 0 for the initial group_start run. */
+static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc,
+                                         uint32_t args_ea, int image_id,
+                                         uint32_t spu_id, uint32_t group_id,
+                                         uint32_t inmbox_val)
+{
+    extern uint8_t* vm_base;
+    spu_context ctx;
+    spu_context_init(&ctx, 0);
+    if (inmbox_val) spu_channel_write(&ctx.ch_in_mbox, inmbox_val);
+    /* Identify the context as the real thread so a WrOutMbox/WrOutIntrMbox the
+     * SPU issues reaches the RIGHT connected event queue: g_spu_out_mbox_hook ->
+     * ydkj_spu_out_mbox_deliver looks the thread up by spu_id. Left at 0 (the
+     * spu_context_init default), delivery finds no thread and silently drops the
+     * event -- which is why the sim SPUs' natural completion signals never woke
+     * the waiting PPU. */
+    ctx.spu_id       = spu_id;
+    ctx.spu_group_id = group_id;
+    ctx.image_id = image_id;
+    ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;       /* SPU stack top, 16B aligned */
+    if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);
+    /* Raw-SPU-thread ABI: sys_spu_thread_argument is 4 u64s (arg1..arg4) passed
+     * in r3..r6. Each is a 64-bit effective address the SPU treats as the pair
+     * {word0 = EA-low, word1 = EA-high}: DMA code writes MFC_EAL from word0 and
+     * asserts (dma.h) that word1 (EA-high) is 0 (main memory is 32-bit
+     * addressable). So the low 32 bits of the guest u64 go in word0, high in
+     * word1 -- NOT the plain big-endian doubleword order (which would put the EA
+     * in word1 and trip the assert on any real pointer arg). */
+    if (args_ea && vm_base) {
+        for (int i = 0; i < 4; i++) {
+            const uint8_t* p = vm_base + args_ea + i * 8;
+            uint32_t hi = ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+            uint32_t lo = ((uint32_t)p[4]<<24)|((uint32_t)p[5]<<16)|((uint32_t)p[6]<<8)|p[7];
+            ctx.gpr[3 + i]._u32[0] = lo;
+            ctx.gpr[3 + i]._u32[1] = hi;
+        }
+    } else {
+        ctx.gpr[3]._u32[0] = args_ea;
+    }
+    spu_interp_run(&ctx, entry_pc);
+    if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
+    return (int32_t)ctx.stop_code;
+}
 
 /* Run a lifted SPU job. `local_store` (256 KB, may be NULL) is the SPU thread's
  * local store; it is brought into the context, the job's arg EA is placed in r3
@@ -54,6 +109,13 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * negative -> garbage stack -> null function pointers -> branch to LS 0. */
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* 0x3FFF0 for a 256KB LS */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
+    /* A SpursTasksetContext at LS 0x2700 (built by spurs_pm_build_context) writes
+     * syscallAddr=0xA70 at STC_SYSCALL_ADDR (0x27C4). That sentinel means "this is
+     * a generic SPURS taskset task" (LBP's audio SPEEX/MultiStream tasks) -- flOw
+     * jobs never plant it, so keying off it cannot change their behaviour. */
+    #define _LB(o) (((uint32_t)ctx.ls[(o)]<<24)|((uint32_t)ctx.ls[(o)+1]<<16)| \
+                    ((uint32_t)ctx.ls[(o)+2]<<8)|ctx.ls[(o)+3])
+    int taskset_ctx = (_LB(0x27C4) == 0xA70u);
     if (spurs_task_abi) {
         if (r3_override) {
             ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle      */
@@ -70,6 +132,14 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
              * to 0 and FAILS the gate -> no decode, no DMA. Use 0x00400000. */
             ctx.gpr[3]._u32[0] = 0x00400000u;   /* >>16 == 64 -> cri real decode path */
             ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
+        } else if (taskset_ctx) {
+            /* Generic SPURS task (RPCS3 spursTasksetStartTask): r3 = the task's
+             * 16-byte CellSpursTaskArgument (TaskInfo.args, DMA'd to LS 0x2780 by
+             * spurs_pm_build_context), passed by value -- NOT the cri 0x40 marker. */
+            ctx.gpr[3]._u32[0] = _LB(0x2780);
+            ctx.gpr[3]._u32[1] = _LB(0x2784);
+            ctx.gpr[3]._u32[2] = _LB(0x2788);
+            ctx.gpr[3]._u32[3] = _LB(0x278C);
         } else {
             ctx.gpr[3]._u32[0] = 0x00400000u;   /* 0x40 marker (>>16==64), DMA tag 0 */
             ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
@@ -86,16 +156,22 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * (planted by spurs_pm_build_context). Without it the leaf reads a garbage SPURS base
      * and DMAs from a bad address / bails at init. Set for image 22 (cri) when the context
      * carries a non-zero spurs ptr. */
-    if (spurs_task_abi && image_id == 22) {
-        #define LB(o) (((uint32_t)ctx.ls[(o)]<<24)|((uint32_t)ctx.ls[(o)+1]<<16)|((uint32_t)ctx.ls[(o)+2]<<8)|ctx.ls[(o)+3])
-        uint32_t spurs_lo = LB(0x2764);
+    if (spurs_task_abi && (image_id == 22 || taskset_ctx)) {
+        uint32_t spurs_lo = _LB(0x2764);
         if (spurs_lo) {
-            ctx.gpr[4]._u32[0] = LB(0x2768);   /* args hi (d0) */
-            ctx.gpr[4]._u32[1] = LB(0x276C);   /* args lo      */
-            ctx.gpr[4]._u32[2] = LB(0x2760);   /* spurs hi (d1)*/
+            ctx.gpr[4]._u32[0] = _LB(0x2768);  /* args hi (d0) */
+            ctx.gpr[4]._u32[1] = _LB(0x276C);  /* args lo      */
+            ctx.gpr[4]._u32[2] = _LB(0x2760);  /* spurs hi (d1)*/
             ctx.gpr[4]._u32[3] = spurs_lo;     /* spurs lo = CellSpurs EA */
         }
-        #undef LB
+    }
+    #undef _LB
+    if (taskset_ctx && getenv("LBP_TASKSET_TRACE")) {
+        fprintf(stderr, "[taskset] run image=%d r3=%08X %08X %08X %08X "
+                "r4=%08X %08X %08X %08X\n", image_id,
+                ctx.gpr[3]._u32[0], ctx.gpr[3]._u32[1], ctx.gpr[3]._u32[2], ctx.gpr[3]._u32[3],
+                ctx.gpr[4]._u32[0], ctx.gpr[4]._u32[1], ctx.gpr[4]._u32[2], ctx.gpr[4]._u32[3]);
+        fflush(stderr);
     }
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
       spu_run_with_halt(entry, &ctx); }                         /* run with halt pad   */

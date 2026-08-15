@@ -10,8 +10,10 @@
  * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
  */
 
+#include <time.h>
 #include "cellPad.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -399,10 +401,36 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
      * GetData) -- if it's parked on a "press button" prompt after loading, no
      * host input means it waits forever. Inject a real button PULSE (CROSS+START+
      * CIRCLE) so it advances. Legit input simulation, not forged pixels. */
-    if (getenv("YDKJ_INJECT_PAD") && port_no < PAD_MAX_HOST_PORTS) {
+    /* NOTE: cache getenv() -- this runs on every poll from multiple threads, and the
+     * uncached version crashed deterministically (varying fault address = race). Every
+     * other probe in this tree uses the cached `static int x=-1` pattern; match it. */
+    static int  s_inj   = -1;
+    static u16  s_btn   = 0x0008u;   /* default START */
+    static long s_delay = 3000;
+    if (s_inj < 0) {
+        s_inj = getenv("YDKJ_INJECT_PAD") ? 1 : 0;
+        const char* be = getenv("YDKJ_PAD_BTN");   if (be) s_btn   = (u16)strtoul(be,0,0);
+        const char* de = getenv("YDKJ_PAD_DELAY"); if (de) s_delay = strtol(de,0,0);
+    }
+    /* Gate on WALL-CLOCK, not poll count: the game polls the pad hundreds of thousands
+     * of times inside an early wait loop, so any count-based delay fires during init
+     * (crash: guest ctr=0x0005F8A0 r3=0 -- button handler on an unconstructed object).
+     * YDKJ_PAD_DELAY is now SECONDS to wait before the first injected press. */
+    if (s_inj && port_no < PAD_MAX_HOST_PORTS) {
         static long _pc = 0; _pc++;
-        const char* be = getenv("YDKJ_PAD_BTN"); u16 btn = be ? (u16)strtoul(be,0,0) : 0x0008u; /* default START */
-        long delay = 3000; const char* de = getenv("YDKJ_PAD_DELAY"); if(de) delay = strtol(de,0,0);
+        /* Cheap counter gate FIRST: clock() is a slow call and this poll loop is hammered
+         * by the guest from multiple threads; sampling it every poll perturbs timing. Only
+         * consult the clock once every 256 polls, and never after arming. */
+        static int     s_armed = 0;
+        static clock_t s_t0    = 0;
+        if (!s_armed) {
+            if ((_pc & 0xFF) == 0) {
+                if (!s_t0) s_t0 = clock();
+                else if ((double)(clock() - s_t0) / (double)CLOCKS_PER_SEC >= (double)s_delay) s_armed = 1;
+            }
+            goto skip_inject;
+        }
+        u16 btn = s_btn; long delay = 0;
         /* Delay past init, then a single clean pulse every ~180 calls (press 15, release 165). */
         if (_pc > delay) {
             long ph = (_pc - delay) % 180;
@@ -411,6 +439,7 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
             s_host_state[port_no].connected = 1;
         }
     }
+skip_inject: ;
 
     if (port_no >= PAD_MAX_HOST_PORTS || (!s_host_state[port_no].connected && port_no != 0)) {
         goto emit;   /* data stays zeroed -> len=0 */
@@ -440,6 +469,19 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
      * (via sagemono, PR #42) */
     data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = (u16)(hs->buttons & 0xFF);
     data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = (u16)((hs->buttons >> 8) & 0xFF);
+
+    /* LBP_AUTOPRESS: headless bring-up input -- pulse CROSS then START every few
+     * seconds of polling so boot screens that wait for input advance without a
+     * human at the pad. Env-gated test scaffolding, off by default. */
+    { static int s_ap = -1; static unsigned s_apn = 0;
+      if (s_ap < 0) s_ap = getenv("LBP_AUTOPRESS") ? 1 : 0;
+      if (s_ap && port_no == 0) {
+          unsigned ph = s_apn++ % 240;
+          if (ph < 12)
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= 0x40;   /* CROSS */
+          else if (ph >= 120 && ph < 132)
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= 0x08;   /* START */
+      } }
 
     /* Analog sticks */
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
@@ -559,6 +601,65 @@ s32 cellPadGetInfo2(CellPadInfo2* info_guest)
         for (unsigned int _o = 0; _o < sizeof(CellPadInfo2); _o += 4)
             vm_write32((unsigned long long)ea + _o, *(u32*)((char*)info + _o));
     }
+    return CELL_OK;
+}
+
+/* cellPadPeriphGetInfo -- the peripheral-class view of the pad ports (NID
+ * 0x4CC9B68D). LBP polls this during boot; leaving it unresolved returned
+ * CELL_OK with the caller's CellPadPeriphInfo left as uninitialised stack
+ * garbage, so the game read junk port_status/pclass_type for all 7 ports.
+ *
+ * Layout (SDK cell/pad/pad_codes.h) -- all u32, so the whole struct marshals
+ * big-endian in one sweep like cellPadGetInfo2:
+ *   max_connect, now_connect, system_info,
+ *   port_status[7], port_setting[7], device_capability[7],
+ *   device_type[7], pclass_type[7], pclass_profile[7]
+ * We report a standard DUALSHOCK-class pad (pclass_type STANDARD = 0, no
+ * profile bits) mirroring the ports cellPadGetInfo2 already reports. */
+s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (!info_guest)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+
+    pad_poll_backend();
+
+    CellPadPeriphInfo _in; CellPadPeriphInfo* info = &_in;
+    memset(info, 0, sizeof(CellPadPeriphInfo));
+    info->max_connect = s_max_connect;
+    info->system_info = 0;
+
+    u32 connected = 0;
+    for (u32 i = 0; i < s_max_connect && i < CELL_PAD_MAX_PORT_NUM; i++) {
+        /* Same virtual-pad-on-port-0 rule as cellPadGetInfo2, so both views of
+         * the ports agree (a game that cross-checks them must see one truth). */
+        if ((i < PAD_MAX_HOST_PORTS && s_host_state[i].connected) || i == 0) {
+            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED;
+            info->port_setting[i]      = s_port_setting[i];
+            info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
+                                       | CELL_PAD_CAPABILITY_PRESS_MODE
+                                       | CELL_PAD_CAPABILITY_SENSOR_MODE
+                                       | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
+                                       | CELL_PAD_CAPABILITY_ACTUATOR;
+            info->device_type[i]       = CELL_PAD_DEV_TYPE_STANDARD;
+            info->pclass_type[i]       = CELL_PAD_PCLASS_TYPE_STANDARD;
+            info->pclass_profile[i]    = 0;
+            connected++;
+        } else {
+            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED;
+        }
+    }
+    info->now_connect = connected;
+
+    { unsigned int ea = (unsigned int)(uintptr_t)info_guest;
+      for (unsigned int _o = 0; _o < sizeof(CellPadPeriphInfo); _o += 4)
+          vm_write32((unsigned long long)ea + _o, *(u32*)((char*)info + _o)); }
+
+    { static int _n = 0;
+      if (_n++ < 2)
+          printf("[cellPad] PeriphGetInfo(max=%u now=%u) -> STANDARD class\n",
+                 info->max_connect, connected); }
     return CELL_OK;
 }
 

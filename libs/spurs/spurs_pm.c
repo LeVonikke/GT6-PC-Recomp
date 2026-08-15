@@ -76,11 +76,49 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
     LS_BE32(STC_KERNEL_MGMT_ADDR, 0x100);
     LS_BE32(STC_SYSCALL_ADDR,     CELL_SPURS_TASKSET_PM_SYSCALL_ADDR);
 
+    /* SPURS KERNEL context (LS 0x100..0x1FF): the SPU task library's fast-path
+     * validation reads fields the real kernel + taskset PM populate there.
+     * moduleId @0x1E4 must be "TK" (stamped by the taskset PM, RPCS3
+     * spursTasksetInit) -- without it every task-API wait (event flag / queue)
+     * fails its context check with ERROR_STAT 0x80410909: LBP's binkspu movie
+     * IO task spun forever on exactly that, so BinkWait never completed and
+     * the intro never produced a frame. Also plant the spurs instance ptr
+     * (@0x1C0, read from the taskset header) + spuNum/dmaTagId, which the
+     * library reads next to the moduleId. */
+    {
+        uint32_t spurs_lo = vm_read32(taskset_ea + 0x64);   /* be64 spurs @0x60 */
+        LS_BE64(0x1C0, (uint64_t)spurs_lo);
+        LS_BE32(0x1C8, spuNum);
+        LS_BE32(0x1CC, dmaTagId);
+        /* The task library's fast-path check FSMs on the halfword at 0x1E8
+         * (ceqh of rotqbyi(LS[0x1E0],6), select-mask bit -> word0); stamp the
+         * neighboring slots too -- they are all inside the moduleId/pad area
+         * the real PM owns and nothing else reads them. */
+        ls[0x1E4] = 'T'; ls[0x1E5] = 'K';
+        ls[0x1E6] = 'T'; ls[0x1E7] = 'K';
+        ls[0x1E8] = 'T'; ls[0x1E9] = 'K';
+    }
+
     /* DMA the selected task's TaskInfo (48 bytes) into LS 0x2780 (the kernel temp area).
      * Read each word BE and re-store BE -> the raw bytes are preserved verbatim. */
     uint32_t ti = spurs_taskset_taskinfo_ea(taskset_ea, taskId);
     for (int o = 0; o < TI_SIZE; o += 4)
         LS_BE32(STC_TEMP_TASKINFO + o, vm_read32(ti + o));
+
+    /* Force a FULL-COVERAGE ls pattern (TaskInfo +0x20, 128 bits). The real
+     * taskset PM computes a precise bitmask of the 2KB LS blocks the task's
+     * context occupies, and the SPU task library refuses any blocking wait
+     * whose pattern doesn't cover the task's stack (error 0x8041090F). We run
+     * each task in its OWN full 256KB local store (never sharing LS between
+     * tasks), so every block IS the task's -- an all-ones pattern is the
+     * accurate description of our execution model, not a fake. Without it a
+     * wait-capable task (LBP's binkspu movie IO) spun forever and the intro
+     * movie never decoded a frame. The game's own pattern reaches us mangled
+     * anyway (its lsPattern EA arrives unaligned through the attribute ABI). */
+    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x0, 0xFFFFFFFFu);
+    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x4, 0xFFFFFFFFu);
+    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x8, 0xFFFFFFFFu);
+    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0xC, 0xFFFFFFFFu);
 
     return vm_read64(ti + TI_ELF);       /* caller masks elf & ~7 to load */
     #undef LS_BE32

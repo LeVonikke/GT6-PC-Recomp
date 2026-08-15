@@ -158,6 +158,9 @@ RI10_TABLE: dict[int, str] = {
     0b01011110: "clgtbi", # compare logical greater than byte immediate
     0b01110100: "mpyi",   # multiply immediate
     0b01110101: "mpyui",  # multiply unsigned immediate
+    0b01111111: "heqi",   # halt if equal word immediate      (assert-style trap)
+    0b01001111: "hgti",   # halt if greater than word immediate
+    0b01011111: "hlgti",  # halt if logically greater than word immediate
     # NOTE: the rotate/shift IMMEDIATE forms (roti/rotmi/rotmai/shli/rothi/
     # rothmi/rotmahi/shlhi) are RI7 (op11 0x78-0x7f), NOT RI10 — they are
     # handled in the ri7_table inside spu_decode(). The old spurious RI10
@@ -549,6 +552,15 @@ def spu_decode(insn: int, addr: int = 0) -> SPUInstruction:
             return result
         # nop/sync/dsync: no real operand consumed by the ISA semantics.
         if mne in ("lnop", "nop", "sync", "dsync"):
+            # sync carries a C feature bit (BE bit 11 => mask 1<<20): channel
+            # synchronization before instruction synchronization (SPU ISA v1.2
+            # 'Synchronize' page; spu_disasm_audit.py notes the oracle calls it
+            # syncc). Was silently folded into plain sync, losing the bit
+            # before the lifter could act on it. The lifter handles "syncc"
+            # (spu_lifter.py sync family) -- keep these two in lockstep
+            # (LESSONS #11c).
+            if mne == "sync" and (insn & 0x00100000):
+                result.mnemonic = "syncc"
             return result
 
         # Single-operand

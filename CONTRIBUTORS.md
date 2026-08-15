@@ -114,6 +114,27 @@ were silent-miscompile classes rather than crashes:
   (#67); `sys_spu_thread_group_create` reads r5 as priority and the name from the
   attr struct (#66).
 
+*Also incorporated (unreleased, folded via `integrate/fold-2026-08-14`)* — a
+guest-ABI and lv2 batch:
+- **Guest callbacks receive r3 through r10** — the dispatch hook only plumbed
+  four arguments, so any guest callback taking more than four read stale
+  registers (#86).
+- **One authoritative lv2 semaphore count** — the count lived twice (in
+  `sys_semaphore_info::value` and in the Win32 handle), so timeout/wake races
+  could lose tokens or park a waiter while `value` was already positive. `value`
+  under `value_lock` is now the only count, the handle is a wake channel, and
+  overflow returns the lv2 `CELL_EBUSY` instead of `CELL_EINVAL` (#88).
+- **`cellFsReaddir` writes the real 258-byte dirent ABI** + a corrected CellOS
+  generic error-code table (#85).
+- **`cellGame` firmware parameter IDs, error values and buffer bounds** matched
+  to the SDK (#84).
+- **SPU `sync`/`dsync`/`syncc` emit real host memory fences**, with the `sync` C
+  bit decoded instead of folded into plain `sync` (#87).
+- **`cellAudio` clears each consumed ring-buffer block**, so an underrun replays
+  silence rather than the previous block (#83).
+- Plus the **`sync_stress` lv2 target wired into the build**, so the semaphore
+  behaviour above stays executable outside a generated title (#88).
+
 ### Jonathan Del Corpo — [@JonathanDC64](https://github.com/JonathanDC64)
 Correctness and robustness fixes distilled from a **Demon's Souls** port that
 stress-tested the toolkit against a ~106k-function title. The title-agnostic wins
@@ -200,6 +221,36 @@ homebrew TUI (cellmark), vkcube, wave, and a PSL1GHT/Tiny3D bring-up
   plus the fused-fmadd / PPC NaN / `mfspr`/`mtspr` semantics it surfaced.
 - **`sys_spu_image_import`** implemented (SPU ELF → entry point + segment table)
   and the SPU image syscall numbers corrected (#57).
+
+A **guest-ABI HLE correctness batch**, mostly surfaced by LBP and DeferredShading
+bring-ups (folded via `integrate/fold-2026-07-24`):
+- **Guest-EA / big-endian out-param marshalling** across the HLE surface — a run
+  of handlers were writing host pointers or native-endian values into what are
+  actually guest VM addresses: `cellUserInfo` (overflow), trophy u64s,
+  `cellGameGetParamInt` DISC type, open PSID, `cellRtc`, save-data user paths,
+  `cellJpgDecDecodeData`, `cellPngDec` (first live use, DeferredShading), and the
+  `cellAudio` read index as a BE u64.
+- **`cellFsSdataOpen` with real SDATA/EDAT (NPD) decryption**, `cellFsMkdir` + the
+  game-data dir created where the VFS actually looks, and a `/dev_hdd0` overlay
+  onto the installed-update tree (`PS3_HDD0_ROOT`).
+- **Honest state, not silently-faked CELL_OK** — a module name that matches no
+  file now fails; net reports a real offline state with real SDK NP error codes;
+  `sys_time_get_system_time` returns real microseconds instead of a call counter.
+- **Raw-`sys_fs` path parity** — strip mount prefixes so raw `sys_fs` opens hit
+  the same host tree as the cellFs layer; `cellHttpCreateClient` guest-EA
+  translation (fixed a boot crash); HLSL-safe NaN/Inf fragment-program constants;
+  `sys_spu_image_import` segment source EA at the correct offset.
+
+The **SPU-lifter "faithful adoption"** (branch `spu/faithful-adopt-caner`, folded
+via `integrate/faithful-adopt-caner`) — a from-scratch re-implementation of the
+SPU decode/lift + runtime, consolidating the interpreter and function registry
+into `spu_channels.c`, plus LBP SPU/SPURS bring-up and RSX texture support
+(G8B8/DXT, deswizzle). **This work re-adopts the original SPU decoder/lifter and
+runtime that [@sp00nznet](https://github.com/sp00nznet) and
+[@canersaka](https://github.com/canersaka) authored** — their commit history for
+that work stands on its own (the `caner/ppu-*`, `c6*/c7*`, and the core SPU
+subsystem commits); the faithful-adoption branch is a parallel re-derivation, and
+credit for the underlying design belongs to them.
 
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated

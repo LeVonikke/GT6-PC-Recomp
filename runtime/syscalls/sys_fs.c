@@ -82,17 +82,67 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
     }
 
-    /* /app_home/ is the game's install dir (== the USRDIR root); the title opens
-     * it in several spellings ("/app_home/...", "app_home/...", "e:/app_home/...").
-     * Map anything from "app_home/" onward to <root>/... directly rather than
-     * appending a literal "app_home" directory that doesn't exist on disk. */
+    /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there
+     * for a disc title patched to e.g. v1.30) -- mirror ppu_fs.cpp host_path.
+     * PS3_HDD0_ROOT = host dir that /dev_hdd0 maps into (contains game/<title>/). */
+    {
+        static const char* hdd0_root = NULL; static int hdd0_init = 0;
+        if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
+        if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10);
+            fs_normalize_sep(host_path);
+            return;
+        }
+    }
+
+    /* Strip a known mount prefix so this sys_fs layer resolves to the SAME host
+     * tree as the cellFs layer (ppu_fs.cpp host_path). Previously /dev_bdvd/X
+     * mapped to <root>/dev_bdvd/X -- a directory that doesn't exist -- so a title
+     * that opens disc content through the raw sys_fs path (LBP's Bink videos,
+     * e.g. gamedata/videos/localisation_test.bik) failed even though the file is
+     * present, stalling the loader waiting on the resource. /app_home/ is the
+     * game's install dir (== the USRDIR root); the title also opens it in
+     * non-leading spellings ("app_home/...", "e:/app_home/..."). */
+    static const char* const mounts[] = {
+        "/dev_bdvd/", "/app_home/", "/dev_hdd0/", "/dev_hdd1/",
+        "/dev_flash/", "/host_root/", "/dev_usb000/", "/dev_usb/"
+    };
     const char* rel = ps3_path;
-    const char* ah = strstr(ps3_path, "app_home/");
-    if (ah) rel = ah + 9;                 /* everything after "app_home/" */
-    else if (rel[0] == '/') rel++;         /* otherwise just strip leading slash */
+    /* flОw first: map anything from a "USRDIR/" component onward to <root>/USRDIR/...
+     * directly, bypassing the full /dev_hdd0/game/<ID>/USRDIR install tree (which we
+     * normally provide via a filesystem junction) -- concurrent opens THROUGH a
+     * Windows junction intermittently fail (the nondeterministic Cg shader "could
+     * not be read" abort). The real assets live under <root>/USRDIR. flОw's failing
+     * paths carry "USRDIR/"; LBP's raw-sys_fs disc paths (/dev_bdvd Bink videos) do
+     * not, so they fall through to sagemono's mount-prefix stripping below. */
+    const char* usrp = strstr(ps3_path, "USRDIR/");
+    if (usrp) {
+        rel = usrp;                        /* "USRDIR/..." */
+    } else {
+        /* Otherwise strip a known mount prefix so this sys_fs layer resolves to the
+         * SAME host tree as the cellFs layer (ppu_fs.cpp). /dev_bdvd/X previously
+         * mapped to <root>/dev_bdvd/X -- a dir that doesn't exist -- stalling titles
+         * that open disc content through raw sys_fs. */
+        int matched = 0;
+        for (size_t i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++) {
+            size_t n = strlen(mounts[i]);
+            if (strncmp(ps3_path, mounts[i], n) == 0) { rel = ps3_path + n; matched = 1; break; }
+        }
+        if (!matched) {
+            const char* ah = strstr(ps3_path, "app_home/");
+            if (ah) rel = ah + 9;          /* non-leading app_home spelling */
+            else if (rel[0] == '/') rel++; /* otherwise just strip leading slash */
+        }
+    }
 
     snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
     fs_normalize_sep(host_path);
+    /* NOTE: do NOT stat() the direct path and fall back to the dev_hdd0 junction
+     * on failure. stat() intermittently returns ENOENT for an existing file here
+     * (a Windows transient), and the junction fallback made it WORSE -- the flaky
+     * stat sent a real open to a path that doesn't exist. The direct <root>/USRDIR
+     * layout holds the assets; a genuinely-missing direct path is handled by the
+     * caller's open retry + the extracted-dump fallback below. */
 
     /* Extracted-dump fallback: our test setups often hold a title's data at
      * <root>/extracted/USRDIR/... rather than the full /dev_hdd0/game/<ID>/USRDIR
@@ -211,13 +261,30 @@ int64_t sys_fs_open(ppu_context* ctx)
 
     FILE* fp = fopen(host_path, mode);
 
+    /* Transient open failures: on Windows an existing, correctly-pathed file can
+     * intermittently fail to open (AV/indexer holding a share lock, or momentary
+     * handle pressure) -- which surfaced as a NONDETERMINISTIC "Cg shader file
+     * could not be read" abort. Retry a few times with a brief backoff for a
+     * read-only open of a file that exists; deterministic and cheap. */
+    if (!fp && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
+        for (int _r = 0; !fp && _r < 3000; _r++) {
+#ifdef _WIN32
+            Sleep(1);
+#endif
+            fp = fopen(host_path, mode);
+        }
+        if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
+    }
+
     /* If CREAT flag set and file doesn't exist, try creating it */
     if (!fp && (flags & CELL_FS_O_CREAT)) {
         fp = fopen(host_path, "w+b");
     }
 
     if (!fp) {
-        fprintf(stderr, "[sys_fs] open FAILED: %s\n", host_path);
+        { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
+          fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
+                  host_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
         return (int64_t)(int32_t)CELL_ENOENT;
     }
 
@@ -261,11 +328,25 @@ int64_t sys_fs_read(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     void* buf = vm_to_host(buf_addr);
+    long pos_before = ftell(f->fp);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
 
     if (nread_addr != 0) {
         write_be64(nread_addr, (uint64_t)nread);
     }
+
+    /* FLOW_FSDBG: the lv2 path is what PhyreEngine titles actually use (they do
+     * not go through the cellFs HLE), so YDKJ_FSDBG in ppu_fs.cpp never fires. */
+    { extern char* getenv(const char*);
+      if (getenv("FLOW_FSDBG")) {
+        const unsigned char* b = (const unsigned char*)buf;
+        fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
+                        " head=%02X%02X%02X%02X lr=0x%08X\n",
+                fd, f->path, pos_before, (unsigned long long)size, nread,
+                nread > 0 ? b[0] : 0, nread > 1 ? b[1] : 0,
+                nread > 2 ? b[2] : 0, nread > 3 ? b[3] : 0,
+                (uint32_t)ctx->lr);
+      } }
 
     return CELL_OK;
 }
