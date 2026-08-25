@@ -1440,8 +1440,12 @@ extern "C" void gt6_register_hle(void)
     cellspurs_ready_count_observer = gt6_observe_spurs_ready_count;
     /* Digital GT6 installation supplied for this port.  The more-specific
      * /dev_bdvd/PS3_GAME/ mapping lets retail paths work without duplicating
-     * the installed game directory on the host. */
-    cellfs_set_root_path("E:/Emulation/storage/rpcs3");
+     * the installed game directory on the host. GT6_RPCS3_STORAGE overrides
+     * the hardcoded Windows dev path (must match main.cpp's PARAM.SFO/content
+     * path, which reads the same variable). */
+    cellfs_set_root_path(getenv("GT6_RPCS3_STORAGE")
+                              ? getenv("GT6_RPCS3_STORAGE")
+                              : "E:/Emulation/storage/rpcs3");
     cellfs_add_path_mapping("/dev_hdd0/", "dev_hdd0/");
     cellfs_add_path_mapping("/dev_bdvd/PS3_GAME/", "dev_hdd0/game/NPUA81049/");
 

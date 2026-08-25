@@ -67,6 +67,28 @@ if(MSVC)
         ../emain_recompiled/ppu_recomp_004.cpp
         PROPERTIES COMPILE_FLAGS "/Od /W0"
     )
+else()
+    # Same problem, same fix, on GCC/Clang: -O2 on these files (verified on
+    # Linux/GCC 16) uses ~5 GB RSS *per file* -- two compiling at once nearly
+    # OOM'd a 15 GB machine. -O0 trades that for a slower recompiled binary;
+    # correctness only, not speed, is the goal at this stage. Applies to all
+    # ten chunks, not just 000-004 like the MSVC list above -- untested
+    # whether the later ones are actually smaller/cheaper to optimize, so
+    # cover all of them until proven otherwise.
+    set_source_files_properties(
+        "${GT6_DIR}/spu_jobs/all_jobs/spu_recomp.c"
+        ../emain_recompiled/ppu_recomp_000.cpp
+        ../emain_recompiled/ppu_recomp_001.cpp
+        ../emain_recompiled/ppu_recomp_002.cpp
+        ../emain_recompiled/ppu_recomp_003.cpp
+        ../emain_recompiled/ppu_recomp_004.cpp
+        ../emain_recompiled/ppu_recomp_005.cpp
+        ../emain_recompiled/ppu_recomp_006.cpp
+        ../emain_recompiled/ppu_recomp_007.cpp
+        ../emain_recompiled/ppu_recomp_008.cpp
+        ../emain_recompiled/ppu_recomp_009.cpp
+        PROPERTIES COMPILE_FLAGS "-O0"
+    )
 endif()
 
 target_include_directories(GT6MainRecompHook PRIVATE
@@ -92,6 +114,13 @@ if(MSVC)
     # Windows commits it on demand, so the physical cost remains small.
     target_link_options(GT6MainRecompHook PRIVATE
         /FORCE:MULTIPLE /MAP /STACK:1073741824,1048576)
+else()
+    # GNU ld equivalent of /FORCE:MULTIPLE above: libs/network/sceNpCommerce.c
+    # and sceNpCommerce2.c define several identically-named functions (a
+    # pre-existing duplicate in the runtime, not introduced here or by this
+    # Linux port); the first definition wins, same as the MSVC side already
+    # tolerates.
+    target_link_options(GT6MainRecompHook PRIVATE -Wl,--allow-multiple-definition)
 endif()
 
 target_link_libraries(GT6MainRecompHook PRIVATE "${PS3RECOMP_RUNTIME_LIB}")
@@ -103,4 +132,20 @@ if(WIN32)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(GT6MainRecompHook PRIVATE Threads::Threads)
+    # This is a separate CMake project from the root one (PS3RECOMP_RUNTIME_LIB
+    # is a raw file path, not a CMake target), so ps3recomp_runtime's own
+    # PRIVATE SDL2 link requirement doesn't propagate here automatically --
+    # cellAudio.c/cellPad.c's SDL2 calls need it linked again at this level.
+    # Deliberately a raw library path (find_library), not the SDL2::SDL2
+    # imported target: none of GT6MainRecompHook's own sources #include SDL2
+    # (only the prebuilt .a does), but linking the imported target still
+    # applies its INTERFACE_INCLUDE_DIRECTORIES to every source's compile
+    # command, which invalidates and forces a full recompile of the ten
+    # already-built 40 MB generated chunks just to add an unused -isystem.
+    find_library(SDL2_RAW_LIB NAMES SDL2)
+    if(SDL2_RAW_LIB)
+        target_link_libraries(GT6MainRecompHook PRIVATE "${SDL2_RAW_LIB}")
+    else()
+        message(WARNING "libSDL2 not found: link will fail on cellAudio/cellPad's SDL2 calls.")
+    endif()
 endif()

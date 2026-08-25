@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 #ifdef _WIN32
@@ -695,9 +696,15 @@ int main(int argc, char** argv)
      * rather than the disc GT.VOL path. */
     cellGame_set_title_id("NPUA81049");
     cellGame_set_title("Gran Turismo 6");
-    cellGame_init_from_paramsfo(
-        "E:/Emulation/storage/rpcs3/dev_hdd0/game/NPUA81049/PARAM.SFO");
-    cellGame_set_content_path("E:/Emulation/storage/rpcs3/dev_hdd0/game");
+    /* GT6_RPCS3_STORAGE overrides the dev machine's hardcoded Windows path
+     * below (e.g. on Linux: /mnt/dados/Emulation/storage/rpcs3) -- must
+     * match the root passed to cellfs_set_root_path in gt6_hle.cpp. */
+    {
+        const char* storage_env = std::getenv("GT6_RPCS3_STORAGE");
+        const std::string storage = storage_env ? storage_env : "E:/Emulation/storage/rpcs3";
+        cellGame_init_from_paramsfo((storage + "/dev_hdd0/game/NPUA81049/PARAM.SFO").c_str());
+        cellGame_set_content_path((storage + "/dev_hdd0/game").c_str());
+    }
     cellGame_set_game_type(CELL_GAME_GAMETYPE_HDD);
     gt6_register_hle();
     ppu_sysprx_register();

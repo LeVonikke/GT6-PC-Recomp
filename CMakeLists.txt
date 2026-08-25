@@ -91,6 +91,30 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+else()
+    # libs/audio/cellAudio.c and libs/input/cellPad.c default to an SDL2
+    # backend on every non-Windows target (AUDIO_BACKEND_SDL2 is 1 unless
+    # PS3RECOMP_AUDIO_USE_SDL2 says otherwise -- see the top of cellAudio.c),
+    # but nothing here actually found/linked it before. Optional per
+    # docs/BUILDING.md; without it these two files' SDL_* calls are just
+    # undefined at link time, not a hard requirement to run everything else.
+    find_package(SDL2 QUIET)
+    if(SDL2_FOUND)
+        target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
+    else()
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(SDL2PC QUIET sdl2)
+        endif()
+        if(SDL2PC_FOUND)
+            target_include_directories(ps3recomp_runtime PRIVATE ${SDL2PC_INCLUDE_DIRS})
+            target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2PC_LIBRARIES})
+        else()
+            message(WARNING "SDL2 not found: cellAudio/cellPad's SDL2 backend "
+                             "will fail to link. Install libsdl2-dev (or the "
+                             "distro equivalent) for audio/gamepad support.")
+        endif()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
