@@ -1,4 +1,4 @@
-# GT6HACKFIX
+# GT6 PC Recomp
 
 **Static recompilation of Gran Turismo 6 (PS3, title ID `NPUA81049`) into a native PC executable — no PS3 emulator involved.**
 
