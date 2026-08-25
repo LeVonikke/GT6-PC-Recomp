@@ -62,6 +62,31 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
     return 1;
 }
 
+/* The runner reserves the complete 32-bit PS3 address space and commits it
+ * lazily on CPU access.  An SPU PUT is also a legitimate guest write, so make
+ * its target pages resident before copying.  GETs deliberately retain the
+ * strict guard above: fabricating data for an unreadable source would hide a
+ * bad workload context. */
+static inline int mfc_ea_commit_write_range(uint64_t ea, uint32_t size)
+{
+    uint32_t e = (uint32_t)ea;
+    if (size == 0 || (uint64_t)e + (uint64_t)size > 0x100000000ull)
+        return 0;
+#ifdef _WIN32
+    if (!vm_base)
+        return 0;
+    const uintptr_t page_size = 0x1000u;
+    const uintptr_t begin = (uintptr_t)(vm_base + e) & ~(page_size - 1u);
+    const uintptr_t end = ((uintptr_t)(vm_base + e + size) + page_size - 1u) &
+                          ~(page_size - 1u);
+    if (end <= begin)
+        return 0;
+    if (!VirtualAlloc((void*)begin, end - begin, MEM_COMMIT, PAGE_READWRITE))
+        return 0;
+#endif
+    return mfc_ea_range_committed(ea, size);
+}
+
 /* MFC queue depth */
 #define MFC_QUEUE_DEPTH     16
 
@@ -173,7 +198,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* Reject transfers whose main-memory range is not committed guest memory,
      * so a garbage EA (e.g. from an incomplete SPURS context) is a failed DMA
      * rather than a host segfault. */
-    if (!mfc_ea_range_committed(ea, size)) {
+    if (!mfc_ea_range_committed(ea, size) &&
+        !(mfc_is_put(cmd) && mfc_ea_commit_write_range(ea, size))) {
         static int s_warned = 0;
         if (s_warned++ < 32)
             fprintf(stderr, "[spu-dma] SKIP %s lsa=0x%05X ea=0x%08X size=%u "
@@ -205,6 +231,32 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         memcpy(ls_ptr, ea_ptr, size);
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory */
+        /* The GT6 boot path must never overwrite the EMAIN jump table at
+         * 0x00A5D3BC.  Trace only an overlapping PUT so we can identify the
+         * producing SPU without perturbing normal timing or logging every DMA. */
+        { static int s_codewrite_trace = -1;
+          if (s_codewrite_trace < 0)
+              s_codewrite_trace = getenv("GT6_CODEWRITE_TRACE") ? 1 : 0;
+          if (s_codewrite_trace) {
+              const uint64_t begin = (uint32_t)ea;
+              const uint64_t end = begin + size;
+              const uint64_t watch_begin = 0x00A5D3BCull;
+              const uint64_t watch_end = watch_begin + 0x20ull;
+              if (begin < watch_end && end > watch_begin) {
+                  static unsigned s_hits = 0;
+                  if (s_hits++ < 32) {
+                      uint32_t first = begin > watch_begin ? (uint32_t)(begin - watch_begin) : 0;
+                      uint32_t source = begin < watch_begin ? (uint32_t)(watch_begin - begin) : 0;
+                      uint8_t b0 = source < size ? ls_ptr[source] : 0;
+                      uint8_t b1 = source + 1 < size ? ls_ptr[source + 1] : 0;
+                      uint8_t b2 = source + 2 < size ? ls_ptr[source + 2] : 0;
+                      uint8_t b3 = source + 3 < size ? ls_ptr[source + 3] : 0;
+                      fprintf(stderr, "[GT6 CODEWRITE] img=%u cmd=%02X lsa=%05X ea=%08X size=%X table+%X bytes=%02X%02X%02X%02X\\n",
+                              spu->image_id, cmd, lsa, (uint32_t)ea, size, first,
+                              b0, b1, b2, b3);
+                  }
+              }
+          } }
         memcpy(ea_ptr, ls_ptr, size);
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
@@ -301,6 +353,20 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     uint32_t size = spu->mfc_size;
     uint32_t tag  = spu->mfc_tag & 0x1F;
     int rc = 0;
+
+    /* PDI policy runs are the current boot blocker.  Keep this entirely
+     * opt-in: it records the exact workload-context DMA contract without
+     * perturbing the normal execution path. */
+    {
+        static int pdi_trace = -1;
+        static unsigned pdi_count = 0;
+        if (pdi_trace < 0) pdi_trace = getenv("GT6_PDI_DMA_TRACE") ? 1 : 0;
+        if (pdi_trace && pdi_count++ < 256) {
+            fprintf(stderr,
+                    "[GT6 PDI DMA] img=%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\\n",
+                    spu->image_id, cmd, lsa, (unsigned long long)ea, size, tag);
+        }
+    }
 
     /* cri build (YDKJ_CRI_CHAIN): when the kernel DMA-loads the TASKSET policy
      * module (libsre guest 0x30023680) to LS 0xA00, switch this SPU's image to 23

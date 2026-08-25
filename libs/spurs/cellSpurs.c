@@ -24,6 +24,7 @@
 uint32_t g_ydkj_real_taskset_ea = 0;
 uint32_t g_ydkj_real_taskid     = 0;
 uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the taskset-policy handoff) */
+void (*cellspurs_ready_count_observer)(u32 spurs_ea, u32 wid) = NULL;
 
 /* Generic HLE adapter passes GUEST addresses; translate pointer args. CellSpurs
  * is treated opaquely by the game (passed back as a handle), so translating the
@@ -50,6 +51,7 @@ typedef struct {
     u32         minContention;
     u32         maxContention;
     u32         readyCount;
+    u8          uniqueId;
 } SpursWorkload;
 
 typedef struct {
@@ -62,10 +64,107 @@ typedef struct {
     u64         argA;
 } SpursTask;
 
-/* Global workload table (per-SPURS instance in a real system, simplified) */
-static SpursWorkload s_workloads[CELL_SPURS_MAX_WORKLOAD];
+/* Workload bookkeeping is per CellSpurs object.  GT6 creates its PDI
+ * scheduler at 0x30100000 and later a separate job-chain scheduler; a single
+ * global table caused the latter initialization to erase the former's WIDs
+ * 5..7 while their raw policies were still executing. */
+#define CELLSPURS_MAX_INSTANCES 8
+typedef struct {
+    u32 ea;
+    SpursWorkload workloads[CELL_SPURS_MAX_WORKLOAD];
+} SpursWorkloadInstance;
+static SpursWorkloadInstance s_workload_instances[CELLSPURS_MAX_INSTANCES];
 static SpursTask     s_tasks[CELL_SPURS_MAX_TASK];
 static u32           s_next_task_id = 0;
+
+static SpursWorkload* cellspurs_workloads(u32 spurs_ea, int create)
+{
+    for (u32 i = 0; i < CELLSPURS_MAX_INSTANCES; ++i) {
+        if (s_workload_instances[i].ea == spurs_ea)
+            return s_workload_instances[i].workloads;
+    }
+    if (!create)
+        return NULL;
+    for (u32 i = 0; i < CELLSPURS_MAX_INSTANCES; ++i) {
+        if (s_workload_instances[i].ea == 0) {
+            s_workload_instances[i].ea = spurs_ea;
+            memset(s_workload_instances[i].workloads, 0,
+                   sizeof(s_workload_instances[i].workloads));
+            return s_workload_instances[i].workloads;
+        }
+    }
+    return NULL;
+}
+
+static void cellspurs_clear_workloads(u32 spurs_ea)
+{
+    for (u32 i = 0; i < CELLSPURS_MAX_INSTANCES; ++i) {
+        if (s_workload_instances[i].ea == spurs_ea) {
+            memset(&s_workload_instances[i], 0, sizeof(s_workload_instances[i]));
+            return;
+        }
+    }
+}
+
+/* CellSpurs is not a native C object in guest memory.  The SPURS policy DMA
+ * reads this scheduler layout directly, including the ready counts at offset
+ * zero.  Keep HLE validation on real mirror fields so no private "initialized"
+ * marker corrupts workload 0's ready count. */
+static int cellspurs_guest_is_initialized(u32 spurs_ea)
+{
+    if (!vm_base)
+        return 0;
+
+    const u8 n_spus = vm_base[spurs_ea + 0x76u];
+    return n_spus >= 1 && n_spus <= CELL_SPURS_MAX_SPU;
+}
+
+static void cellspurs_guest_initialize(u32 spurs_ea, u32 n_spus)
+{
+    if (n_spus < 1 || n_spus > CELL_SPURS_MAX_SPU)
+        n_spus = 1;
+
+    /* These entry points create SPURS1 (CELL_SPURS_SIZE = 0x1000).  SPURS2's
+     * 0x2000-byte InitializeWithAttribute2 path is title/runtime-specific. */
+    memset(vm_base + spurs_ea, 0, 0x1000u);
+    vm_base[spurs_ea + 0x74u] = 0;            /* SPURS1 / 16 workloads */
+    vm_base[spurs_ea + 0x76u] = (u8)n_spus;
+    vm_base[spurs_ea + 0x77u] = 0xff;         /* no flag receiver */
+    /* CellSpurs::sysSrvPreemptWklId[8].  Zero is a valid workload id; the
+     * system service uses 0xff as its required "no pre-empted workload"
+     * sentinel before running cleanup. */
+    memset(vm_base + spurs_ea + 0xC0u, 0xff, CELL_SPURS_MAX_SPU);
+    vm_write32(spurs_ea + 0xB0u, 0x0000FFFFu);
+}
+
+/* Policy-module instances that use the same PM image must share a unique ID.
+ * Different images take the first ID not already used by a live workload. */
+static u8 cellspurs_workload_unique_id(const SpursWorkload* workloads,
+                                       const void* pm)
+{
+    u32 used = 0;
+
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
+        if (!workloads[i].in_use)
+            continue;
+        if (workloads[i].pm == pm)
+            return workloads[i].uniqueId;
+        used |= 1u << workloads[i].uniqueId;
+    }
+
+    for (u8 id = 0; id < 32; id++) {
+        if ((used & (1u << id)) == 0)
+            return id;
+    }
+
+    return 0;
+}
+
+/* Optional title observer.  A native SPURS implementation is still the owner
+ * of workload allocation; a title can attach the corresponding lifted policy
+ * only after this function has committed the work item to the guest table. */
+void (*cellspurs_workload_observer)(u32 spurs_ea, u32 pm_ea, u32 size_pm,
+                                    u32 wid, u64 data) = NULL;
 
 /* ---------------------------------------------------------------------------
  * Event flag sync side table
@@ -183,16 +282,17 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
 
     if (!spurs)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    spurs = GUEST_PTR(spurs, CellSpurs*);
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
 
     printf("[cellSpurs] Initialize(nSpus=%d)\n", nSpus);
 
-    memset(spurs, 0, sizeof(CellSpurs));
-    spurs->initialized = 1;
-    spurs->nSpus = (nSpus > 0 && nSpus <= CELL_SPURS_MAX_SPU)
-                   ? (u32)nSpus : 1;
+    cellspurs_guest_initialize(spurs_ea, (u32)nSpus);
 
-    memset(s_workloads, 0, sizeof(s_workloads));
+    {
+        SpursWorkload* workloads = cellspurs_workloads(spurs_ea, 1);
+        if (!workloads) return CELL_SPURS_CORE_ERROR_NOMEM;
+        memset(workloads, 0, sizeof(SpursWorkload) * CELL_SPURS_MAX_WORKLOAD);
+    }
     return CELL_OK;
 }
 
@@ -202,17 +302,19 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     if (!spurs || !attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
 
-    spurs = GUEST_PTR(spurs, CellSpurs*);
-    attr  = GUEST_PTR(attr, const CellSpursAttribute*);
-    printf("[cellSpurs] InitializeWithAttribute(prefix=\"%.15s\")\n", attr->prefix);
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
+    const u32 attr_ea = (u32)(uintptr_t)attr;
+    const u32 n_spus = vm_read32(attr_ea + 0x08u);
+    if (n_spus < 1 || n_spus > CELL_SPURS_MAX_SPU)
+        return CELL_SPURS_CORE_ERROR_INVAL;
+    printf("[cellSpurs] InitializeWithAttribute(nSpus=%u)\n", n_spus);
+    cellspurs_guest_initialize(spurs_ea, n_spus);
 
-    memset(spurs, 0, sizeof(CellSpurs));
-    spurs->initialized = 1;
-    spurs->nSpus = attr->nSpus;
-    spurs->flags = attr->flags;
-    memcpy(spurs->prefix, attr->prefix, sizeof(spurs->prefix));
-
-    memset(s_workloads, 0, sizeof(s_workloads));
+    {
+        SpursWorkload* workloads = cellspurs_workloads(spurs_ea, 1);
+        if (!workloads) return CELL_SPURS_CORE_ERROR_NOMEM;
+        memset(workloads, 0, sizeof(SpursWorkload) * CELL_SPURS_MAX_WORKLOAD);
+    }
     return CELL_OK;
 }
 
@@ -220,48 +322,67 @@ s32 cellSpursFinalize(CellSpurs* spurs)
 {
     if (!spurs)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    spurs = GUEST_PTR(spurs, CellSpurs*);
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
 
-    if (!spurs->initialized)
+    if (!cellspurs_guest_is_initialized(spurs_ea))
         return CELL_SPURS_CORE_ERROR_STAT;
 
     printf("[cellSpurs] Finalize()\n");
 
-    memset(s_workloads, 0, sizeof(s_workloads));
-    spurs->initialized = 0;
+    cellspurs_clear_workloads(spurs_ea);
+    memset(vm_base + spurs_ea, 0, 0x1000u);
     return CELL_OK;
 }
 
-s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
-                                 s32 spuPriority, s32 ppuPriority,
-                                 u8 exitIfNoWork)
+static s32 cellspurs_attribute_initialize_guest(CellSpursAttribute* attr,
+                                                u32 revision,
+                                                u32 sdkVersion, u32 nSpus,
+                                                s32 spuPriority,
+                                                s32 ppuPriority,
+                                                u8 exitIfNoWork)
 {
-    (void)ppuPriority; (void)exitIfNoWork;
-
     if (!attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
 
-    /* `attr` is a GUEST address (generic HLE adapter passes r3 raw). */
-    attr = GUEST_PTR(attr, CellSpursAttribute*);
-    memset(attr, 0, sizeof(CellSpursAttribute));
-    attr->nSpus = (nSpus > 0 && nSpus <= CELL_SPURS_MAX_SPU)
-                  ? (u32)nSpus : 1;
+    const u32 attr_ea = (u32)(uintptr_t)attr;
+    if (attr_ea & 7u)
+        return CELL_SPURS_CORE_ERROR_ALIGN;
 
-    for (int i = 0; i < CELL_SPURS_MAX_SPU; i++)
-        attr->spuPriority[i] = spuPriority;
+    memset(vm_base + attr_ea, 0, 0x200u);
+    vm_write32(attr_ea + 0x00u, revision);
+    vm_write32(attr_ea + 0x04u, sdkVersion);
+    vm_write32(attr_ea + 0x08u, nSpus);
+    vm_write32(attr_ea + 0x0Cu, (u32)spuPriority);
+    vm_write32(attr_ea + 0x10u, (u32)ppuPriority);
+    vm_base[attr_ea + 0x14u] = exitIfNoWork ? 1u : 0u;
 
-    printf("[cellSpurs] AttributeInitialize(nSpus=%d)\n", nSpus);
+    printf("[cellSpurs] AttributeInitialize(revision=%u sdk=0x%08X nSpus=%u)\n",
+           revision, sdkVersion, nSpus);
     return CELL_OK;
 }
 
-/* The SDK's cellSpursAttributeInitialize() macro imports this internal name
- * (NID 0x95180230). Forward to the implementation above. */
-s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
+/* Compatibility entry point for callers that expose the five-argument public
+ * wrapper directly.  Retail SDK code normally imports the seven-argument
+ * internal function below. */
+s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
+                                 s32 spuPriority, s32 ppuPriority,
+                                  u8 exitIfNoWork)
+{
+    return cellspurs_attribute_initialize_guest(attr, 2u, 0u, (u32)nSpus,
+                                                spuPriority, ppuPriority,
+                                                exitIfNoWork);
+}
+
+/* NID 0x95180230: attr, revision, sdkVersion, nSpus, spuPriority,
+ * ppuPriority and exitIfNoWork are passed in guest r3..r9 respectively. */
+s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, u32 revision,
+                                  u32 sdkVersion, u32 nSpus,
                                   s32 spuPriority, s32 ppuPriority,
                                   u8 exitIfNoWork)
 {
-    return cellSpursAttributeInitialize(attr, nSpus, spuPriority,
-                                        ppuPriority, exitIfNoWork);
+    return cellspurs_attribute_initialize_guest(attr, revision, sdkVersion,
+                                                nSpus, spuPriority,
+                                                ppuPriority, exitIfNoWork);
 }
 
 s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
@@ -269,14 +390,13 @@ s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
 {
     if (!attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    attr = GUEST_PTR(attr, CellSpursAttribute*);
+    const u32 attr_ea = (u32)(uintptr_t)attr;
     const char* prefix_h = GUEST_PTR(prefix, const char*);
 
     if (prefix_h && size > 0) {
-        u32 copyLen = size < sizeof(attr->prefix) ? size : sizeof(attr->prefix) - 1;
-        memcpy(attr->prefix, prefix_h, copyLen);
-        attr->prefix[copyLen] = '\0';
-        attr->prefixSize = copyLen;
+        const u32 copyLen = size < 15u ? size : 15u;
+        memcpy(vm_base + attr_ea + 0x15u, prefix_h, copyLen);
+        vm_write32(attr_ea + 0x24u, copyLen);
     }
 
     return CELL_OK;
@@ -300,26 +420,24 @@ s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads)
 {
     if (!spurs || !nThreads)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    spurs = GUEST_PTR(spurs, const CellSpurs*);
-    u32* nThreads_h = GUEST_PTR(nThreads, u32*);
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
 
-    if (!spurs->initialized)
+    if (!cellspurs_guest_is_initialized(spurs_ea))
         return CELL_SPURS_CORE_ERROR_STAT;
 
-    *nThreads_h = spurs->nSpus;
+    vm_write32((u32)(uintptr_t)nThreads, vm_base[spurs_ea + 0x76u]);
     return CELL_OK;
 }
 
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
                               u32 maxContention)
 {
-    (void)maxContention;
-
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
-    if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
+    SpursWorkload* workloads = cellspurs_workloads((u32)(uintptr_t)spurs, 0);
+    if (!workloads || !workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
-    s_workloads[wid].maxContention = maxContention;
+    workloads[wid].maxContention = maxContention;
     return CELL_OK;
 }
 
@@ -329,9 +447,10 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
     if (!spurs || !priorities) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     const u8* priorities_h = GUEST_PTR(priorities, const u8*);
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
-    if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
+    SpursWorkload* workloads = cellspurs_workloads((u32)(uintptr_t)spurs, 0);
+    if (!workloads || !workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
-    memcpy(s_workloads[wid].priority, priorities_h, CELL_SPURS_MAX_SPU);
+    memcpy(workloads[wid].priority, priorities_h, CELL_SPURS_MAX_SPU);
     return CELL_OK;
 }
 
@@ -378,7 +497,7 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
     if (!spurs || !taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    if (!spurs->initialized)
+    if (!cellspurs_guest_is_initialized(spurs_ea))
         return CELL_SPURS_CORE_ERROR_STAT;
 
     memset(taskset, 0, sizeof(CellSpursTaskset));
@@ -652,31 +771,76 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     /* spurs/wid/priority are guest EAs; pm stays a guest EA (it's the SPU
      * program address consumed later by the workload dispatch). */
-    spurs = GUEST_PTR(spurs, CellSpurs*);
-    CellSpursWorkloadId* wid_h = GUEST_PTR(wid, CellSpursWorkloadId*);
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
     const u8* priority_h = GUEST_PTR(priority, const u8*);
 
-    if (!spurs->initialized)
+    if (!cellspurs_guest_is_initialized(spurs_ea))
         return CELL_SPURS_CORE_ERROR_STAT;
+    SpursWorkload* workloads = cellspurs_workloads(spurs_ea, 1);
+    if (!workloads)
+        return CELL_SPURS_CORE_ERROR_NOMEM;
 
     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
-        if (!s_workloads[i].in_use) {
-            s_workloads[i].in_use = 1;
-            s_workloads[i].pm = pm;
-            s_workloads[i].sizePm = sizePm;
-            s_workloads[i].data = data;
-            s_workloads[i].minContention = minContention;
-            s_workloads[i].maxContention = maxContention;
-            s_workloads[i].readyCount = 0;
+        if (!workloads[i].in_use) {
+            workloads[i].uniqueId = cellspurs_workload_unique_id(workloads, pm);
+            workloads[i].in_use = 1;
+            workloads[i].pm = pm;
+            workloads[i].sizePm = sizePm;
+            workloads[i].data = data;
+            workloads[i].minContention = minContention;
+            workloads[i].maxContention = maxContention;
+            workloads[i].readyCount = 0;
 
             if (priority_h)
-                memcpy(s_workloads[i].priority, priority_h, CELL_SPURS_MAX_SPU);
+                memcpy(workloads[i].priority, priority_h, CELL_SPURS_MAX_SPU);
             else
-                memset(s_workloads[i].priority, 0, CELL_SPURS_MAX_SPU);
+                memset(workloads[i].priority, 0, CELL_SPURS_MAX_SPU);
 
-            *wid_h = i;
+            /* `wid` is guest memory.  The recompiled PPU reads it through
+             * vm_read32, so a native host-endian store turns workload 5 into
+             * 0x05000000 and makes subsequent SPURS calls reject it. */
+            vm_write32((u32)(uintptr_t)wid, i);
+
+            /* Keep the real 0x2000-byte BE CellSpurs scheduler mirror in
+             * sync with the host bookkeeping.  Raw policy modules (GT6 PDI
+             * included) DMA this table directly; the compact native
+             * CellSpurs C struct above is only an HLE convenience and cannot
+             * stand in for its guest layout. */
+            if (vm_base) {
+                const u32 info = spurs_ea + 0xB00u + i * 0x20u;
+                vm_write64(info + 0x00, (u64)(uintptr_t)pm);
+                vm_write64(info + 0x08, data);
+                vm_write32(info + 0x10, sizePm);
+                vm_base[info + 0x14] = workloads[i].uniqueId;
+                memcpy(vm_base + info + 0x18, workloads[i].priority, 8);
+
+                vm_base[spurs_ea + 0x80u + i] = 2;  /* RUNNABLE */
+                vm_base[spurs_ea + 0x40u + i] = (u8)minContention;
+                vm_base[spurs_ea + 0x50u + i] = (u8)maxContention;
+                vm_write32(spurs_ea + 0xB0u,
+                    vm_read32(spurs_ea + 0xB0u) | (1u << (31u - i)));
+
+                /* Publishing a workload is a system-service request, not
+                 * merely a descriptor write.  Firmware marks every live SPU
+                 * in both sysSrvMsgUpdateWorkload (+0xBD) and sysSrvMessage
+                 * (+0x72); the WID-32 service then rebuilds its runnable
+                 * mirror before Kernel1 is allowed to dispatch the policy.
+                 * Without these two bits the lifted kernel sees an old local
+                 * table and has to rely on host-side re-selection workarounds.
+                 * This is guest scheduler state, never a synthetic PPU event. */
+                {
+                    const u8 n_spus = vm_base[spurs_ea + 0x76u];
+                    const u8 active_mask = n_spus >= 8u ? 0xffu :
+                        n_spus ? (u8)((1u << n_spus) - 1u) : 0u;
+                    vm_base[spurs_ea + 0xBDu] |= active_mask;
+                    vm_base[spurs_ea + 0x72u] |= active_mask;
+                }
+            }
             printf("[cellSpurs] AddWorkload(wid=%u, pm=%p, size=%u)\n",
                    i, pm, sizePm);
+            if (cellspurs_workload_observer)
+                cellspurs_workload_observer(spurs_ea, (u32)(uintptr_t)pm, sizePm,
+                                            i, data);
             return CELL_OK;
         }
     }
@@ -689,23 +853,101 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
                                        const CellSpursWorkloadAttribute* attr)
 {
     if (!attr) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    attr = GUEST_PTR(attr, const CellSpursWorkloadAttribute*);
+    const u32 attr_ea = (u32)(uintptr_t)attr;
 
-    /* spurs/wid stay guest EAs (cellSpursAddWorkload translates them); attr->pm
-     * and attr->priority are guest EAs carried through verbatim. */
-    return cellSpursAddWorkload(spurs, wid, (const void*)(uintptr_t)attr->pm,
-                               attr->sizePm, attr->data, attr->priority,
-                               attr->minContention, attr->maxContention);
+    /* Attributes are a documented big-endian guest layout.  Reading them
+     * through the native C struct byte-swaps every integer on x86, yielding
+     * impossible PM sizes such as 0x80300000 and preventing SPU dispatch. */
+    const u64 pm = vm_read64(attr_ea + 0x08);
+    const u32 size_pm = vm_read32(attr_ea + 0x10);
+    const u64 data = vm_read64(attr_ea + 0x18);
+    const u32 min_contention = vm_read32(attr_ea + 0x28);
+    const u32 max_contention = vm_read32(attr_ea + 0x2c);
+
+    /* spurs/wid remain guest EAs for cellSpursAddWorkload; only the attribute
+     * fields are decoded here. */
+    return cellSpursAddWorkload(spurs, wid,
+                               (const void*)(uintptr_t)(u32)pm,
+                               size_pm, data,
+                               (const u8*)(uintptr_t)(attr_ea + 0x20),
+                               min_contention, max_contention);
 }
 
 s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
-    if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
+    SpursWorkload* workloads = cellspurs_workloads((u32)(uintptr_t)spurs, 0);
+    if (!workloads || !workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
-    s_workloads[wid].in_use = 0;
+    workloads[wid].in_use = 0;
     printf("[cellSpurs] RemoveWorkload(wid=%u)\n", wid);
+    return CELL_OK;
+}
+
+s32 cellSpursGetWorkloadInfo(CellSpurs* spurs, CellSpursWorkloadId wid,
+                              CellSpursWorkloadInfo* info)
+{
+    if (!spurs || !info)
+        return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
+    const u32 info_ea = (u32)(uintptr_t)info;
+
+    if ((spurs_ea & 0x7fu) != 0)
+        return CELL_SPURS_POLICY_MODULE_ERROR_ALIGN;
+
+    const int is_spurs2 = (vm_base[spurs_ea + 0x74u] & 0x40u) != 0;
+    const u32 max_workloads = is_spurs2 ? 32u : 16u;
+    if (wid >= max_workloads)
+        return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
+
+    if ((vm_read32(spurs_ea + 0xB0u) & (0x80000000u >> wid)) == 0)
+        return CELL_SPURS_POLICY_MODULE_ERROR_SRCH;
+
+    if (vm_read32(spurs_ea + 0xD6Cu) != 0)
+        return CELL_SPURS_POLICY_MODULE_ERROR_STAT;
+
+    const u32 slot = wid & 0x0fu;
+    const u32 workload_ea = spurs_ea + (wid < 16u ? 0xB00u : 0x1000u)
+                          + slot * 0x20u;
+    const u32 runtime_ea = spurs_ea + (wid < 16u ? 0x100u : 0x1200u)
+                         + slot * 0x80u;
+    const u32 names_ea = spurs_ea + (wid < 16u ? 0xE00u : 0x1A00u)
+                       + slot * 0x10u;
+    const u8 packed_contention = vm_base[spurs_ea + 0x20u + slot];
+    const u8 packed_max = vm_base[spurs_ea + 0x50u + slot];
+    const u16 signals = vm_read16(spurs_ea + (wid < 16u ? 0x70u : 0x78u));
+    const u16 signal_mask = (u16)(0x8000u >> slot);
+
+    memset(vm_base + info_ea, 0, sizeof(CellSpursWorkloadInfo));
+    vm_write64(info_ea + 0x00u, vm_read64(workload_ea + 0x08u));
+    memcpy(vm_base + info_ea + 0x08u, vm_base + workload_ea + 0x18u,
+           CELL_SPURS_MAX_SPU);
+    vm_write32(info_ea + 0x10u, (u32)vm_read64(workload_ea + 0x00u));
+    vm_write32(info_ea + 0x14u, vm_read32(workload_ea + 0x10u));
+    vm_write32(info_ea + 0x18u, (u32)vm_read64(names_ea + 0x00u));
+    vm_write32(info_ea + 0x1Cu, (u32)vm_read64(names_ea + 0x08u));
+    vm_base[info_ea + 0x20u] = !is_spurs2
+        ? packed_contention
+        : (wid < 16u ? (u8)(packed_contention & 0x0fu)
+                     : (u8)(packed_contention >> 4));
+    vm_base[info_ea + 0x21u] = is_spurs2
+        ? 0
+        : vm_base[spurs_ea + 0x40u + slot];
+    vm_base[info_ea + 0x22u] = !is_spurs2
+        ? packed_max
+        : (wid < 16u ? (u8)(packed_max & 0x0fu)
+                     : (u8)(packed_max >> 4));
+    vm_base[info_ea + 0x23u] = vm_base[spurs_ea
+        + (wid < 16u ? 0x00u : 0x10u) + slot];
+    vm_base[info_ea + 0x24u] = is_spurs2
+        ? 0
+        : vm_base[spurs_ea + 0x10u + slot];
+    vm_base[info_ea + 0x25u] = (signals & signal_mask) != 0;
+    vm_write32(info_ea + 0x28u, (u32)vm_read64(runtime_ea + 0x30u));
+    vm_write32(info_ea + 0x2Cu, (u32)vm_read64(runtime_ea + 0x38u));
+
     return CELL_OK;
 }
 
@@ -739,10 +981,19 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
                              u32 value)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
-    if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD || value > 0xffu)
+        return CELL_SPURS_CORE_ERROR_INVAL;
 
-    s_workloads[wid].readyCount = value;
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
+    SpursWorkload* workloads = cellspurs_workloads(spurs_ea, 0);
+    if (!workloads || !workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
+    vm_base[spurs_ea + wid] = (u8)value;
+    workloads[wid].readyCount = (u8)value;
+    if (getenv("GT6_SPURS_WAKE_TRACE"))
+        fprintf(stderr, "[GT6 SPURS WAKE] ready-store spurs=%08X wid=%u value=%u\n",
+                spurs_ea, wid, value);
+    if (cellspurs_ready_count_observer)
+        cellspurs_ready_count_observer(spurs_ea, wid);
     return CELL_OK;
 }
 
@@ -750,11 +1001,20 @@ s32 cellSpursReadyCountSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
                             u32* old, u32 value)
 {
     if (!spurs || !old) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
-    if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
-
-    *old = s_workloads[wid].readyCount;
-    s_workloads[wid].readyCount = value;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD || value > 0xffu)
+        return CELL_SPURS_CORE_ERROR_INVAL;
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
+    SpursWorkload* workloads = cellspurs_workloads(spurs_ea, 0);
+    if (!workloads || !workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
+    const u32 old_value = vm_base[spurs_ea + wid];
+    vm_base[spurs_ea + wid] = (u8)value;
+    workloads[wid].readyCount = (u8)value;
+    vm_write32((u32)(uintptr_t)old, old_value);
+    if (getenv("GT6_SPURS_WAKE_TRACE"))
+        fprintf(stderr, "[GT6 SPURS WAKE] ready-swap spurs=%08X wid=%u %u->%u\n",
+                spurs_ea, wid, old_value, value);
+    if (cellspurs_ready_count_observer)
+        cellspurs_ready_count_observer(spurs_ea, wid);
     return CELL_OK;
 }
 
@@ -763,13 +1023,43 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
                                        u32* old, u32 compare, u32 value)
 {
     if (!spurs || !old) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD || (compare | value) > 0xffu)
+        return CELL_SPURS_CORE_ERROR_INVAL;
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
+    SpursWorkload* workloads = cellspurs_workloads(spurs_ea, 0);
+    if (!workloads || !workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
+    const u32 old_value = vm_base[spurs_ea + wid];
+    if (old_value == compare) {
+        vm_base[spurs_ea + wid] = (u8)value;
+        workloads[wid].readyCount = (u8)value;
+    } else {
+        workloads[wid].readyCount = old_value;
+    }
+    vm_write32((u32)(uintptr_t)old, old_value);
+    if (getenv("GT6_SPURS_WAKE_TRACE"))
+        fprintf(stderr,
+                "[GT6 SPURS WAKE] ready-cas spurs=%08X wid=%u old=%u compare=%u new=%u\n",
+                spurs_ea, wid, old_value, compare, value);
+    if (old_value == compare && cellspurs_ready_count_observer)
+        cellspurs_ready_count_observer(spurs_ea, wid);
+
+    return CELL_OK;
+}
+
+s32 cellSpursSendWorkloadSignal(CellSpurs* spurs, CellSpursWorkloadId wid)
+{
+    if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
-    if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
+    const u32 spurs_ea = (u32)(uintptr_t)spurs;
+    SpursWorkload* workloads = cellspurs_workloads(spurs_ea, 0);
+    if (!workloads || !workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
-    *old = s_workloads[wid].readyCount;
-    if (s_workloads[wid].readyCount == compare)
-        s_workloads[wid].readyCount = value;
-
+    const u32 signal_ea = spurs_ea + 0x70u;
+    vm_write16(signal_ea,
+               (u16)(vm_read16(signal_ea) | (u16)(0x8000u >> wid)));
+    if (getenv("GT6_SPURS_WAKE_TRACE"))
+        fprintf(stderr, "[GT6 SPURS WAKE] signal spurs=%08X wid=%u\n",
+                (u32)(uintptr_t)spurs, wid);
     return CELL_OK;
 }
 
@@ -777,6 +1067,9 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     /* In a full implementation, wake the worker threads */
+    if (getenv("GT6_SPURS_WAKE_TRACE"))
+        fprintf(stderr, "[GT6 SPURS WAKE] wake spurs=%08X\n",
+                (u32)(uintptr_t)spurs);
     return CELL_OK;
 }
 

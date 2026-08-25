@@ -9,8 +9,14 @@
  */
 
 #include "cellMouse.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+/* HLE pointer arguments are 32-bit guest effective addresses. */
+extern void vm_write8 (unsigned long long a, unsigned char  v);
+extern void vm_write16(unsigned long long a, unsigned short v);
+extern void vm_write32(unsigned long long a, unsigned int   v);
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -34,6 +40,23 @@ typedef struct {
 static int            s_mouse_initialized = 0;
 static u32            s_mouse_max_connect = 0;
 static MousePortState s_mouse_ports[CELL_MOUSE_MAX_MICE];
+
+static void mouse_write_data(u32 ea, const CellMouseData* data)
+{
+    vm_write8((unsigned long long)ea + 0, data->update);
+    vm_write8((unsigned long long)ea + 1, data->buttons);
+    vm_write8((unsigned long long)ea + 2, (u8)data->x_axis);
+    vm_write8((unsigned long long)ea + 3, (u8)data->y_axis);
+    vm_write8((unsigned long long)ea + 4, (u8)data->wheel);
+    vm_write8((unsigned long long)ea + 5, (u8)data->tilt);
+}
+
+static void mouse_clear_data(u32 ea)
+{
+    CellMouseData zero;
+    memset(&zero, 0, sizeof(zero));
+    mouse_write_data(ea, &zero);
+}
 
 /* ---------------------------------------------------------------------------
  * Host event injection
@@ -142,23 +165,26 @@ s32 cellMouseEnd(void)
     return CELL_OK;
 }
 
-s32 cellMouseGetData(u32 port_no, CellMouseData* data)
+s32 cellMouseGetData(u32 port_no, CellMouseData* data_guest)
 {
+    u32 ea = (u32)(uintptr_t)data_guest;
+
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
-    if (port_no >= s_mouse_max_connect || !data)
+    if (port_no >= s_mouse_max_connect || !ea)
         return CELL_MOUSE_ERROR_INVALID_PARAMETER;
 
     MousePortState* ms = &s_mouse_ports[port_no];
 
     if (!ms->connected) {
-        memset(data, 0, sizeof(CellMouseData));
+        mouse_clear_data(ea);
         return CELL_MOUSE_ERROR_NO_DEVICE;
     }
 
-    data->update  = ms->updated ? 1 : 0;
-    data->buttons = ms->buttons;
+    CellMouseData data;
+    data.update  = ms->updated ? 1 : 0;
+    data.buttons = ms->buttons;
 
     /* Clamp accumulated deltas to s8 range */
     s32 dx = ms->acc_dx;
@@ -168,10 +194,12 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
     if (dy > 127) dy = 127; if (dy < -128) dy = -128;
     if (wh > 127) wh = 127; if (wh < -128) wh = -128;
 
-    data->x_axis = (s8)dx;
-    data->y_axis = (s8)dy;
-    data->wheel  = (s8)wh;
-    data->tilt   = 0;
+    data.x_axis = (s8)dx;
+    data.y_axis = (s8)dy;
+    data.wheel  = (s8)wh;
+    data.tilt   = 0;
+
+    mouse_write_data(ea, &data);
 
     /* Reset accumulated state */
     ms->acc_dx = 0;
@@ -182,18 +210,22 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
     return CELL_OK;
 }
 
-s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
+s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data_guest)
 {
+    u32 ea = (u32)(uintptr_t)data_guest;
+
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
-    if (port_no >= s_mouse_max_connect || !data)
+    if (port_no >= s_mouse_max_connect || !ea)
         return CELL_MOUSE_ERROR_INVALID_PARAMETER;
 
     MousePortState* ms = &s_mouse_ports[port_no];
 
     if (!ms->connected) {
-        memset(data, 0, sizeof(CellMouseDataList));
+        vm_write32(ea, 0);
+        for (u32 i = 0; i < CELL_MOUSE_MAX_DATA_LIST_NUM; i++)
+            mouse_clear_data(ea + 4 + i * (u32)sizeof(CellMouseData));
         return CELL_MOUSE_ERROR_NO_DEVICE;
     }
 
@@ -206,14 +238,15 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
         ms->updated = 0;
     }
 
-    data->list_num = ms->ring_count;
+    u32 list_num = ms->ring_count;
+    vm_write32(ea, list_num);
     u32 start = 0;
     if (ms->ring_write > CELL_MOUSE_MAX_DATA_LIST_NUM)
         start = ms->ring_write - CELL_MOUSE_MAX_DATA_LIST_NUM;
 
-    for (u32 i = 0; i < ms->ring_count; i++) {
+    for (u32 i = 0; i < list_num; i++) {
         u32 idx = (start + i) % CELL_MOUSE_MAX_DATA_LIST_NUM;
-        data->list[i] = ms->ring[idx];
+        mouse_write_data(ea + 4 + i * (u32)sizeof(CellMouseData), &ms->ring[idx]);
     }
 
     /* Clear ring */
@@ -223,27 +256,35 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
     return CELL_OK;
 }
 
-s32 cellMouseGetInfo(CellMouseInfo* info)
+s32 cellMouseGetInfo(CellMouseInfo* info_guest)
 {
+    u32 ea = (u32)(uintptr_t)info_guest;
+    const u32 vendor_offset = 0x0C;
+    const u32 product_offset = vendor_offset + CELL_MOUSE_MAX_INFO_DEVICES * 2;
+    const u32 status_offset = product_offset + CELL_MOUSE_MAX_INFO_DEVICES * 2;
+
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
-    if (!info)
+    if (!ea)
         return CELL_MOUSE_ERROR_INVALID_PARAMETER;
 
-    memset(info, 0, sizeof(CellMouseInfo));
-    info->max_connect = s_mouse_max_connect;
-
     u32 connected = 0;
-    for (u32 i = 0; i < s_mouse_max_connect; i++) {
-        if (s_mouse_ports[i].connected) {
-            info->status[i] = CELL_MOUSE_STATUS_CONNECTED;
-            info->vendor_id[i]  = 0x054C; /* Sony */
-            info->product_id[i] = 0x0001;
-            connected++;
-        }
+    for (u32 i = 0; i < CELL_MOUSE_MAX_INFO_DEVICES; i++) {
+        int on = i < s_mouse_max_connect && i < CELL_MOUSE_MAX_MICE &&
+                 s_mouse_ports[i].connected;
+        vm_write16((unsigned long long)ea + vendor_offset + i * 2,
+                   on ? 0x054C : 0); /* Sony */
+        vm_write16((unsigned long long)ea + product_offset + i * 2,
+                   on ? 0x0001 : 0);
+        vm_write8((unsigned long long)ea + status_offset + i,
+                  on ? CELL_MOUSE_STATUS_CONNECTED : CELL_MOUSE_STATUS_DISCONNECTED);
+        if (on) connected++;
     }
-    info->now_connect = connected;
+
+    vm_write32((unsigned long long)ea + 0, s_mouse_max_connect);
+    vm_write32((unsigned long long)ea + 4, connected);
+    vm_write32((unsigned long long)ea + 8, 0);
 
     return CELL_OK;
 }

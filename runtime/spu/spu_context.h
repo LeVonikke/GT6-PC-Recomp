@@ -36,6 +36,12 @@ extern "C" {
 #define SPU_MBOX_DEPTH      1    /* SPU write outbound mailbox depth */
 #define SPU_INTR_MBOX_DEPTH 1    /* SPU write inbound interrupt mailbox depth */
 
+/* Lifted brsl/bisl calls use native C calls, while bi-style guest returns are
+ * routed through the indirect-branch helper.  Keep the corresponding guest
+ * return PCs in the execution context so a computed bi r0 can be distinguished
+ * from a genuine tail jump. */
+#define SPU_HOST_CALL_MAX_DEPTH 1024
+
 /* ---------------------------------------------------------------------------
  * SPU channel IDs
  * -----------------------------------------------------------------------*/
@@ -118,6 +124,16 @@ typedef struct spu_context {
     /* Program counter (local store address, 0-0x3FFFF) */
     uint32_t pc;
 
+    void* trampoline_fn;
+
+    /* Guest call/return bookkeeping used by generated brsl/bisl glue. */
+    uint32_t host_call_return_pc[SPU_HOST_CALL_MAX_DEPTH];
+    uint32_t host_call_depth;
+
+    /* Optional bound for policy/bootstrap indirect dispatch.  Zero means
+     * unlimited; selected SPURS runners install a finite budget. */
+    uint32_t indirect_branch_budget;
+
     /* SPU status (running, stopped, etc.) */
     uint32_t status;
     #define SPU_STATUS_STOPPED      0x0
@@ -142,6 +158,7 @@ typedef struct spu_context {
      * so spu_indirect_branch resolves pc within the image currently selected
      * here. 0 = match any image (back-compat for single-image contexts). */
     int image_id;
+
 
     /* Decrementer (a free-running down counter) */
     uint32_t decrementer;
@@ -189,6 +206,45 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
     memset(ctx, 0, sizeof(*ctx));
     ctx->spu_id = spu_id;
     ctx->status = SPU_STATUS_STOPPED;
+}
+
+static inline void spu_host_call_push(spu_context* ctx, uint32_t return_pc)
+{
+    if (ctx->host_call_depth < SPU_HOST_CALL_MAX_DEPTH)
+        ctx->host_call_return_pc[ctx->host_call_depth++] = return_pc & SPU_LS_MASK;
+}
+
+static inline void spu_host_call_pop(spu_context* ctx)
+{
+    if (ctx->host_call_depth != 0)
+        --ctx->host_call_depth;
+}
+
+static inline int spu_host_call_is_return(const spu_context* ctx, uint32_t pc)
+{
+    return ctx->host_call_depth != 0 &&
+           ctx->host_call_return_pc[ctx->host_call_depth - 1] ==
+               (pc & SPU_LS_MASK);
+}
+
+void spu_halt(spu_context* ctx);
+
+/* Execute cross-fragment continuations iteratively so scheduler loops keep a
+ * constant native-stack depth even when the host compiler cannot tail-call. */
+static inline void spu_drain_trampoline(spu_context* ctx)
+{
+    while (ctx->trampoline_fn) {
+        if (ctx->indirect_branch_budget != 0 &&
+            --ctx->indirect_branch_budget == 0) {
+            ctx->trampoline_fn = 0;
+            ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+            spu_halt(ctx);
+            return;
+        }
+        void (*next)(spu_context*) = (void (*)(spu_context*))ctx->trampoline_fn;
+        ctx->trampoline_fn = 0;
+        next(ctx);
+    }
 }
 
 /* ---------------------------------------------------------------------------

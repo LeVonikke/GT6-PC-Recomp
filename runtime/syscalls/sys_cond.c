@@ -318,3 +318,4 @@ void sys_cond_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_COND_SIGNAL,      sys_cond_signal);
     lv2_syscall_register(tbl, SYS_COND_SIGNAL_ALL,  sys_cond_signal_all);
 }
+

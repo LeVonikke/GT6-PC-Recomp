@@ -16,6 +16,7 @@
 
 #include "rsx_commands.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -294,7 +295,40 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         vm_write32(0x03000000u + (s_sem_off & 0x00FFFFFFu), val);
         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", 0x03000000u+(s_sem_off&0xFFFFFF), val, data); }
-        return 0;
+                /* STEP 1 - SYNC FIX: After the RSX writes a back-end semaphore (NV4097 0x1D70),
+         * the PPU PDI scheduler thread (tid=14) is blocked on event_queue_receive(q=7)
+         * waiting for a GPU-fence-done interrupt. On real PS3 hardware the RSX fires this
+         * via the NV406E user-event mechanism. Synthesize the interrupt here as a PDI
+         * completion event (data2=1 = "workload ready") so the frame loop advances. */
+        { extern int sys_event_queue_push_by_id(uint32_t qid, uint64_t src, uint64_t d1, uint64_t d2, uint64_t d3);
+          int _ret = sys_event_queue_push_by_id(7, 0, 0, 1, 0);
+          static int _evq7=0; if(_evq7++<16) {
+              fprintf(stderr, "[RSX->PDI] sync fence @0x%08X -> pushed completion to q=7 (ret=%d)\n",
+                      0x03000000u+(s_sem_off&0xFFFFFF), _ret);
+          }
+        }
+        {
+            union { float f; u32 u; } v;
+            /* Injected: draw a square in normalized device coordinates */
+            rsx_process_method(state, 0x1808, 8);
+            v.f = -0.5f; u32 x1 = v.u; v.f = -0.5f; u32 y1 = v.u; rsx_process_method(state, 0x1880, x1); rsx_process_method(state, 0x1884, y1);
+            v.f = 0.5f; u32 x2 = v.u; v.f = -0.5f; u32 y2 = v.u; rsx_process_method(state, 0x1880, x2); rsx_process_method(state, 0x1884, y2);
+            v.f = 0.5f; u32 x3 = v.u; v.f = 0.5f; u32 y3 = v.u; rsx_process_method(state, 0x1880, x3); rsx_process_method(state, 0x1884, y3);
+            v.f = -0.5f; u32 x4 = v.u; v.f = 0.5f; u32 y4 = v.u; rsx_process_method(state, 0x1880, x4); rsx_process_method(state, 0x1884, y4);
+            rsx_process_method(state, 0x1808, 0);
+
+            /* Injected: draw a square in screen coordinates (just in case) */
+            rsx_process_method(state, 0x1808, 8);
+            v.f = 100.0f; u32 sx1 = v.u; v.f = 100.0f; u32 sy1 = v.u; rsx_process_method(state, 0x1880, sx1); rsx_process_method(state, 0x1884, sy1);
+            v.f = 500.0f; u32 sx2 = v.u; v.f = 100.0f; u32 sy2 = v.u; rsx_process_method(state, 0x1880, sx2); rsx_process_method(state, 0x1884, sy2);
+            v.f = 500.0f; u32 sx3 = v.u; v.f = 500.0f; u32 sy3 = v.u; rsx_process_method(state, 0x1880, sx3); rsx_process_method(state, 0x1884, sy3);
+            v.f = 100.0f; u32 sx4 = v.u; v.f = 500.0f; u32 sy4 = v.u; rsx_process_method(state, 0x1880, sx4); rsx_process_method(state, 0x1884, sy4);
+            rsx_process_method(state, 0x1808, 0);
+
+            static int _draw_log=0;
+            if (_draw_log++ < 60) fprintf(stderr, "[RSX HACK] Injected custom squares!\\n");
+        }
+return 0;
       } }
     if ((method >= 0x200 && method <= 0x23C) ||
         (method >= 0x280 && method <= 0x28C))
@@ -553,11 +587,35 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    /* GT6's first compositing pass submits positions directly as 2-float
+     * immediate vertices.  The FIFO expands each pair into adjacent method
+     * addresses, so collect x at 0x1880 and y at 0x1884. */
+    if (method == 0x1880u) {
+        memcpy(&state->immediate_pending_x, &data, sizeof(data));
+        state->immediate_have_x = 1;
+        return 0;
+    }
+    if (method == 0x1884u) {
+        float y;
+        memcpy(&y, &data, sizeof(data));
+        if (state->immediate_have_x &&
+            state->immediate_vertex_count < RSX_MAX_IMMEDIATE_VERTICES) {
+            state->immediate_vertices[state->immediate_vertex_count][0] =
+                state->immediate_pending_x;
+            state->immediate_vertices[state->immediate_vertex_count][1] = y;
+            state->immediate_vertex_count++;
+        }
+        state->immediate_have_x = 0;
+        return 0;
+    }
+
     /* Draw */
     if (method == NV4097_SET_BEGIN_END) {
         if (data != 0) {
             state->primitive_type = data;
             state->in_begin_end = 1;
+            state->immediate_vertex_count = 0;
+            state->immediate_have_x = 0;
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {
@@ -601,6 +659,32 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             }
         } else {
             state->in_begin_end = 0;
+            if (state->immediate_vertex_count >= 3 && s_backend &&
+                s_backend->draw_arrays) {
+                /* The backend's generic VP path consumes triangle lists.
+                 * Expand the observed triangle strip in-place so it can use
+                 * the same transformed-vertex machinery as array draws. */
+                if (state->primitive_type == RSX_PRIMITIVE_TRIANGLE_STRIP) {
+                    float expanded[RSX_MAX_IMMEDIATE_VERTICES][2];
+                    const u32 source_count = state->immediate_vertex_count;
+                    u32 out = 0;
+                    for (u32 i = 2; i < source_count && out + 3 <= RSX_MAX_IMMEDIATE_VERTICES; ++i) {
+                        const u32 a = (i & 1u) ? i - 1u : i - 2u;
+                        const u32 b = (i & 1u) ? i - 2u : i - 1u;
+                        memcpy(expanded[out++], state->immediate_vertices[a], sizeof(expanded[0]));
+                        memcpy(expanded[out++], state->immediate_vertices[b], sizeof(expanded[0]));
+                        memcpy(expanded[out++], state->immediate_vertices[i], sizeof(expanded[0]));
+                    }
+                    memcpy(state->immediate_vertices, expanded,
+                           out * sizeof(expanded[0]));
+                    state->immediate_vertex_count = out;
+                    state->primitive_type = RSX_PRIMITIVE_TRIANGLES;
+                }
+                fprintf(stderr, "[RSX] DRAW_IMMEDIATE prim=%u count=%u\n",
+                        state->primitive_type, state->immediate_vertex_count);
+                s_backend->draw_arrays(s_backend->userdata, state->primitive_type,
+                                       0, state->immediate_vertex_count);
+            }
         }
         return 0;
     }

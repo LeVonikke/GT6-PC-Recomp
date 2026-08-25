@@ -332,6 +332,14 @@ static inline void ppu_res_stdcx(ppu_context* ctx, uint64_t ea, uint64_t val) {
  * corresponding host function. Handles OPD resolution. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);
 
+/* Guest context-restore routines (longjmp-style) cannot return through the
+ * native host call stack.  Configured restore functions call this after the
+ * register image has been loaded; the runtime unwinds to a root dispatcher and
+ * resumes at the restored guest LR. */
+extern "C" void ppu_nonlocal_jump(ppu_context* ctx);
+extern "C" int  ppu_nonlocal_pending(ppu_context* ctx);
+extern "C" void ppu_nonlocal_clear(ppu_context* ctx);
+
 /* Firmware-import HLE dispatch: a lifted import stub (a .lib.stub trampoline)
  * is replaced with a direct call to the registered HLE handler for its NID
  * instead of running the literal `load OPD ptr; bctrl` trampoline (whose import
@@ -440,6 +448,9 @@ class LiftedFunction:
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)  # addresses of bl targets
     fallthrough_to: int = 0  # if it falls off the end, the continuation address
+    # Return PCs immediately following a configured guest context-save call in
+    # this function.  They are exception landing pads for a later restore.
+    nonlocal_continuations: list[int] = field(default_factory=list)
 
 
 # Max span (bytes) for a mid-function tail-entry / gap wrapper. A real interior
@@ -460,7 +471,8 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
         if s.endswith(":"):
             continue
         t = s.rstrip(";")
-        return (t.startswith("return") or "goto " in t or
+        return (t.startswith("return") or t.startswith("ppu_nonlocal_jump") or
+                "goto " in t or
                 t.startswith("func_") or t.startswith("lv2_syscall") or
                 "{ func_" in t or t.startswith("{ g_trampoline_fn"))
     return False
@@ -491,6 +503,13 @@ class PPULifter:
         # _vfprintf_r: %f never restores r27). Set by main() from
         # discover_jump_tables.
         self.jump_tables: dict[int, list[int]] = {}
+        # Computed local jump tables recovered directly from a bctr's immediate
+        # address arithmetic.  GCC uses this shape for short, alignment-sensitive
+        # routines (notably memset): ``lis/addi; subf index; mtctr; bctr`` jumps
+        # into a run of instructions immediately following the dispatcher.
+        # Unlike normal switch tables, there is no data table for
+        # discover_jump_tables() to read.
+        self.inline_jump_tables: dict[int, list[int]] = {}
         # Optional executable-code window [code_lo, code_hi). When set, branch /
         # call targets that fall outside it are NOT promoted to func_X (they are
         # data the boundary detector mis-read as code -- e.g. .rodata living in
@@ -506,6 +525,11 @@ class PPULifter:
         # `.lib.stub` trampoline (which derefs an import pointer table the recomp
         # never populates -> bctrl to garbage). Populated from --hle-stubs.
         self.hle_stub_nids: dict[int, int] = {}
+        # Entry addresses of guest context-restore functions whose terminal blr
+        # has longjmp semantics.  Their return must escape the entire native
+        # call chain and resume at the LR loaded from the saved guest context.
+        self.nonlocal_restore_addrs: set[int] = set()
+        self.nonlocal_save_addrs: set[int] = set()
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -547,6 +571,97 @@ class PPULifter:
         hi = bisect.bisect_left(addrs, end)
         return ordered[lo:hi]
 
+    @staticmethod
+    def _inline_bctr_cases(range_insns: list["Instruction"],
+                           disp_index: int) -> list[int]:
+        """Recover short local bctr case ranges built from a literal address.
+
+        Some compiler-generated routines form CTR as ``BASE - scaled_index``
+        and branch into a sequence placed directly after the ``bctr``.  This is
+        a jump table in control-flow terms, but has no memory-resident table.
+        The literal BASE is normally built by ``lis/addi`` in the same register
+        that is later passed to ``mtctr``.  Returning every aligned instruction
+        between the dispatcher and BASE is safe: the generated switch still
+        falls back to the normal indirect resolver for all other targets.
+        """
+        insn = range_insns[disp_index]
+        if insn.mnemonic != "bctr":
+            return []
+
+        ctr_reg = None
+        for prior in reversed(range_insns[max(0, disp_index - 10):disp_index]):
+            if prior.mnemonic == "mtctr":
+                ctr_reg = prior.operands.strip()
+                break
+        if not ctr_reg:
+            return []
+
+        def literal_base(reg: str) -> int | None:
+            """Recover ``lis/addi reg,reg`` in the local dispatcher window."""
+            addi_index = None
+            low = None
+            for j in range(disp_index - 1, max(-1, disp_index - 16), -1):
+                prior = range_insns[j]
+                if prior.mnemonic != "addi":
+                    continue
+                ops = _parse_operands(prior.operands)
+                if len(ops) != 3 or ops[0] != reg or ops[1] != reg:
+                    continue
+                try:
+                    low = int(ops[2], 0)
+                except ValueError:
+                    continue
+                addi_index = j
+                break
+            if addi_index is None or low is None:
+                return None
+
+            for j in range(addi_index - 1, max(-1, addi_index - 12), -1):
+                prior = range_insns[j]
+                if prior.mnemonic != "lis":
+                    continue
+                ops = _parse_operands(prior.operands)
+                if len(ops) != 2 or ops[0] != reg:
+                    continue
+                try:
+                    high = int(ops[1], 0) & 0xFFFF
+                except ValueError:
+                    continue
+                return ((high << 16) + low) & 0xFFFFFFFF
+            return None
+
+        # The simplest form builds the literal directly in the CTR source.
+        base = literal_base(ctr_reg)
+
+        # GCC also commonly builds the table base in a separate register, loads
+        # the signed case offset into CTR's eventual source, then combines them:
+        # ``lis/addi rBase; lwzx rCtr,...,rBase; add rCtr,rCtr,rBase; mtctr``.
+        # In this form the literal is not in ctr_reg, so recover the other input
+        # of the final add as the table base.
+        if base is None:
+            for prior in reversed(range_insns[max(0, disp_index - 16):disp_index]):
+                if prior.mnemonic != "add":
+                    continue
+                ops = _parse_operands(prior.operands)
+                if len(ops) != 3 or ops[0] != ctr_reg:
+                    continue
+                for candidate in ops[1:]:
+                    base = literal_base(candidate)
+                    if base is not None:
+                        break
+                if base is not None:
+                    break
+        if base is None:
+            return []
+
+        first = insn.addr + 4
+        # A genuine inline case block is compact and follows the dispatcher.
+        # This bound prevents a literal used for an unrelated indirect branch
+        # from adding a massive switch to an otherwise ordinary function.
+        if not (first <= base <= first + 0x400):
+            return []
+        return list(range(first, base + 1, 4))
+
     def lift_function(self, instructions: list[Instruction],
                       start: int, end: int) -> LiftedFunction:
         """Lift a range of instructions into a C function."""
@@ -579,6 +694,25 @@ class PPULifter:
         # this is O(log N + span) rather than a full O(N) scan per call.
         range_insns = self._range_insns(instructions, start, end)
 
+        # Record the owner-side landing PCs for guest setjmp/context-save calls.
+        # A later restore throws through native frames until it reaches the
+        # still-live lifted function containing this call.  That owner resumes
+        # through a generated tail entry at the saved LR while its own native
+        # callers remain intact.
+        if self.nonlocal_save_addrs:
+            for insn in range_insns:
+                if insn.mnemonic != "bl":
+                    continue
+                ops = _parse_operands(insn.operands)
+                if not ops:
+                    continue
+                try:
+                    target = int(ops[0], 0)
+                except ValueError:
+                    continue
+                if target in self.nonlocal_save_addrs:
+                    func.nonlocal_continuations.append(insn.addr + 4)
+
         # Collect branch targets within the function for labels
         internal_targets: set[int] = set()
         for insn in range_insns:
@@ -603,6 +737,15 @@ class PPULifter:
                 for _c in _cases:
                     if start <= _c < end:
                         internal_targets.add(_c)
+
+        # Literal-address bctr dispatchers have no table in memory.  Recover
+        # their compact fall-through case ranges and make each one a local label
+        # before translating the bctr below.
+        for _i, _insn in enumerate(range_insns):
+            _cases = self._inline_bctr_cases(range_insns, _i)
+            if _cases:
+                self.inline_jump_tables[_insn.addr] = _cases
+                internal_targets.update(_c for _c in _cases if start <= _c < end)
 
         emitted_labels: set[int] = set()
         for insn in range_insns:
@@ -1334,6 +1477,8 @@ class PPULifter:
 
         # ------- Branches -------
         if mn == "blr":
+            if func.start_addr in self.nonlocal_restore_addrs:
+                return "ppu_nonlocal_jump(ctx); return;"
             return "return;"
 
         # blrl = branch to LR *with link* = an indirect CALL through LR, not a
@@ -1461,7 +1606,8 @@ class PPULifter:
             # switch stays one function (the cases share an epilogue/tail;
             # splitting them out orphans the callee-save restore). CTR holds the
             # resolved case address (base + table[idx]); match it to a case.
-            cases = self.jump_tables.get(insn.addr)
+            cases = (self.jump_tables.get(insn.addr)
+                     or self.inline_jump_tables.get(insn.addr))
             if cases:
                 arms = "".join(
                     f"case 0x{c:08X}u: goto loc_{c:08X};"
@@ -3120,8 +3266,27 @@ class PPULifter:
         if label:
             lines.append(f"/* {label} */")
         lines.append(f"void {func.name}(ppu_context* ctx) {{")
-        for bline in func.body_lines:
-            lines.append(f"    {bline}" if not bline.endswith(":") else bline)
+
+        continuations = sorted(set(func.nonlocal_continuations))
+        if continuations:
+            lines.append("    uint32_t _ppu_nonlocal_resume = 0;")
+            lines.append("    for (;;) {")
+            lines.append("        try {")
+            lines.append("            if (_ppu_nonlocal_resume) {")
+            lines.append("                switch (_ppu_nonlocal_resume) {")
+            for cont in continuations:
+                lines.append(
+                    f"                case 0x{cont:08X}u: "
+                    f"{self.prefix}func_{cont:08X}(ctx); "
+                    "DRAIN_TRAMPOLINE(ctx); return;")
+            lines.append("                default: return;")
+            lines.append("                }")
+            lines.append("            }")
+            for bline in func.body_lines:
+                lines.append(f"        {bline}")
+        else:
+            for bline in func.body_lines:
+                lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional
         # branch), PPC execution falls through to the next address. The lifter
@@ -3141,7 +3306,29 @@ class PPULifter:
                 if addr_idx is not None and addr_idx + 1 < len(sorted_addrs):
                     target = func_by_addr[sorted_addrs[addr_idx + 1]].name
             if target:
-                lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}")
+                indent = "            " if continuations else "        "
+                lines.append(
+                    f"{indent}{{ g_trampoline_fn = (void(*)(void*)){target}; return; }}")
+
+        if continuations:
+            # Natural fallthrough must leave the owner rather than repeat the
+            # landing loop. Most bodies already terminate explicitly, but this
+            # also covers a truncated/undecoded tail safely.
+            lines.append("            return;")
+            lines.append("        } catch (...) {")
+            lines.append("            if (!ppu_nonlocal_pending(ctx)) throw;")
+            lines.append("            switch ((uint32_t)ctx->lr) {")
+            for cont in continuations:
+                lines.append(
+                    f"            case 0x{cont:08X}u: "
+                    f"ppu_nonlocal_clear(ctx); _ppu_nonlocal_resume = "
+                    f"0x{cont:08X}u; break;")
+            # The restored context belongs to a save point in an older lifted
+            # frame. Keep unwinding until that owner recognizes its LR.
+            lines.append("            default: throw;")
+            lines.append("            }")
+            lines.append("        }")
+            lines.append("    }")
 
         lines.append("}")
         lines.append("")
@@ -3262,6 +3449,122 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         _dbg(all_insns[i].addr, f"rC={rC}")
         if rC is None:
             continue
+
+        # Inline relative-offset table:
+        #
+        #   lis   rBase, HI(table)
+        #   addi  rBase, rBase, LO(table)
+        #   lwzx  rValue, rIndex, rBase
+        #   extsw rValue, rValue
+        #   add   rValue, rValue, rBase
+        #   mtctr rValue
+        #   bctr
+        #
+        # These tables live in .text immediately after the bctr, so they are
+        # neither TOC-relative nor visible to the old ``lwzx -> lwz(r2)``
+        # recovery below.  They are common in game state switches; failing to
+        # recognize them sends a valid local case address to the function
+        # resolver as an "unresolved indirect call".
+        count = None
+        for w in reversed(win):
+            if w.mnemonic in ('cmplwi', 'cmpwi'):
+                try:
+                    candidate = int(w.operands.split(',')[-1].strip(), 0)
+                    # Nearby comparisons against zero are normally error/state
+                    # checks, not a switch bound.  A zero-case table has no
+                    # useful computed targets, so continue back to the real
+                    # positive range check (e.g. ``cmplwi r22, 0xD``).
+                    if candidate > 0:
+                        count = candidate
+                        break
+                except ValueError:
+                    pass
+        if count is None or count < 0 or count > 4096:
+            count = 256
+
+        def _literal_base(reg):
+            """Return a nearby ``lis/addi reg,reg`` address, if present."""
+            low = None
+            addi_at = None
+            for j in range(len(win) - 1, -1, -1):
+                w = win[j]
+                if w.mnemonic != 'addi':
+                    continue
+                wp = [x.strip() for x in w.operands.split(',')]
+                if len(wp) != 3 or wp[0] != reg or wp[1] != reg:
+                    continue
+                try:
+                    low = int(wp[2], 0)
+                except ValueError:
+                    continue
+                addi_at = j
+                break
+            if addi_at is None:
+                return None
+            for j in range(addi_at - 1, -1, -1):
+                w = win[j]
+                if w.mnemonic != 'lis':
+                    continue
+                wp = [x.strip() for x in w.operands.split(',')]
+                if len(wp) != 2 or wp[0] != reg:
+                    continue
+                try:
+                    return (((int(wp[1], 0) & 0xFFFF) << 16) + low) & 0xFFFFFFFF
+                except ValueError:
+                    return None
+            return None
+
+        inline_base = None
+        for add in reversed(win):
+            if add.mnemonic != 'add':
+                continue
+            ap = [x.strip() for x in add.operands.split(',')]
+            if len(ap) != 3 or ap[0] != rC:
+                continue
+            for base_reg, value_reg in ((ap[1], ap[2]), (ap[2], ap[1])):
+                # The base must be the second address input of an indexed load
+                # whose output is the other add input.  Keeping these roles
+                # explicit handles ``add r0,r0,r9`` without confusing the
+                # loaded offset r0 for the literal table-base r9.
+                has_lwzx = any(
+                    w.mnemonic == 'lwzx' and
+                    (wp := [x.strip() for x in w.operands.split(',')]) and
+                    len(wp) == 3 and wp[0] == value_reg and base_reg in wp[1:]
+                    for w in win)
+                _dbg(all_insns[i].addr,
+                     f"inline add {ap}: base={base_reg} value={value_reg} "
+                     f"lwzx={has_lwzx}")
+                if not has_lwzx:
+                    continue
+                inline_base = _literal_base(base_reg)
+                _dbg(all_insns[i].addr,
+                     f"inline literal base({base_reg})="
+                     f"{'None' if inline_base is None else hex(inline_base)}")
+                if inline_base is not None:
+                    break
+            if inline_base is not None:
+                break
+
+        if inline_base is not None:
+            _dbg(all_insns[i].addr, f"inline table base=0x{inline_base:X} count={count}")
+            inline_targets = []
+            for k in range(count + 1):
+                value = read_u32((inline_base + k * 4) & 0xFFFFFFFF)
+                if value is None:
+                    break
+                offset = value - (1 << 32) if value & 0x80000000 else value
+                target = (inline_base + offset) & 0xFFFFFFFF
+                if text_lo <= target < text_hi and target % 4 == 0:
+                    inline_targets.append(target)
+                else:
+                    break
+            if len(inline_targets) >= 2:
+                tables[all_insns[i].addr] = sorted(set(inline_targets))
+                _dbg(all_insns[i].addr,
+                     f"inline table base=0x{inline_base:X} -> {len(inline_targets)} targets")
+                continue
+            _dbg(all_insns[i].addr, f"inline table yielded {len(inline_targets)} target(s)")
+
         # the indexed table load
         lwzx = next((w for w in reversed(win) if w.mnemonic == 'lwzx'), None)
         _dbg(all_insns[i].addr, f"lwzx={'None' if lwzx is None else lwzx.operands}")
@@ -3291,7 +3594,9 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                         return (d, rA)
             return None
         r_val = p[0]
-        r_base = None; table_base = None
+        r_base = None
+        table_bases: list[int] = []
+        toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
         for cand in (p[1], p[2]):
             ld = _lwz_of(cand)
             if ld is None:
@@ -3299,19 +3604,25 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             d_base, rA = ld
             if d_base is None:
                 continue
-            if rA == 'r2' and toc:                       # one-level: lwz base, d(r2)
-                table_base = read_u32((toc + d_base) & 0xFFFFFFFF)
-            else:                                        # two-level: base <- global <- TOC
-                mid = _lwz_of(rA)
-                if mid is not None and mid[0] is not None and mid[1] == 'r2' and toc:
-                    midval = read_u32((toc + mid[0]) & 0xFFFFFFFF)
-                    if midval is not None:
-                        table_base = read_u32((midval + d_base) & 0xFFFFFFFF)
-            if table_base is not None:
-                r_base = cand; break
-        if table_base is None or not toc:
+            for toc_value in toc_candidates:
+                if not toc_value:
+                    continue
+                table_base = None
+                if rA == 'r2':                           # one-level: lwz base, d(r2)
+                    table_base = read_u32((toc_value + d_base) & 0xFFFFFFFF)
+                else:                                    # two-level: base <- global <- TOC
+                    mid = _lwz_of(rA)
+                    if mid is not None and mid[0] is not None and mid[1] == 'r2':
+                        midval = read_u32((toc_value + mid[0]) & 0xFFFFFFFF)
+                        if midval is not None:
+                            table_base = read_u32((midval + d_base) & 0xFFFFFFFF)
+                if table_base is not None:
+                    table_bases.append(table_base)
+            if table_bases:
+                r_base = cand
+                break
+        if not table_bases:
             continue
-        toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
         # offset table iff an `add rC, *, r_base` combines the loaded value + base
         is_offset = any(
             w.mnemonic == 'add' and
@@ -3323,32 +3634,21 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         for w in reversed(win):
             if w.mnemonic in ('cmplwi', 'cmpwi'):
                 try:
-                    count = int(w.operands.split(',')[-1].strip(), 0)
+                    candidate = int(w.operands.split(',')[-1].strip(), 0)
+                    if candidate > 0:
+                        count = candidate
+                        break
                 except ValueError:
                     count = None
-                break
         if count is None or count < 0 or count > 4096:
             count = 256
 
-        # Multi-TOC executables (e.g. LBP: two TOCs, ~3.6k/2.2k functions each)
-        # load the table base relative to WHICHEVER r2 their function runs
-        # with. We don't track per-function TOCs here, so try each candidate
-        # and keep the one whose table decodes to the most in-text case
-        # targets (a wrong TOC reads unrelated data and validates 0 targets).
+        # Retain the candidate yielding the most valid in-text entries.  This
+        # also handles multi-TOC executables without assuming which module owns
+        # the dispatcher.
         best = []
-        for cand in toc_candidates:
-            if not cand:
-                continue
-            if base_is_ld:
-                hi = read_u32((cand + disp) & 0xFFFFFFFF)
-                table_base = read_u32((cand + disp + 4) & 0xFFFFFFFF)
-                if hi:              # table addresses live in the 32-bit VA space
-                    table_base = None
-            else:
-                table_base = read_u32((cand + disp) & 0xFFFFFFFF)
-            _dbg(all_insns[i].addr, f"cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
-            if table_base is None:
-                continue
+        for table_base in table_bases:
+            _dbg(all_insns[i].addr, f"table_base=0x{table_base:X} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
             targets = []
             for k in range(count + 1):
                 v = read_u32((table_base + k * 4) & 0xFFFFFFFF)
@@ -3388,7 +3688,8 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0):
+                 toc_base=0, nonlocal_restore_addrs=None,
+                 nonlocal_save_addrs=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -3403,6 +3704,8 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_lo"] = code_lo
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
+    _WORKER_STATE["nonlocal_restore_addrs"] = nonlocal_restore_addrs or set()
+    _WORKER_STATE["nonlocal_save_addrs"] = nonlocal_save_addrs or set()
 
 
 def _worker_lift(task):
@@ -3418,6 +3721,10 @@ def _worker_lift(task):
     lifter.code_hi = _WORKER_STATE.get("code_hi", None)
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
+    lifter.nonlocal_restore_addrs = _WORKER_STATE.get(
+        "nonlocal_restore_addrs", set())
+    lifter.nonlocal_save_addrs = _WORKER_STATE.get(
+        "nonlocal_save_addrs", set())
     results = []
     for start, end in bounds:
         blob = b""
@@ -3428,7 +3735,7 @@ def _worker_lift(task):
         insns = disassemble_bytes(blob, start, _WORKER_STATE["be"]) if blob else []
         f = lifter.lift_function(insns, start, end)
         results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
-                        f.fallthrough_to))
+                        f.fallthrough_to, f.nonlocal_continuations))
     return idx0, results, lifter.call_targets, lifter.branch_targets
 
 
@@ -3452,7 +3759,9 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
-                             getattr(lifter, "toc_base", 0)))
+                             getattr(lifter, "toc_base", 0),
+                             lifter.nonlocal_restore_addrs,
+                             lifter.nonlocal_save_addrs))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -3471,10 +3780,11 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
         raise
 
     for idx0 in sorted(results_by_idx):
-        for name, s, e, body, calls, ft in results_by_idx[idx0]:
+        for name, s, e, body, calls, ft, nl_cont in results_by_idx[idx0]:
             lifter.functions.append(LiftedFunction(
                 name=name, start_addr=s, end_addr=e,
-                body_lines=body, calls=calls, fallthrough_to=ft))
+                body_lines=body, calls=calls, fallthrough_to=ft,
+                nonlocal_continuations=nl_cont))
 
 
 def main() -> None:
@@ -3515,6 +3825,17 @@ def main() -> None:
                              "instead of its literal .lib.stub trampoline, and "
                              "split out as its own 0x20-byte function so direct "
                              "calls to it dispatch to the HLE handler.")
+    parser.add_argument("--nonlocal-save", metavar="ADDR", action="append",
+                        type=lambda x: int(x, 0), default=[],
+                        help="Guest context-save function address. Every direct "
+                             "call continuation is forced into the function table "
+                             "so a later context restore can resume at that LR. "
+                             "Repeatable.")
+    parser.add_argument("--nonlocal-restore", metavar="ADDR", action="append",
+                        type=lambda x: int(x, 0), default=[],
+                        help="Guest context-restore/longjmp function address. Its "
+                             "terminal blr calls ppu_nonlocal_jump instead of "
+                             "returning through the stale host call chain. Repeatable.")
     args = parser.parse_args()
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
@@ -3893,6 +4214,35 @@ def main() -> None:
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
+    lifter.nonlocal_restore_addrs = set(args.nonlocal_restore)
+    lifter.nonlocal_save_addrs = set(args.nonlocal_save)
+
+    # A context save records the LR produced by its calling `bl`, i.e. the
+    # instruction immediately after that call.  Longjmp restores exactly one of
+    # those addresses.  Seed them as forced branch targets so the existing
+    # mid-function entry pass emits registered tail fragments for every possible
+    # continuation, even though ordinary direct calls never referenced them as
+    # standalone func_X symbols.
+    if args.nonlocal_save:
+        save_addrs = set(args.nonlocal_save)
+        forced = set()
+        for insn in all_insns:
+            if insn.mnemonic != "bl":
+                continue
+            ops = _parse_operands(insn.operands)
+            if not ops:
+                continue
+            try:
+                target = int(ops[0], 0)
+            except ValueError:
+                continue
+            if target in save_addrs:
+                continuation = insn.addr + 4
+                if (lifter.code_hi is None or
+                        lifter.code_lo <= continuation < lifter.code_hi):
+                    forced.add(continuation)
+        lifter.branch_targets.update(forced)
+        print(f"  nonlocal-save: forced {len(forced)} continuation entries")
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.

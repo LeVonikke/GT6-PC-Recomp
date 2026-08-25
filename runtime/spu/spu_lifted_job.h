@@ -13,6 +13,8 @@
 #ifndef SPU_LIFTED_JOB_H
 #define SPU_LIFTED_JOB_H
 
+#include <stdlib.h>
+
 #include "spu_context.h"
 #include <string.h>
 #include <stdio.h>
@@ -48,6 +50,13 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     spu_context ctx;
     spu_context_init(&ctx, 0);
     ctx.image_id = image_id;     /* select this image's indirect-branch table */
+    /* The raw PDI policy has an endless scheduler dispatch loop.  Under MSVC
+     * the lifted tail branches are ordinary host calls, so keeping that loop
+     * resident eventually exhausts the host thread stack.  Run enough of the
+     * genuine policy to initialize its MFC state, then yield to the PPU-facing
+     * scheduler tick bridge. */
+    if (image_id == 24)
+        ctx.indirect_branch_budget = 5000u;
     /* Initialize the SPU stack pointer to the top of local store (the SPU ABI
      * expects r1 = top-16, 16-byte aligned, with a NULL back-chain). Without
      * this it is 0 from spu_context_init, so the first `r1 -= frame` wraps
@@ -109,6 +118,92 @@ static inline int32_t spu_run_lifted_job_img(spu_lifted_entry_fn entry,
                                              int image_id)
 {
     return spu_run_lifted_job_abi(entry, local_store, args_ea, image_id, 0, 0);
+}
+
+/* Run a raw CellSpurs workload policy after its image and SpursKernelContext
+ * have been installed in LS by the title bridge.  The real kernel dispatch ABI
+ * is r0=kernel-exit, r1=policy stack, r3=kernel context, r4=64-bit workload
+ * data and r5=poll status; execution starts at LS 0xA00. */
+static inline int32_t spu_run_lifted_pdi_policy(spu_lifted_entry_fn entry,
+                                                uint8_t* local_store,
+                                                uint64_t workload_data,
+                                                uint32_t poll_status)
+{
+    if (!entry) return -1;
+    spu_context ctx;
+    spu_context_init(&ctx, 0);
+    ctx.image_id = 24;
+    /* Keep the historical bound by default, but allow a controlled Kernel1
+     * probe to distinguish a genuine scheduler loop from an artificial host
+     * trampoline cutoff.  This is intentionally opt-in: the normal bounded
+     * PDI turn must retain its existing cadence until the persistent lane path
+     * is verified. */
+    ctx.indirect_branch_budget = 5000u;
+    {
+        const char* budget_text = getenv("GT6_PDI_BRANCH_BUDGET");
+        if (budget_text) {
+            const unsigned long parsed = strtoul(budget_text, NULL, 10);
+            /* Zero has the runtime's documented meaning of unbounded.  It is
+             * useful only for the real-Kernel1 persistent-lane experiment;
+             * callers keep the 5000-turn default when the variable is absent. */
+            if (parsed <= 500000ul)
+                ctx.indirect_branch_budget = (uint32_t)parsed;
+        }
+    }
+    ctx.pc = 0x0A00u;
+    if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);
+
+    ctx.gpr[0]._u32[0] = 0x0808u;
+    ctx.gpr[1]._u32[0] = 0x3FFB0u;
+    ctx.gpr[3]._u32[0] = 0x0100u;
+    /* The PDI policy receives CellSpurs' u64 `data` as a doubleword.  GT6's
+     * workload records use a 32-bit EA there (high half zero), but the policy
+     * reads that EA both after a 4-byte vector shift and directly from the
+     * preferred slot when it DMA-loads the worker context.  Preserve a real
+     * 64-bit value verbatim; for the title's 32-bit form mirror the EA into
+     * the preferred lane as well.  Without this, func 0x26F8 observes zero
+     * and skips the very DMA which supplies its PDI worker record. */
+    ctx.gpr[4]._u32[0] = (uint32_t)(workload_data >> 32);
+    ctx.gpr[4]._u32[1] = (uint32_t)workload_data;
+    if (!getenv("GT6_PDI_STRICT_DATA") &&
+        (uint32_t)(workload_data >> 32) == 0)
+        ctx.gpr[4]._u32[0] = (uint32_t)workload_data;
+    /* Diagnostic ABI variant: the raw policy consumes the preferred word for
+     * its first DMA, while the hardware dispatcher supplies `arg` as one
+     * doubleword.  Keep the normal mirrored form by default; this form lets
+     * us verify whether the duplicated low word is contaminating vector math. */
+    if (getenv("GT6_PDI_PREFERRED_DATA_ONLY") &&
+        (uint32_t)(workload_data >> 32) == 0)
+        ctx.gpr[4]._u32[1] = 0;
+    ctx.gpr[5]._u32[0] = poll_status;
+
+    { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+      extern int spu_resume_with_halt(spu_context*);
+      extern int spu_system_service_lockwait(spu_context*);
+      int halted = spu_run_with_halt(entry, &ctx);
+      /* A persistent Kernel1 lane must park system-service work outside the
+       * generated C call chain.  Resuming through the dispatcher retains the
+       * same context/MFC state but starts with an empty host-call stack, which
+       * matches the SPU's independent execution stack.  This mode is entirely
+       * opt-in and handles only the real WID-32 idle boundary. */
+      if (getenv("GT6_PDI_SYSTEM_SERVICE_LOCKWAIT")) {
+          while (halted && ctx.stop_code == 0x7ffeu) {
+              if (!spu_system_service_lockwait(&ctx))
+                  break;
+              ctx.stop_code = 0;
+              ctx.status = 0;
+              halted = spu_resume_with_halt(&ctx);
+          }
+      } }
+    if (getenv("GT6_PDI_EXITTRACE"))
+        fprintf(stderr,
+            "[GT6 PDI exit] status=%u pc=%05X r0=%08X r3=%08X r4=%08X r5=%08X "
+            "ls1510=%08X ls1520=%08X\n",
+            ctx.status, ctx.pc, ctx.gpr[0]._u32[0], ctx.gpr[3]._u32[0],
+            ctx.gpr[4]._u32[0], ctx.gpr[5]._u32[0],
+            spu_ls_read32(&ctx, 0x1510u), spu_ls_read32(&ctx, 0x1520u));
+    if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
+    return 0;
 }
 
 static inline int32_t spu_run_lifted_job(spu_lifted_entry_fn entry,

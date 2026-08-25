@@ -630,11 +630,19 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
     port->buf_size = buf_samples * (u32)sizeof(float);
 
-    static u32 s_audio_guest = 0x01000000u;          /* 1 MB-aligned, free window */
-    u32 guest_buf  = s_audio_guest;
-    s_audio_guest += (port->buf_size + 0xFFFFFu) & ~0xFFFFFu;
-    u32 guest_ridx = s_audio_guest;
-    s_audio_guest += 0x100000u;
+    /* Keep audio outside the title image and the runtime heap ranges.  GT6's
+     * EMAIN owns 0x01000000+, so the old arena silently zeroed its allocator
+     * tables on the first PortOpen.  sys_heap ends at 0x58000000 and sys_vm
+     * begins at 0x60000000.  Give each of the eight ports a stable 2 MiB slot:
+     * one 1 MiB-aligned buffer window plus one read-index window.  Reopening a
+     * port reuses its slot instead of leaking a bump allocation. */
+    if (port->buf_size > 0x100000u) {
+        port->in_use = 0;
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PARAM;
+    }
+    u32 guest_buf  = 0x58000000u + (u32)found * 0x200000u;
+    u32 guest_ridx = guest_buf + 0x100000u;
 
     port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
     memset(port->buffer, 0, port->buf_size);

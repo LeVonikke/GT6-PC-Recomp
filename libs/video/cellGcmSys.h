@@ -72,7 +72,12 @@ extern "C" {
 #define CELL_GCM_LOCATION_MAIN          1  /* main memory */
 
 /* IO mapping limits */
-#define CELL_GCM_MAX_IO_MAPPINGS        16
+/* GT6 maps its main-memory RSX heap in 1 MiB slices during graphics startup.
+ * The original compatibility limit of 16 is exhausted before its final
+ * 0x3FE00000 mapping, causing MapEaIoAddress to fail and the title to abort
+ * while constructing the renderer.  Keep a bounded table, but large enough
+ * for the title's normal startup map set. */
+#define CELL_GCM_MAX_IO_MAPPINGS        64
 
 /* Debug output levels */
 #define CELL_GCM_DEBUG_LEVEL0           0

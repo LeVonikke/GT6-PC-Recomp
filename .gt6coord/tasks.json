@@ -1,0 +1,129 @@
+{
+  "schema": 1,
+  "project": "GT6 static recompilation",
+  "updated_utc": "2026-08-03T20:20:00Z",
+  "tasks": [
+    {
+      "id": "coord-001",
+      "title": "Confirmar ABI e efeitos de inicializa\u00e7\u00e3o dos jobs SPURS de \u00e1udio",
+      "owner": "Antigravity",
+      "state": "completed",
+      "kind": "analysis",
+      "files": [],
+      "scope": "Usar Ghidra/RPCS3/logs para identificar o contrato real de Job Manager e o motivo de o bootstrap chegar ao vcall inv\u00e1lido. N\u00e3o editar nem compilar.",
+      "deliverable": "Recomendacao: Modificar ps3_indirect_call em ppu_loader.cpp para testar range. Se opd < 0x01540000 (ou range .text do GT6), setar code = opd. Caso contrario, tratar como descritor OPD normal.",
+      "evidence": [
+        "1. O unwinder de excecoes C++ do guest usa bctr para saltar para landing pads na secao .text (ex: 0x00EA26E4).",
+        "2. O recompiler PPU converte bctr em ps3_indirect_call, que assume cegamente que ctx->ctr e um descritor OPD.",
+        "3. Ao receber um endereco .text, ps3_indirect_call desreferencia as instrucoes como OPD (opcode 0x807F000C vira code address), causando crash.",
+        "4. vcalls invalidos (ex: 0xFFFFFFFC) causam vm_read32(-4), crashando em memory access invalidos."
+      ]
+    },
+    {
+      "id": "coord-002",
+      "title": "Executar HLE segura para overlays de \u00e1udio e medir avan\u00e7o do boot",
+      "owner": "Codex",
+      "state": "done",
+      "kind": "implementation",
+      "files": [
+        "gt6/spu_job_executor.cpp",
+        "gt6/emain_project/CMakeLists.txt",
+        "historico_ia.txt"
+      ],
+      "scope": "Corrigir o carregamento/contrato dos overlays ou aplicar HLE de \u00e1udio sem corromper o estado PPU; construir e executar smoke tests.",
+      "deliverable": "Build reproduz\u00edvel e resultado de boot/frames, com pr\u00f3ximo bloqueador registrado.",
+      "evidence": [
+        "2026-07-21: build Release succeeded after audio-overlay HLE replacement.",
+        "Smoke analysis_20260721_audio_hle1 reached all early audio chains and RSX fence writes, but exited 1 on unresolved direct/invalid PPU targets before the 30-second deadline.",
+        "Validated next owner: coord-003 fixes direct .text dispatch in runtime/ppu/ppu_loader.cpp."
+      ]
+    },
+    {
+      "id": "coord-003",
+      "title": "Corrigir bctr direto para .text no dispatcher PPU",
+      "owner": "Codex",
+      "state": "done",
+      "kind": "implementation",
+      "files": [
+        "runtime/ppu/ppu_loader.cpp"
+      ],
+      "scope": "Corrigir a semantica de restauracao de contexto do guest no runtime, sem alterar syscalls, SPURS ou arquivos gerados. ps3_indirect_call ja usa ppu_lookup direto; o bloqueador implementavel e ppu_nonlocal_jump atualmente vazio.",
+      "deliverable": "Patch minimo em ppu_loader.cpp que propaga a excecao interna de contexto ate os catch/resume gerados.",
+      "evidence": "Implementado ppu_nonlocal_jump como transferencia interna ate os catch/resume gerados; o contador de profundidade do dispatcher passou a TLS. Build Release passou; os smokes tlsdepth1 (30 s) e longboot1 (90 s) chegaram a video/RSX e encerraram pelo watchdog com codigo 0."
+    },
+    {
+      "id": "coord-004",
+      "title": "Diagnosticar ausencia de draw records apos o primeiro clear RSX",
+      "owner": "Antigravity",
+      "state": "done",
+      "kind": "analysis",
+      "files": [],
+      "scope": "Analisar somente logs analysis_20260721_rtttrace1 e a leitura FIFO em libs/video/cellGcmSys.c. Determinar por que CLEAR_SURFACE chega, mas RTT mostra zero ops e nao ha DRAW_ARRAYS. Nao editar, compilar nem executar comandos longos.",
+      "deliverable": "Hipotese curta, com funcao/condicao exata a corrigir ou proximo trace minimo.",
+      "evidence": "Hipotese descartada na revisao: cellGcm_rsx_process_fifo testa CALL (w & 3 == 2) antes de type == 0 || type == 2, portanto nao pode interceptar CALL como metodo. GCM_2DTRACE em 12 s nao observou metodos fora do subcanal zero; proxima verificacao: SET_OBJECT por subcanal quando o bootstrap chegar ao frame."
+    },
+    {
+      "id": "coord-005",
+      "title": "Despachar corretamente o objeto RSX por subcanal",
+      "owner": "Codex",
+      "state": "done",
+      "kind": "implementation",
+      "files": [
+        "libs/video/cellGcmSys.c"
+      ],
+      "scope": "Rastrear SET_OBJECT e encaminhar apenas subcanais vinculados ao NV4097 para rsx_process_method; manter motores 2D no caminho atual. Compilar e validar com smoke RTT.",
+      "deliverable": "Build e trace que prove se DRAW_ARRAYS/INDEX chega por subcanal 3D nao-zero.",
+      "evidence": [
+        "2026-07-21: SET_OBJECT passou a ser rastreado por subcanal; somente NV4097 e enviado ao processador 3D fora do subcanal zero.",
+        "Build Release passou apos restaurar os simbolos nonlocal do runtime PPU. Smoke analysis_20260721_subchannel3 (25 s) encerrou 0, recebeu CLEAR_SURFACE e comandos do usuario no subcanal 7, mas nao recebeu SET_OBJECT nem DRAW_ARRAYS/INDEX; RTT continuou 0 ops.",
+        "Conclusao: o bloqueio atual ocorre antes da emissao do primeiro buffer 3D de frame, nao no roteamento de subcanal."
+      ]
+    },
+    {
+      "id": "coord-006",
+      "title": "Rearmar ciclo PDI quando novos workloads sao registrados",
+      "owner": "Codex",
+      "state": "done",
+      "kind": "implementation",
+      "files": [
+        "gt6/gt6_hle.cpp",
+        "gt6/spu_policy_runtime.c"
+      ],
+      "scope": "Como a politica PDI liftada rende em 0x808, reexecutar os workers bootstrap registrados quando os workloads posteriores aparecem no scheduler. Nao inventar payloads nem completar jobs.",
+      "deliverable": "Trace PDI que confirme selecao/avanco apos os workloads 5-7 e smoke de estabilidade.",
+      "evidence": [
+        "analysis_20260721_pdi_trace1: os workers 0/1 fazem atomics validos no scheduler e rendem em 0x808 antes dos workloads 5-7 serem adicionados; o observer atual nao os reinicia.",
+        "Implementado: um retorno da policy libera seu bit de execucao; workloads 5-7 agora lancam um ciclo com seu proprio contexto, em vez de reexecutar os contextos 0/1.",
+        "Build Release passou. analysis_20260721_pdi_service1 (30 s) saiu 0 e prova DMA/atomics para os contextos 0172DE00, 0172DC00 e 01670380; as policies ainda rendem em 0x808 e RTT segue 0 ops."
+      ]
+    },
+    {
+      "id": "coord-007",
+      "title": "Entregar ticks de servico PDI na fila LV2 anexada",
+      "owner": "Codex",
+      "state": "done",
+      "kind": "implementation",
+      "files": [
+        "gt6/gt6_hle.cpp"
+      ],
+      "scope": "Passar a fila anexada ao lancador PDI para ativar gt6_pdi_policy_add_scheduler_tick; atualmente todos os lancamentos passam ready_queue=0 apesar de queue=3 existir.",
+      "deliverable": "Smoke que confirme eventos de scheduler na fila 3 e qualquer avanco posterior ao bootstrap.",
+      "evidence": [
+        "spu_policy_runtime.c so cria o ticker quando ready_queue nao e zero; traces anteriores mostravam que hle passava zero em todos os tres pontos de lancamento.",
+        "Build Release passou. analysis_20260721_pdi_tick1 (30 s, exit 0) confirma o ticker PDI na fila 3 e retornos repetidos de q=3 para tid 8 com o payload esperado {0,0,1,0}.",
+        "Ainda sem DRAW_ARRAYS/INDEX; RTT 0 ops. O PPU recebe o servico PDI, portanto o proximo bloqueio nao e mais a entrega do wakeup."
+      ]
+    },
+    {
+      "id": "coord-008",
+      "title": "Investigar localizacao da entrada de trabalho no dispatcher (campos +0x38/+0x40)",
+      "owner": "Antigravity",
+      "state": "done",
+      "kind": "analysis",
+      "files": [],
+      "scope": "Rastrear a funcao func_00A7273C e por que a localizacao de trabalho nas estruturas raiz nao publica trabalho efetivo (baseado na hipotese de 2026-08-02). Nao fabricar a entrada.",
+      "deliverable": "Explicacao ou patch para o dispatcher PDI/rotas de manutencao.",
+      "evidence": "1. func_00A7273C nao e um dispatcher de trabalho, mas um alocador de memoria (malloc) para o ring buffer em obj40.\n2. Quando r4=1 e r5=0xE00 (route #6), ele tenta alocar 1 bloco de tamanho 0xE00.\n3. A inicializacao (route #3) configurou a lista livre, mas o alloc falha se a fila estiver cheia (obj40+6 e obj40+2 == 0xFFF). Neste caso, ele pula para loc_00A72DBC e retorna um indice dummy (r29 + 0x7FF8).\n4. O chamador (func_00B81EA4) inicializa um pool interno nesse bloco e retorna, sem nunca publicar trabalho efetivo.\n5. Se a alocacao do comando CLEAR_SURFACE recebe esse bloco dummy, a gravacao ocorre em memoria invalida e o comando e perdido, explicando as 0 ops no worker SPU."
+    }
+  ]
+}

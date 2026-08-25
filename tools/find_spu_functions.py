@@ -172,6 +172,16 @@ def collect_brsl_targets(insns):
                       if tok.strip().startswith("0x")]}
 
 
+def collect_call_continuations(insns):
+    """Return addresses after direct SPU calls.
+
+    A policy module often links calls through r78/r79 rather than r0.  Its
+    `bi $r78` return is an indirect branch, so the instruction immediately
+    following each brsl/brasl must be a registered dispatch entry too.
+    """
+    return {ins.addr + 4 for ins in insns if ins.mnemonic in ("brsl", "brasl")}
+
+
 # Mnemonics that end a function's fall-through region.
 _TERMINATORS_NO_FALLTHROUGH = {
     "stop", "stopd",        # absolute end
@@ -239,6 +249,8 @@ def detect_functions(buf, base_override=None, verbose=True):
     for t in collect_branch_targets(insns):
         if code_start <= t < code_end:
             seed_starts.add(t)
+    seed_starts.update(t for t in collect_call_continuations(insns)
+                       if code_start <= t < code_end)
 
     # Always cover the entry of the text segment itself (some images have no
     # entry point but a function at va 0).
@@ -289,6 +301,46 @@ def detect_functions(buf, base_override=None, verbose=True):
     return cleaned, (text_off, base, len(code))
 
 
+def detect_raw_functions(buf, base=0, entry=None, verbose=True):
+    """Discover function ranges in a raw local-store SPU module.
+
+    CellSpurs policy modules are commonly shipped as a bare local-store image
+    rather than an ELF.  They have no symbol table, but direct branch targets
+    provide the same useful boundary seeds as a stripped ELF.
+    """
+    code = buf
+    code_start, code_end = base, base + len(code)
+    insns = disassemble_spu(code, base_addr=base)
+    insns_by_addr = {ins.addr: ins for ins in insns}
+    seed_starts = {code_start}
+    if entry is not None and code_start <= entry < code_end:
+        seed_starts.add(entry)
+    seed_starts.update(t for t in collect_branch_targets(insns)
+                       if code_start <= t < code_end)
+    seed_starts.update(t for t in collect_call_continuations(insns)
+                       if code_start <= t < code_end)
+    sorted_starts = sorted(seed_starts)
+    funcs = [(s, find_end(s, insns_by_addr, sorted_starts, code_end))
+             for s in sorted_starts]
+    cleaned = []
+    for s, e in sorted(funcs):
+        if e <= s:
+            continue
+        if cleaned and s < cleaned[-1][1]:
+            ps, pe = cleaned[-1]
+            cleaned[-1] = (ps, max(pe, e))
+        else:
+            cleaned.append((s, e))
+    if verbose:
+        print(f"Raw text: va=0x{code_start:X} .. 0x{code_end:X} "
+              f"({len(code):,} bytes, {len(insns):,} instructions)")
+        print(f"Seeds: entry={'set' if entry is not None else 'none'}, "
+              f"{len(collect_branch_targets(insns))} branch targets, "
+              f"{len(sorted_starts)} unique starts")
+        print(f"Detected {len(cleaned)} function(s)")
+    return cleaned
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -299,12 +351,21 @@ def main():
                         "`spu_lifter.py --base <va>`)")
     p.add_argument("--base", type=lambda x: int(x, 0), default=None,
                    help="Override the .text base address")
+    p.add_argument("--raw", action="store_true",
+                   help="Treat input as a raw local-store image instead of an ELF")
+    p.add_argument("--entry", type=lambda x: int(x, 0), default=None,
+                   help="Raw-image entry address (used with --raw)")
     args = p.parse_args()
 
     with open(args.input, "rb") as f:
         buf = f.read()
 
-    funcs, (text_off, base, size) = detect_functions(buf, args.base)
+    if args.raw:
+        base = 0 if args.base is None else args.base
+        funcs = detect_raw_functions(buf, base, args.entry)
+        text_off, size = 0, len(buf)
+    else:
+        funcs, (text_off, base, size) = detect_functions(buf, args.base)
 
     out_obj = [{"start": s, "end": e} for s, e in funcs]
     if args.out:

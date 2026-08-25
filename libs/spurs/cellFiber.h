@@ -64,6 +64,10 @@ typedef struct CellFiberAttribute {
  * -----------------------------------------------------------------------*/
 
 s32 cellFiberPpuInitialize(void);
+/* Internal SDK entry point used by retail titles. Its scheduler-state argument
+ * lives in guest memory, so the HLE implementation must not dereference it as
+ * a host pointer. */
+s32 _cellFiberPpuInitialize(void);
 s32 cellFiberPpuFinalize(void);
 
 /* Fiber lifecycle */

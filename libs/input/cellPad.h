@@ -21,6 +21,7 @@ extern "C" {
 
 #define CELL_PAD_MAX_PORT_NUM       7
 #define CELL_PAD_MAX_CODES          64
+#define CELL_PAD_MAX_CAPABILITY_INFO 32
 #define CELL_MAX_PADS               CELL_PAD_MAX_PORT_NUM
 
 /* Button bitmask constants (digital buttons, in button[2] low word) */
@@ -139,12 +140,13 @@ typedef struct CellPadInfo2 {
 
 /* Capability info for a specific port */
 typedef struct CellPadCapabilityInfo {
-    u32 info[CELL_PAD_MAX_CODES];
+    u32 info[CELL_PAD_MAX_CAPABILITY_INFO];
 } CellPadCapabilityInfo;
 
 /* Actuator (vibration) parameter */
 typedef struct CellPadActParam {
     u8 motor[CELL_PAD_ACTUATOR_MAX];
+    u8 reserved[6];
 } CellPadActParam;
 
 /* ---------------------------------------------------------------------------

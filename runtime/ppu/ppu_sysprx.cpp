@@ -18,12 +18,16 @@
 #include <string.h>
 #include <mutex>
 #include <map>
+#include <memory>
+#include <condition_variable>
+#include <chrono>
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
+extern "C" void     ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
 
 /* Simple bump allocator for TLS areas, in a free vm region below the stack. */
 static uint32_t s_tls_next = 0x0E000000u;
@@ -145,10 +149,44 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * lwmutex. The CRT and (newly) libsre's cellSpurs create/wait/signal these. Like
  * sys_lwmutex above, model it directly in guest memory so the args stay GUEST
  * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
- * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
- * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
- * handshakes, not long-term blocking. sys_lwcond_t: +0x00 lwmutex EA (be64),
- * +0x08 lwcond_queue id. */
+ * deref'd them as host pointers -> AV during cellSpurs init).  A previous
+ * no-op wait made guest polling loops call this import millions of times per
+ * second.  Keep a host-side generation/cv per guest object so signals wake
+ * waiters, with a short cooperative fallback for still-unimplemented SPU
+ * producers. sys_lwcond_t: +0x00 lwmutex EA (be64), +0x08 lwcond_queue id. */
+struct LwcondState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    uint64_t generation = 0;
+};
+
+static std::mutex g_lwcond_map_mtx;
+static std::map<uint32_t, std::shared_ptr<LwcondState>> g_lwcond_states;
+
+static std::shared_ptr<LwcondState> lwcond_state(uint32_t lwcond)
+{
+    std::lock_guard<std::mutex> lock(g_lwcond_map_mtx);
+    auto& state = g_lwcond_states[lwcond];
+    if (!state) state = std::make_shared<LwcondState>();
+    return state;
+}
+
+/* A single-condition trace is useful for title bring-up: the normal lwcond
+ * trace is deliberately capped and is exhausted long before an asynchronous
+ * boot resource completes.  It is diagnostic only and selected explicitly
+ * with GT6_LWCOND_TARGET=<guest condition address>. */
+static bool gt6_lwcond_is_target(uint32_t lwcond)
+{
+    static int initialized = 0;
+    static uint32_t target = 0;
+    if (!initialized) {
+        const char* value = getenv("GT6_LWCOND_TARGET");
+        target = value ? (uint32_t)strtoul(value, nullptr, 0) : 0;
+        initialized = 1;
+    }
+    return target != 0 && target == lwcond;
+}
+
 static void sys_lwcond_create(ppu_context* ctx)
 {
     static uint32_t s_lwcond_id = 0x4C000000u;
@@ -156,13 +194,126 @@ static void sys_lwcond_create(ppu_context* ctx)
     uint32_t lwmutex = (uint32_t)ctx->gpr[4];
     vm_write64(lwcond + 0x00, (uint64_t)lwmutex);
     vm_write32(lwcond + 0x08, ++s_lwcond_id);
+    (void)lwcond_state(lwcond);
+    if (gt6_lwcond_is_target(lwcond))
+        fprintf(stderr, "[GT6 LWCOND TARGET] create cond=%08X mutex=%08X tid=%llu lr=%08X\n",
+                lwcond, lwmutex, (unsigned long long)ctx->thread_id,
+                (uint32_t)ctx->lr);
+    if (getenv("GT6_LWCOND_TRACE")) {
+        static unsigned create_count;
+        if (create_count++ < 64)
+            fprintf(stderr, "[GT6 LWCOND] create cond=%08X mutex=%08X tid=%llu lr=%08X\n",
+                    lwcond, lwmutex, (unsigned long long)ctx->thread_id,
+                    (uint32_t)ctx->lr);
+    }
     ctx->gpr[3] = 0;
 }
-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
-static void sys_lwcond_wait(ppu_context* ctx)       { ctx->gpr[3] = 0; }
+static void sys_lwcond_destroy(ppu_context* ctx)
+{
+    const uint32_t lwcond = (uint32_t)ctx->gpr[3];
+    if (gt6_lwcond_is_target(lwcond))
+        fprintf(stderr, "[GT6 LWCOND TARGET] destroy cond=%08X tid=%llu lr=%08X\n",
+                lwcond, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    std::lock_guard<std::mutex> lock(g_lwcond_map_mtx);
+    g_lwcond_states.erase(lwcond);
+    ctx->gpr[3] = 0;
+}
+static void sys_lwcond_signal(ppu_context* ctx)
+{
+    const uint32_t lwcond = (uint32_t)ctx->gpr[3];
+    const auto state = lwcond_state(lwcond);
+    { std::lock_guard<std::mutex> lock(state->mutex); ++state->generation; }
+    state->cv.notify_one();
+    if (gt6_lwcond_is_target(lwcond))
+        fprintf(stderr, "[GT6 LWCOND TARGET] signal cond=%08X generation=%llu tid=%llu lr=%08X\n",
+                lwcond, (unsigned long long)state->generation,
+                (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    if (getenv("GT6_LWCOND_TRACE")) {
+        static unsigned signal_count;
+        if (signal_count++ < 128)
+            fprintf(stderr, "[GT6 LWCOND] signal cond=%08X generation=%llu tid=%llu lr=%08X\n",
+                    lwcond, (unsigned long long)state->generation,
+                    (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    }
+    ctx->gpr[3] = 0;
+}
+static void sys_lwcond_signal_all(ppu_context* ctx)
+{
+    const auto state = lwcond_state((uint32_t)ctx->gpr[3]);
+    { std::lock_guard<std::mutex> lock(state->mutex); ++state->generation; }
+    state->cv.notify_all();
+    ctx->gpr[3] = 0;
+}
+static void sys_lwcond_signal_to(ppu_context* ctx)
+{
+    sys_lwcond_signal(ctx); /* target thread id is advisory in this host bridge */
+}
+static void sys_lwcond_wait(ppu_context* ctx)
+{
+    const uint32_t lwcond = (uint32_t)ctx->gpr[3];
+    /* A few optional host-service paths use -1 as a disabled condition
+     * handle.  It is not a guest address; attempting vm_read64(0xFFFFFFFF)
+     * crosses the guest window and turns an otherwise harmless wait into a
+     * host access violation.  Treat that sentinel as an already-satisfied
+     * wait, matching the non-blocking fallback used by the other lwcond HLEs. */
+    if (lwcond == 0xFFFFFFFFu) {
+        ctx->gpr[3] = 0;
+        return;
+    }
+    const uint32_t lwmutex = (uint32_t)vm_read64(lwcond);
+    const auto state = lwcond_state(lwcond);
+
+    /* For a selected bring-up condition, capture the actual guest waiter
+     * before blocking.  The post-wait trace is unreachable when its producer
+     * is missing, so it cannot identify that producer/consumer edge.  The
+     * immediate caller is the generic lwcond wrapper; its caller LR is saved
+     * at +0xB0 in that wrapper's guest frame.  Logging that word avoids the
+     * expensive full stack walk, which changes this timing-sensitive path. */
+    if (gt6_lwcond_is_target(lwcond)) {
+        const uint32_t caller_lr = (uint32_t)vm_read64((uint32_t)ctx->gpr[1] + 0xB0u);
+        fprintf(stderr, "[GT6 LWCOND TARGET] enter cond=%08X mutex=%08X gen=%llu tid=%llu lr=%08X caller=%08X sp=%08X\n",
+                lwcond, lwmutex, (unsigned long long)state->generation,
+                (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr,
+                caller_lr,
+                (uint32_t)ctx->gpr[1]);
+    }
+
+    /* Host mutexes are opt-in, but preserve the usual condvar hand-off when
+     * that stronger synchronization mode is enabled. */
+    if (ydkj_reallwm() && lwmutex) lwm_host_mutex(lwmutex).unlock();
+    std::unique_lock<std::mutex> lock(state->mutex);
+    const uint64_t generation = state->generation;
+    /* sys_lwcond_wait has no timeout in its PS3 ABI.  Returning after one host
+     * millisecond turned every asynchronous resource wait into a busy poll;
+     * more importantly, consumers could run their cancellation path before
+     * the producer posted its completion.  Keep the guest suspended until the
+     * paired signal changes this condition's generation. */
+    state->cv.wait(lock, [&] {
+        return state->generation != generation;
+    });
+    const bool signaled = true;
+    if (gt6_lwcond_is_target(lwcond))
+        fprintf(stderr, "[GT6 LWCOND TARGET] wait cond=%08X generation=%llu -> %s tid=%llu lr=%08X\n",
+                lwcond, (unsigned long long)generation, signaled ? "signal" : "timeout",
+                (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    if (getenv("GT6_LWCOND_TRACE")) {
+        static unsigned wait_count;
+        if (wait_count++ < 192)
+            fprintf(stderr, "[GT6 LWCOND] wait cond=%08X gen=%llu -> %s tid=%llu lr=%08X\n",
+                    lwcond, (unsigned long long)generation,
+                    signaled ? "signal" : "timeout",
+                    (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+        if (!signaled) {
+            static std::map<uint32_t, bool> dumped_timeout_waiters;
+            if (dumped_timeout_waiters.emplace(lwcond, true).second) {
+                ppu_dump_guest_stack(ctx, "lwcond-unsignaled");
+            }
+        }
+    }
+    lock.unlock();
+    if (ydkj_reallwm() && lwmutex) lwm_host_mutex(lwmutex).lock();
+    ctx->gpr[3] = 0;
+}
 
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = main thread id (1). */
 static void sys_ppu_thread_get_id(ppu_context* ctx)
@@ -379,7 +530,10 @@ extern "C" void ppu_sysprx_register(void)
      * context OPD) into cellGcm_fifo_recycle so the FIFO ring recycles on wrap. */
     ppu_register_function(GCM_FIFO_CALLBACK_SENTINEL_EA, hle_gcm_callback);
     ps3_hle_register_ctx(ps3_compute_nid("sys_initialize_tls"),       "sys_initialize_tls",       sys_initialize_tls);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_time_get_system_time"), "sys_time_get_system_time", sys_time_get_system_time);
+    // GT6 imports the retail sys_time NID directly.  The generic hash helper
+    // resolves a different value for this export, leaving title timing loops
+    // with the unresolved fallback instead of a monotonic clock.
+    ps3_hle_register_ctx(0x8461E528u, "sys_time_get_system_time", sys_time_get_system_time);
     ps3_hle_register_ctx(ps3_compute_nid("sys_process_is_stack"),     "sys_process_is_stack",     sys_process_is_stack);
     /* Atexit registration: nothing to do at boot, just succeed. */
     ps3_hle_register_ctx(ps3_compute_nid("_sys_process_atexitspawn"), "_sys_process_atexitspawn", crt_ok);

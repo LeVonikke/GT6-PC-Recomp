@@ -106,6 +106,16 @@ s32 cellFiberPpuInitialize(void)
     return CELL_OK;
 }
 
+/* Retail code calls this private export during its per-thread CRT setup.  The
+ * actual SDK receives a pointer to a guest scheduler record in r3; this HLE's
+ * scheduler state is host-owned, and the generic NID bridge passes guest values
+ * as integers, so deliberately keep this ABI adapter argument-free.  On the
+ * x64 host ABI extra register arguments are ignored. */
+s32 _cellFiberPpuInitialize(void)
+{
+    return cellFiberPpuInitialize();
+}
+
 s32 cellFiberPpuFinalize(void)
 {
     printf("[cellFiber] Finalize()\n");

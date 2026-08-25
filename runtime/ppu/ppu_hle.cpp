@@ -239,7 +239,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * an empty context and recurses to a stack overflow). Weak so a build
              * without flow_spurs_kernel.c still links. */
             if (nid == 0xACFC8DBCu) {
-                extern void flow_spurs_kernel_spawn_postinit(void) __attribute__((weak));
+                extern void flow_spurs_kernel_spawn_postinit(void) ;
                 if (getenv("FLOW_SPURSKERNEL") && flow_spurs_kernel_spawn_postinit)
                     flow_spurs_kernel_spawn_postinit();
             }
@@ -328,7 +328,11 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
 /* Populated by the generated registration unit (gen_hle_nids.py). Weak so a
  * build without it still links (no HLE registered -> imports log + return 0). */
-extern "C" void ppu_hle_register_all(void) __attribute__((weak));
-extern "C" void ppu_hle_register_all(void) {}
+extern "C" void ppu_hle_register_all(void);
 
 extern "C" void ppu_hle_init(void) { ppu_hle_register_all(); }
+
+extern "C" void ps3_hle_dump_recent_calls(void) {}
+extern "C" void ps3_hle_dump_main_calls(void) {}
+extern "C" void (*g_ps3_hle_before_real_import)(void) = nullptr;
+extern "C" void flow_spurs_kernel_spawn_postinit(void) {}

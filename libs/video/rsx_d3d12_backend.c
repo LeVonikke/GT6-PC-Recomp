@@ -2963,6 +2963,14 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
     for (int i = 0; i < 16; i++) {
         VPSlot* o = &out16[i];
         o->v[0] = o->v[1] = o->v[2] = 0.0f; o->v[3] = 1.0f;
+    }
+    if (state->immediate_vertex_count && vi < state->immediate_vertex_count) {
+        out16[0].v[0] = state->immediate_vertices[vi][0];
+        out16[0].v[1] = state->immediate_vertices[vi][1];
+        return;
+    }
+    for (int i = 0; i < 16; i++) {
+        VPSlot* o = &out16[i];
         const rsx_vertex_attrib* a = &state->vertex_attribs[i];
         if (!a->enabled || a->stride == 0) continue;
         const u8* p = vm_base + cellGcmResolveOffset(a->offset + vi * a->stride);
@@ -3045,7 +3053,7 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
-    if (!state->vertex_attribs[0].enabled) return 0;
+    if (!state->vertex_attribs[0].enabled && !state->immediate_vertex_count) return 0;
     vp_attrs_dbg(state);
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (count > maxv) count = maxv - (maxv % 3);

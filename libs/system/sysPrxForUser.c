@@ -140,6 +140,25 @@ typedef struct {
 static HeapSlot s_heaps[MAX_HEAPS];
 static u32 s_next_heap_id = 1;
 
+/* Fixed-block pools use guest memory supplied by the title.  Only allocation
+ * metadata lives on the host; returned pointers remain 32-bit guest EAs. */
+#define MAX_MEMPOOLS 32
+typedef struct {
+    int in_use;
+    u32 id;
+    u32 chunk_ea;
+    u64 chunk_size;
+    u64 block_size;
+    u64 alignment;
+    u32 block_count;
+    u32 free_count;
+    u8* allocated;
+    u32* free_indices;
+} MempoolSlot;
+
+static MempoolSlot s_mempools[MAX_MEMPOOLS];
+static u32 s_next_mempool_id = 1;
+
 /* ---------------------------------------------------------------------------
  * Thread management
  *
@@ -760,6 +779,149 @@ u32 sys_heap_create_heap_ret(u32 name, u32 type, u32 blocksize, u32 flags)
 }
 
 /* ---------------------------------------------------------------------------
+ * Fixed-block memory pools
+ * -----------------------------------------------------------------------*/
+
+extern void vm_write32(u64 addr, u32 value);
+
+static MempoolSlot* mempool_find(sys_mempool_t id)
+{
+    for (u32 i = 0; i < MAX_MEMPOOLS; i++) {
+        if (s_mempools[i].in_use && s_mempools[i].id == id)
+            return &s_mempools[i];
+    }
+    return NULL;
+}
+
+s32 sys_mempool_create(sys_mempool_t* mempool, void* chunk,
+                        u64 chunk_size, u64 block_size, u64 alignment)
+{
+    const u32 out_ea = (u32)(uintptr_t)mempool;
+    const u32 chunk_ea = (u32)(uintptr_t)chunk;
+
+    if (!out_ea || !chunk_ea || !block_size || block_size > chunk_size)
+        return (s32)CELL_EINVAL;
+    if (alignment == 0 || alignment == 2)
+        alignment = 4;
+    if ((alignment & (alignment - 1)) != 0 || (chunk_ea & 7u) != 0)
+        return (s32)CELL_EINVAL;
+    if (chunk_size > 0xffffffffull - chunk_ea)
+        return (s32)CELL_EINVAL;
+
+    const u64 count64 = chunk_size / block_size;
+    if (!count64 || count64 > 0xffffffffull)
+        return (s32)CELL_EINVAL;
+
+    u8* allocated = (u8*)calloc((size_t)count64, 1);
+    u32* free_indices = (u32*)malloc((size_t)count64 * sizeof(u32));
+    if (!allocated || !free_indices) {
+        free(allocated);
+        free(free_indices);
+        return (s32)CELL_ENOMEM;
+    }
+    for (u32 i = 0; i < (u32)count64; i++)
+        free_indices[i] = i;
+
+    slot_lock();
+    for (u32 i = 0; i < MAX_MEMPOOLS; i++) {
+        MempoolSlot* pool = &s_mempools[i];
+        if (pool->in_use)
+            continue;
+
+        u32 id = s_next_mempool_id++;
+        if (!id)
+            id = s_next_mempool_id++;
+        memset(pool, 0, sizeof(*pool));
+        pool->in_use = 1;
+        pool->id = id;
+        pool->chunk_ea = chunk_ea;
+        pool->chunk_size = chunk_size;
+        pool->block_size = block_size;
+        pool->alignment = alignment;
+        pool->block_count = (u32)count64;
+        pool->free_count = (u32)count64;
+        pool->allocated = allocated;
+        pool->free_indices = free_indices;
+        vm_write32(out_ea, id);
+        slot_unlock();
+        printf("[sysPrxForUser] sys_mempool_create(id=%u, chunk=0x%08X, blocks=%u)\n",
+               id, chunk_ea, (u32)count64);
+        return CELL_OK;
+    }
+    slot_unlock();
+    free(allocated);
+    free(free_indices);
+    return (s32)CELL_ENOMEM;
+}
+
+void sys_mempool_destroy(sys_mempool_t mempool)
+{
+    slot_lock();
+    MempoolSlot* pool = mempool_find(mempool);
+    if (pool) {
+        u8* allocated = pool->allocated;
+        u32* free_indices = pool->free_indices;
+        memset(pool, 0, sizeof(*pool));
+        free(allocated);
+        free(free_indices);
+    }
+    slot_unlock();
+}
+
+u64 sys_mempool_get_count(sys_mempool_t mempool)
+{
+    slot_lock();
+    MempoolSlot* pool = mempool_find(mempool);
+    const u64 result = pool ? pool->free_count : (u64)CELL_EINVAL;
+    slot_unlock();
+    return result;
+}
+
+void* sys_mempool_try_allocate_block(sys_mempool_t mempool)
+{
+    u32 block_ea = 0;
+    slot_lock();
+    MempoolSlot* pool = mempool_find(mempool);
+    if (pool && pool->free_count) {
+        /* RPCS3 models this as a LIFO free-block vector. */
+        const u32 index = pool->free_indices[--pool->free_count];
+        pool->allocated[index] = 1;
+        block_ea = pool->chunk_ea + (u32)(index * pool->block_size);
+    }
+    slot_unlock();
+    return (void*)(uintptr_t)block_ea;
+}
+
+s32 sys_mempool_free_block(sys_mempool_t mempool, void* block)
+{
+    const u32 block_ea = (u32)(uintptr_t)block;
+    slot_lock();
+    MempoolSlot* pool = mempool_find(mempool);
+    if (!pool || block_ea < pool->chunk_ea) {
+        slot_unlock();
+        return (s32)CELL_EINVAL;
+    }
+
+    const u64 delta = (u64)block_ea - pool->chunk_ea;
+    if (delta >= pool->block_size * pool->block_count ||
+        (delta % pool->block_size) != 0) {
+        slot_unlock();
+        return (s32)CELL_EINVAL;
+    }
+
+    const u32 index = (u32)(delta / pool->block_size);
+    if (!pool->allocated[index]) {
+        slot_unlock();
+        return (s32)CELL_EINVAL;
+    }
+    pool->allocated[index] = 0;
+    pool->free_indices[pool->free_count] = index;
+    pool->free_count++;
+    slot_unlock();
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * PRX utilities
  * -----------------------------------------------------------------------*/
 
@@ -784,6 +946,30 @@ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 
     if (!hid) return CELL_EFAULT;
     *hid = 0; /* fake module ID */
+    return CELL_OK;
+}
+
+s32 sys_prx_get_module_list(u64 flags, sys_prx_module_list_t* list)
+{
+    (void)flags;
+    const u32 list_ea = (u32)(uintptr_t)list;
+    if (!list_ea)
+        return (s32)CELL_EINVAL;
+
+    /* Static recompilation has no LV2 PRX ID namespace to enumerate.  The
+     * verified retail structure stores max/count/idlist at +8/+12/+16; report
+     * an empty list while preserving the caller's capacity and buffers. */
+    const u32 max = ((u32)vm_base[list_ea + 8] << 24) |
+                    ((u32)vm_base[list_ea + 9] << 16) |
+                    ((u32)vm_base[list_ea + 10] << 8) |
+                    (u32)vm_base[list_ea + 11];
+    const u32 idlist = ((u32)vm_base[list_ea + 16] << 24) |
+                       ((u32)vm_base[list_ea + 17] << 16) |
+                       ((u32)vm_base[list_ea + 18] << 8) |
+                       (u32)vm_base[list_ea + 19];
+    if (max && !idlist)
+        return (s32)CELL_EINVAL;
+    vm_write32(list_ea + 12u, 0);
     return CELL_OK;
 }
 

@@ -15,6 +15,12 @@
 extern "C" {
 #endif
 
+/* Optional title bridge notified after guest-visible workload readiness
+ * changes.  It lets a statically lifted policy re-enter only when the PPU has
+ * explicitly requested service, while keeping the generic SPURS HLE usable
+ * for titles that do not install an observer. */
+extern void (*cellspurs_ready_count_observer)(u32 spurs_ea, u32 wid);
+
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
@@ -42,6 +48,13 @@ extern "C" {
 #define CELL_SPURS_TASK_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x31)
 #define CELL_SPURS_TASK_ERROR_FAULT             (CELL_ERROR_BASE_SPURS | 0x32)
 #define CELL_SPURS_TASK_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x29)
+
+/* Workload policy-module APIs use a distinct SDK error family. */
+#define CELL_SPURS_POLICY_MODULE_ERROR_INVAL        ((s32)0x80410802u)
+#define CELL_SPURS_POLICY_MODULE_ERROR_SRCH         ((s32)0x80410805u)
+#define CELL_SPURS_POLICY_MODULE_ERROR_STAT         ((s32)0x8041080Fu)
+#define CELL_SPURS_POLICY_MODULE_ERROR_ALIGN        ((s32)0x80410810u)
+#define CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER ((s32)0x80410811u)
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -87,19 +100,31 @@ typedef struct CellSpursTask CellSpursTask;
 typedef struct CellSpursTaskAttribute CellSpursTaskAttribute;
 typedef struct CellSpursEventFlag CellSpursEventFlag;
 typedef struct CellSpursWorkloadAttribute CellSpursWorkloadAttribute;
+typedef struct CellSpursWorkloadInfo CellSpursWorkloadInfo;
 
 typedef u32 CellSpursWorkloadId;
 typedef u32 CellSpursTaskId;
 
-/* SPURS attribute -- used to configure a SPURS instance before creation */
+/* Guest CellSpursAttribute layout (0x200 bytes, 8-byte aligned by the SDK).
+ * Integer fields are big-endian in guest memory; HLE code must access them
+ * through vm_read32/vm_write32 rather than dereferencing them on the host. */
 struct CellSpursAttribute {
-    u32  nSpus;
-    s32  spuPriority[CELL_SPURS_MAX_SPU];
-    u8   prefix[16];
-    u32  prefixSize;
-    u32  flags;
-    u32  container;
-    u8   _padding[128];
+    u32  revision;          /* +0x00, BE32 */
+    u32  sdkVersion;        /* +0x04, BE32 */
+    u32  nSpus;             /* +0x08, BE32 */
+    s32  spuPriority;       /* +0x0C, BE32 */
+    s32  ppuPriority;       /* +0x10, BE32 */
+    u8   exitIfNoWork;      /* +0x14 */
+    u8   prefix[15];        /* +0x15, not necessarily NUL-terminated */
+    u32  prefixSize;        /* +0x24, BE32 */
+    u32  flags;             /* +0x28, BE32 */
+    u32  container;         /* +0x2C, BE32 */
+    u32  _unknown30;        /* +0x30, BE32 */
+    u32  _unknown34;        /* +0x34, BE32 */
+    u8   systemPriority[8]; /* +0x38 */
+    u32  systemMaxSpu;      /* +0x40, BE32 */
+    u32  systemIsPreempt;   /* +0x44, BE32 */
+    u8   _padding[440];
 };
 
 /* Main SPURS instance */
@@ -171,6 +196,25 @@ struct CellSpursWorkloadAttribute {
     u8   _padding[128];
 };
 
+/* SDK output layout (0x30 bytes). Pointer members are 32-bit guest EAs. */
+struct CellSpursWorkloadInfo {
+    u64 data;
+    u8  priority[CELL_SPURS_MAX_SPU];
+    u32 policyModule;
+    u32 sizePolicyModule;
+    u32 nameClass;
+    u32 nameInstance;
+    u8  contention;
+    u8  minContention;
+    u8  maxContention;
+    u8  readyCount;
+    u8  idleSpuRequest;
+    u8  hasSignal;
+    u8  padding[2];
+    u32 shutdownCompletionEventHook;
+    u32 shutdownCompletionEventHookArgument;
+};
+
 /* ---------------------------------------------------------------------------
  * SPURS core functions
  * -----------------------------------------------------------------------*/
@@ -184,6 +228,10 @@ s32 cellSpursFinalize(CellSpurs* spurs);
 s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
                                  s32 spuPriority, s32 ppuPriority,
                                  u8 exitIfNoWork);
+s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, u32 revision,
+                                  u32 sdkVersion, u32 nSpus,
+                                  s32 spuPriority, s32 ppuPriority,
+                                  u8 exitIfNoWork);
 s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
                                     const char* prefix, u32 size);
 s32 cellSpursAttributeSetSpuThreadGroupType(CellSpursAttribute* attr,
@@ -242,6 +290,8 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
                                        CellSpursWorkloadId* wid,
                                        const CellSpursWorkloadAttribute* attr);
 s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid);
+s32 cellSpursGetWorkloadInfo(CellSpurs* spurs, CellSpursWorkloadId wid,
+                              CellSpursWorkloadInfo* info);
 
 s32 cellSpursWorkloadAttributeInitialize(CellSpursWorkloadAttribute* attr,
                                          u32 revision, u32 sdkVersion,
@@ -257,6 +307,7 @@ s32 cellSpursReadyCountSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
 s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
                                        CellSpursWorkloadId wid,
                                        u32* old, u32 compare, u32 value);
+s32 cellSpursSendWorkloadSignal(CellSpurs* spurs, CellSpursWorkloadId wid);
 s32 cellSpursWakeUp(CellSpurs* spurs);
 
 /* ---------------------------------------------------------------------------

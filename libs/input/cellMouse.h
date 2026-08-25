@@ -30,6 +30,7 @@ extern "C" {
 
 #define CELL_MOUSE_MAX_MICE             2
 #define CELL_MOUSE_MAX_DATA_LIST_NUM    8
+#define CELL_MOUSE_MAX_INFO_DEVICES     127
 
 /* Button flags */
 #define CELL_MOUSE_BUTTON_1             (1 << 0)  /* Left */
@@ -71,9 +72,9 @@ typedef struct CellMouseInfo {
     u32 max_connect;
     u32 now_connect;
     u32 info;
-    u32 vendor_id[CELL_MOUSE_MAX_MICE];
-    u32 product_id[CELL_MOUSE_MAX_MICE];
-    u32 status[CELL_MOUSE_MAX_MICE];
+    u16 vendor_id[CELL_MOUSE_MAX_INFO_DEVICES];
+    u16 product_id[CELL_MOUSE_MAX_INFO_DEVICES];
+    u8  status[CELL_MOUSE_MAX_INFO_DEVICES];
 } CellMouseInfo;
 
 /* Raw data (for tablet mode) */

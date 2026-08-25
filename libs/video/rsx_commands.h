@@ -168,6 +168,7 @@ extern "C" {
 #define RSX_MAX_TEXTURES          16
 #define RSX_MAX_VERTEX_ATTRIBS    16
 #define RSX_MAX_RENDER_TARGETS     4
+#define RSX_MAX_IMMEDIATE_VERTICES 256
 
 typedef struct rsx_texture_state {
     u32 offset;
@@ -252,6 +253,14 @@ typedef struct rsx_state {
     /* Current draw state */
     u32 primitive_type;
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
+
+    /* Inline vertex stream submitted with NV4097_SET_VERTEX_DATA2F_M.  GT6
+     * uses this for its first fullscreen triangle-strip before it switches to
+     * ordinary array draws. */
+    float immediate_vertices[RSX_MAX_IMMEDIATE_VERTICES][2];
+    u32 immediate_vertex_count;
+    float immediate_pending_x;
+    int immediate_have_x;
 
     /* Index array (SET_INDEX_ARRAY_ADDRESS/_DMA): offset is a raw RSX offset;
      * dma bits [3:0] = location context (0=local 1=main via CELL_GCM_DMA ids),

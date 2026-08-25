@@ -46,21 +46,30 @@ typedef struct CellUsbdDeviceInfo {
     u8  reserved;
 } CellUsbdDeviceInfo;
 
-typedef void (*CellUsbdLddOpsAttachCb)(CellUsbdDeviceId deviceId);
-typedef void (*CellUsbdLddOpsDetachCb)(CellUsbdDeviceId deviceId);
-
+/* The retail PPU ABI stores four 32-bit guest effective addresses here
+ * (name plus probe/attach/detach function descriptors).  Keep the guest
+ * layout explicit: host pointers are 64-bit in the recompiler process. */
 typedef struct CellUsbdLddOps {
-    const char* name;
-    CellUsbdLddOpsAttachCb attach;
-    CellUsbdLddOpsDetachCb detach;
+    u32 name;
+    u32 probe;
+    u32 attach;
+    u32 detach;
 } CellUsbdLddOps;
 
 /* Functions */
 s32 cellUsbdInit(void);
 s32 cellUsbdEnd(void);
 
+s32 cellUsbdSetThreadPriority2(s32 eventPriority, s32 usbdPriority,
+                                s32 callbackPriority);
+
 s32 cellUsbdRegisterLdd(const CellUsbdLddOps* ops);
 s32 cellUsbdUnregisterLdd(const CellUsbdLddOps* ops);
+s32 cellUsbdRegisterExtraLdd(const CellUsbdLddOps* ops, u16 vendorId,
+                              u16 productId);
+s32 cellUsbdRegisterExtraLdd2(const CellUsbdLddOps* ops, u16 vendorId,
+                               u16 productIdMin, u16 productIdMax);
+s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops);
 
 s32 cellUsbdGetDeviceList(CellUsbdDeviceInfo* list, u32 maxDevices,
                             u32* numDevices);

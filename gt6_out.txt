@@ -1,0 +1,8 @@
+[ppu] PT_TLS template vaddr=0x00031200 filesz=0x0 memsz=0x58
+[ppu] loaded 2 PT_LOAD segments, entry OPD 0x00030930
+[POOLGLOB] after-load mem[0x53EF0C]=0x00000000 (expect 0x005877D8)  mem[0x5877D8]=0x00000000
+[cellGame] title id from PARAM.SFO ('E:/Emulation/storage/rpcs3/dev_hdd0/game/NPUA81049/PARAM.SFO'): 'NPUA81049'
+[GT6 JOB EXEC] registered all_jobs combined SPU module (image_id=10)
+[GT6 VFS] /dev_hdd0 and /dev_bdvd/PS3_GAME mounted from RPCS3 storage
+[GT6Recomp] dispatching entry OPD 0x00030930
+[ppu] entry code 0x0001022C not registered

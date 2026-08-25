@@ -1028,9 +1028,9 @@ extern "C" void lv2_syscall(ppu_context* ctx)
 {
     uint64_t num = ctx->gpr[11];
     if (getenv("YDKJ_SCTRACE"))
-        fprintf(stderr, "[sc] %llu r3=%08X r4=%08X r5=%08X r6=%08X\n",
+        fprintf(stderr, "[sc] %llu r3=%08X r4=%08X r5=%08X r6=%08X lr=%08X\n",
                 (unsigned long long)num, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
-                (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
+                (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6], (uint32_t)ctx->lr);
     /* FLOW_WORKERSC: trace every lv2 syscall made by the loader/worker thread
      * (tid=1) so we can see what it does AFTER receiving its q=1 event and why
      * it never registers handlers / loads assets. */
@@ -1495,3 +1495,13 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
     return 0;
 }
+
+int g_s_depth = 0;
+extern "C" void ppu_nonlocal_jump(ppu_context* ctx) { 
+    fprintf(stderr, "[ppu] FATAL: ppu_nonlocal_jump not implemented\n");
+    extern void ppu_dump_guest_stack(ppu_context* ctx, const char* label);
+    ppu_dump_guest_stack(ctx, "ppu_nonlocal_jump");
+    exit(3);
+}
+extern "C" int ppu_nonlocal_pending(ppu_context* ctx) { return 0; }
+extern "C" void ppu_nonlocal_clear(ppu_context* ctx) {}

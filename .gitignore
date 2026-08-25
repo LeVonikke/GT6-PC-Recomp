@@ -93,3 +93,27 @@ _drill/
 
 # Local Claude Code settings
 .claude/
+
+# GT6-specific generated/build/diagnostic output (regenerable from the
+# lifter + the user's own decrypted ELF; not source, not tracked)
+gt6/emain_recompiled/
+gt6/emain_recompiled_before_jump_fix/
+gt6/emain_gen/
+gt6/gen/
+gt6/emain_project/build_relocated/
+gt6/emain_project/analysis_*/
+gt6/emain_project/frame_*/
+gt6/emain_project/smoke_*/
+gt6/emain_project/gamedata/
+build_relocated/
+build_relocated_release/
+scratch/
+gamedata/
+*.bmp
+*.map
+*.tlog
+*.lastbuildstate
+*.recipe
+*.ninja_log
+*.ninja_deps
+unsuccessfulbuild

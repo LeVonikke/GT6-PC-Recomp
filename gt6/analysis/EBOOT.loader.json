@@ -1,0 +1,12 @@
+{
+ "entry_opd": "0x30930",
+ "entry_code": "0x1022c",
+ "entry_toc": "0x39078",
+ "module_toc": "0x39078",
+ "opd_base": "0x30920",
+ "opd_size": "0x758",
+ "opd_count": 235,
+ "function_count": 190,
+ "e_type": 2,
+ "load_segments": 2
+}

@@ -377,6 +377,7 @@ void cellPad_poll(void)
 extern void vm_write8 (unsigned long long a, unsigned char  v);
 extern void vm_write16(unsigned long long a, unsigned short v);
 extern void vm_write32(unsigned long long a, unsigned int   v);
+extern unsigned char vm_read8(unsigned long long a);
 
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
@@ -577,40 +578,48 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
     return CELL_OK;
 }
 
-s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
+s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info_guest)
 {
+    u32 ea = (u32)(uintptr_t)info_guest;
+
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (port_no >= CELL_PAD_MAX_PORT_NUM || !info)
+    if (port_no >= CELL_PAD_MAX_PORT_NUM || !ea)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
-    memset(info, 0, sizeof(CellPadCapabilityInfo));
-
     /* Report standard DualShock 3 capabilities */
-    info->info[0] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
-                   | CELL_PAD_CAPABILITY_PRESS_MODE
-                   | CELL_PAD_CAPABILITY_SENSOR_MODE
-                   | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
-                   | CELL_PAD_CAPABILITY_ACTUATOR;
+    vm_write32(ea, CELL_PAD_CAPABILITY_PS3_CONFORMITY
+                 | CELL_PAD_CAPABILITY_PRESS_MODE
+                 | CELL_PAD_CAPABILITY_SENSOR_MODE
+                 | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
+                 | CELL_PAD_CAPABILITY_ACTUATOR);
+    for (u32 i = 1; i < CELL_PAD_MAX_CAPABILITY_INFO; i++)
+        vm_write32((unsigned long long)ea + i * 4, 0);
 
     return CELL_OK;
 }
 
-s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
+s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param_guest)
 {
+    u32 ea = (u32)(uintptr_t)param_guest;
+
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (port_no >= CELL_PAD_MAX_PORT_NUM || !param)
+    if (port_no >= CELL_PAD_MAX_PORT_NUM || !ea)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+
+    /* CellPadActParam starts with two byte-sized motor values; no byte swap. */
+    u8 motor_small = vm_read8((unsigned long long)ea + CELL_PAD_ACTUATOR_PARAM_SMALL);
+    u8 motor_large = vm_read8((unsigned long long)ea + CELL_PAD_ACTUATOR_PARAM_LARGE);
 
 #if PAD_BACKEND_XINPUT
     /* Map to XInput vibration */
     if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].connected) {
         XINPUT_VIBRATION vib;
-        vib.wLeftMotorSpeed  = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257);
-        vib.wRightMotorSpeed = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257);
+        vib.wLeftMotorSpeed  = (WORD)(motor_large * 257);
+        vib.wRightMotorSpeed = (WORD)(motor_small * 257);
         XInputSetState((DWORD)port_no, &vib);
     }
 #endif
@@ -619,8 +628,8 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
     if (port_no < PAD_MAX_HOST_PORTS && s_sdl_controllers[port_no]) {
         SDL_GameControllerRumble(
             s_sdl_controllers[port_no],
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257),
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257),
+            (Uint16)(motor_large * 257),
+            (Uint16)(motor_small * 257),
             100 /* duration ms */
         );
     }

@@ -10,7 +10,12 @@
 
 #include "cellKb.h"
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
+
+/* HLE pointer arguments are 32-bit guest effective addresses. */
+extern void vm_write16(unsigned long long a, unsigned short v);
+extern void vm_write32(unsigned long long a, unsigned int v);
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -144,18 +149,26 @@ s32 cellKbEnd(void)
     return CELL_OK;
 }
 
-s32 cellKbGetData(u32 port_no, CellKbData* data)
+s32 cellKbGetData(u32 port_no, CellKbData* data_guest)
 {
     if (!s_kb_initialized)
         return CELL_KB_ERROR_UNINITIALIZED;
 
-    if (port_no >= s_kb_max_connect || !data)
+    const u32 data_ea = (u32)(uintptr_t)data_guest;
+    if (port_no >= s_kb_max_connect || !data_ea)
         return CELL_KB_ERROR_INVALID_PARAMETER;
 
     KbPortState* kb = &s_kb_ports[port_no];
+    CellKbData local;
+    CellKbData* data = &local;
+    memset(data, 0, sizeof(*data));
 
     if (!kb->connected) {
-        memset(data, 0, sizeof(CellKbData));
+        vm_write32(data_ea + 0x00, 0);
+        vm_write32(data_ea + 0x04, 0);
+        vm_write32(data_ea + 0x08, 0);
+        for (u32 i = 0; i < CELL_KB_MAX_KEYCODES; ++i)
+            vm_write16(data_ea + 0x0c + i * 2, 0);
         return CELL_KB_ERROR_NO_DEVICE;
     }
 
@@ -187,28 +200,36 @@ s32 cellKbGetData(u32 port_no, CellKbData* data)
         data->len = count;
     }
 
+    vm_write32(data_ea + 0x00, data->led);
+    vm_write32(data_ea + 0x04, data->mkey);
+    vm_write32(data_ea + 0x08, (u32)data->len);
+    for (u32 i = 0; i < CELL_KB_MAX_KEYCODES; ++i)
+        vm_write16(data_ea + 0x0c + i * 2, data->keycode[i]);
     return CELL_OK;
 }
 
-s32 cellKbGetInfo(CellKbInfo* info)
+s32 cellKbGetInfo(CellKbInfo* info_guest)
 {
     if (!s_kb_initialized)
         return CELL_KB_ERROR_UNINITIALIZED;
 
-    if (!info)
+    const u32 info_ea = (u32)(uintptr_t)info_guest;
+    if (!info_ea)
         return CELL_KB_ERROR_INVALID_PARAMETER;
-
-    memset(info, 0, sizeof(CellKbInfo));
-    info->max_connect = s_kb_max_connect;
 
     u32 connected = 0;
     for (u32 i = 0; i < s_kb_max_connect; i++) {
-        if (s_kb_ports[i].connected) {
-            info->status[i] = CELL_KB_STATUS_CONNECTED;
+        if (s_kb_ports[i].connected)
             connected++;
-        }
     }
-    info->now_connect = connected;
+
+    vm_write32(info_ea + 0x00, s_kb_max_connect);
+    vm_write32(info_ea + 0x04, connected);
+    vm_write32(info_ea + 0x08, 0);
+    for (u32 i = 0; i < CELL_KB_MAX_KEYBOARDS; ++i)
+        vm_write32(info_ea + 0x0c + i * 4,
+                   (i < s_kb_max_connect && s_kb_ports[i].connected)
+                       ? CELL_KB_STATUS_CONNECTED : CELL_KB_STATUS_DISCONNECTED);
 
     return CELL_OK;
 }

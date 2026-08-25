@@ -570,6 +570,7 @@ int64_t sys_event_port_create(ppu_context* ctx)
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
     int32_t  port_type   = LV2_ARG_S32(ctx, 1);
     uint64_t name        = LV2_ARG_U64(ctx, 2);
+    fprintf(stderr, "[sys_event] sys_event_port_create(name=0x%llX)\n", (unsigned long long)name);
 
     evt_table_lock();
 
@@ -622,6 +623,7 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
 {
     uint32_t port_id  = LV2_ARG_U32(ctx, 0);
     uint32_t queue_id = LV2_ARG_U32(ctx, 1);
+    fprintf(stderr, "[sys_event] sys_event_port_connect_local(port=%u, queue=%u)\n", port_id, queue_id);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -714,6 +716,8 @@ uint32_t sys_event_find_queue_by_key(uint64_t key)
 int64_t sys_event_port_send(ppu_context* ctx)
 {
     uint32_t port_id = LV2_ARG_U32(ctx, 0);
+    printf("[MAIN HLE] sys_event_port_send port=%d data1=%llx data2=%llx data3=%llx\n", port_id, LV2_ARG_U64(ctx, 1), LV2_ARG_U64(ctx, 2), LV2_ARG_U64(ctx, 3));
+
     uint64_t data1   = LV2_ARG_U64(ctx, 1);
     uint64_t data2   = LV2_ARG_U64(ctx, 2);
     uint64_t data3   = LV2_ARG_U64(ctx, 3);

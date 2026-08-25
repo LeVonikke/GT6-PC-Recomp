@@ -147,12 +147,32 @@ void* sys_heap_malloc(sys_heap_t heap, u32 size);
 s32 sys_heap_free(sys_heap_t heap, void* ptr);
 void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size);
 
+/* Fixed-block memory pools (sysPrxForUser ABI). */
+typedef u32 sys_mempool_t;
+
+s32 sys_mempool_create(sys_mempool_t* mempool, void* chunk,
+                        u64 chunk_size, u64 block_size, u64 alignment);
+void sys_mempool_destroy(sys_mempool_t mempool);
+u64 sys_mempool_get_count(sys_mempool_t mempool);
+void* sys_mempool_try_allocate_block(sys_mempool_t mempool);
+s32 sys_mempool_free_block(sys_mempool_t mempool, void* block);
+
 /* ---------------------------------------------------------------------------
  * PRX utilities
  * -----------------------------------------------------------------------*/
 
 s32 sys_prx_exitspawn_with_level(void);
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id);
+
+typedef struct sys_prx_module_list {
+    u64 size;
+    u32 max;
+    u32 count;
+    u32 idlist;
+    u32 levellist;
+} sys_prx_module_list_t;
+
+s32 sys_prx_get_module_list(u64 flags, sys_prx_module_list_t* list);
 
 /* ---------------------------------------------------------------------------
  * Random number generation

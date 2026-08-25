@@ -311,7 +311,7 @@ class SPULifter:
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; SPU_TAILCALL({self.prefix}spu_func_{end:08X}(ctx)); }}")
+                f"    {{ ctx->pc = 0x{end:X}; ctx->trampoline_fn = (void*){self.prefix}spu_func_{end:08X}; return; }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -608,7 +608,10 @@ class SPULifter:
                 return f"{link} {self._uncond_branch(addr + 4, func)}"
             if tgt is not None:
                 self.call_targets.add(tgt)
-                return f"{link} {self.prefix}spu_func_{tgt:08X}(ctx);"
+                return (f"{link} spu_host_call_push(ctx, 0x{addr + 4:X}); "
+                        f"{self.prefix}spu_func_{tgt:08X}(ctx); "
+                        f"spu_drain_trampoline(ctx); "
+                        f"spu_host_call_pop(ctx);")
             self.unresolved_calls.append(addr)
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
@@ -620,18 +623,16 @@ class SPULifter:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
             return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"SPU_TAILCALL({self.prefix}spu_func_{tgt:08X}(ctx)); }}")
+                    f"ctx->trampoline_fn = (void*){self.prefix}spu_func_{tgt:08X}; return; }}")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
             tgt_reg = _reg(ops[0])
-            # SPU ABI: $r0 is the link register. `bi $r0` is the standard
-            # function return — translate to a host return so call/return
-            # discipline matches the C function nesting from brsl. EXCEPTION:
-            # when r0 was reloaded from memory (lqa/lqr) it is a COMPUTED TAIL
-            # JUMP (e.g. the SPURS task launch `lqa $r0,savedContextLr; bi $r0`),
-            # flagged by compute_bi_r0_jumps() — emit the indirect dispatch.
-            if tgt_reg == "0" and addr not in self.bi_r0_jump:
-                return "return;"
+            # Always route through the runtime, including `bi $r0`.  A direct
+            # lifted brsl/bisl pushes its guest return PC on host_call_return_pc,
+            # so spu_indirect_branch can unwind the matching host C call without
+            # dispatching the continuation twice.  With no matching marker, r0
+            # is a genuine computed/tail target (common in SPURS trampolines) and
+            # must be dispatched instead of being mistaken for a C return.
             return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"spu_indirect_branch(ctx); return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
@@ -648,26 +649,26 @@ class SPULifter:
             # handles both operand formats.
             tgt_reg = _reg(ops[-1])
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-                    f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx);")
+                    f"spu_host_call_push(ctx, 0x{addr + 4:X}); "
+                    f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx); "
+                    f"spu_drain_trampoline(ctx); "
+                    f"spu_host_call_pop(ctx);")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F
             tgt_reg = _reg(ops[-1])   # last operand = target (see bisl above)
-            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
+                    f"spu_host_call_push(ctx, 0x{addr + 4:X}); "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"spu_indirect_branch(ctx); return; }}")
+                    f"spu_indirect_branch(ctx); spu_drain_trampoline(ctx); "
+                    f"spu_host_call_pop(ctx); }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
             tgt_reg = _reg(ops[1])
-            # $r0 is the link register: a conditional branch to it is a
-            # conditional function return — emit a host return so it composes
-            # with the brsl->C-call nesting (mirrors the `bi $r0` case above).
-            # Dispatching to the return address would miss the C frame and
-            # land on an unregistered mid-function PC.
-            if tgt_reg == "0" and addr not in self.bi_r0_jump:
-                return f"if ({cond}) return;"
+            # The runtime's host-call marker makes conditional r0 returns and
+            # computed r0 jumps unambiguous, just like the unconditional case.
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"spu_indirect_branch(ctx); return; }}")
 
@@ -701,7 +702,8 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        return f"{{ ctx->pc = 0x{tgt:X}; SPU_TAILCALL({self.prefix}spu_func_{tgt:08X}(ctx)); }}"
+        return (f"{{ ctx->pc = 0x{tgt:X}; "
+                f"ctx->trampoline_fn = (void*){self.prefix}spu_func_{tgt:08X}; return; }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -799,7 +801,9 @@ def main() -> None:
                    help="Comma-separated extra function entry addresses (e.g. "
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                         "targets that --auto-functions can't detect statically. "
-                        "Splits the containing auto-detected function at each addr.")
+                        "Splits the containing auto-detected function at each addr; "
+                        "an address in an uncovered image gap is bounded by the next "
+                        "known function instead of overlapping the rest of the image.")
     args = p.parse_args()
 
     if args.auto_functions:
@@ -833,7 +837,11 @@ def main() -> None:
     if args.extra_funcs:
         extra = [int(x, 0) for x in args.extra_funcs.split(",") if x.strip()]
         bset = sorted(set(bounds))
+        image_end = base + len(data)
         for a in extra:
+            if not (base <= a < image_end):
+                p.error("--extra-funcs address 0x%X is outside image [0x%X, 0x%X)" %
+                        (a, base, image_end))
             newb = []
             split = False
             for (s, e) in bset:
@@ -842,7 +850,14 @@ def main() -> None:
                 else:
                     newb.append((s, e))
             if not split and not any(s == a for s, _ in bset):
-                newb.append((a, base + len(data)))
+                # The detector intentionally leaves data/padding gaps.  A forced
+                # entry can nevertheless live in such a gap (SPURS job entry
+                # veneers are a real example).  Stop at the next known start;
+                # extending to image_end would lift the same LS instructions in
+                # many functions and create colliding control-flow ownership.
+                next_start = min((s for s, _ in bset if s > a),
+                                 default=image_end)
+                newb.append((a, next_start))
             bset = sorted(set(newb))
         bounds = bset
         sys.stderr.write("[spu_lifter] added extra funcs: %s\n" %

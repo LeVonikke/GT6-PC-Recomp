@@ -34,18 +34,39 @@ extern "C" {
 #define CELL_GAME_ATTRIBUTE_CUSTOM_DATA_MESSAGE (1 << 6)
 #define CELL_GAME_ATTRIBUTE_WEB_BROWSER     (1 << 8)
 
-/* PARAM.SFO integer parameter IDs */
-#define CELL_GAME_PARAMID_TITLE_ID              100
-#define CELL_GAME_PARAMID_PARENTAL_LEVEL        101
-#define CELL_GAME_PARAMID_RESOLUTION             102
-#define CELL_GAME_PARAMID_SOUND_FORMAT           103
-#define CELL_GAME_PARAMID_APP_VER               104
+/* PARAM.SFO parameter IDs used by cellGameGetParam{Int,String}. */
+#define CELL_GAME_PARAMID_TITLE                    0
+#define CELL_GAME_PARAMID_TITLE_DEFAULT            1
+#define CELL_GAME_PARAMID_TITLE_JAPANESE           2
+#define CELL_GAME_PARAMID_TITLE_ENGLISH            3
+#define CELL_GAME_PARAMID_TITLE_FRENCH             4
+#define CELL_GAME_PARAMID_TITLE_SPANISH            5
+#define CELL_GAME_PARAMID_TITLE_GERMAN             6
+#define CELL_GAME_PARAMID_TITLE_ITALIAN            7
+#define CELL_GAME_PARAMID_TITLE_DUTCH              8
+#define CELL_GAME_PARAMID_TITLE_PORTUGUESE         9
+#define CELL_GAME_PARAMID_TITLE_RUSSIAN           10
+#define CELL_GAME_PARAMID_TITLE_KOREAN            11
+#define CELL_GAME_PARAMID_TITLE_CHINESE_T         12
+#define CELL_GAME_PARAMID_TITLE_CHINESE_S         13
+#define CELL_GAME_PARAMID_TITLE_FINNISH           14
+#define CELL_GAME_PARAMID_TITLE_SWEDISH           15
+#define CELL_GAME_PARAMID_TITLE_DANISH            16
+#define CELL_GAME_PARAMID_TITLE_NORWEGIAN         17
+#define CELL_GAME_PARAMID_TITLE_POLISH            18
+#define CELL_GAME_PARAMID_TITLE_PORTUGUESE_BRAZIL 19
+#define CELL_GAME_PARAMID_TITLE_ENGLISH_UK        20
+#define CELL_GAME_PARAMID_TITLE_TURKISH           21
+#define CELL_GAME_PARAMID_TITLE_ID               100
+#define CELL_GAME_PARAMID_VERSION                101
+#define CELL_GAME_PARAMID_PARENTAL_LEVEL         102
+#define CELL_GAME_PARAMID_RESOLUTION             103
+#define CELL_GAME_PARAMID_SOUND_FORMAT           104
+#define CELL_GAME_PARAMID_PS3_SYSTEM_VER         105
+#define CELL_GAME_PARAMID_APP_VER                106
 
-/* PARAM.SFO string parameter IDs */
-#define CELL_GAME_PARAMID_TITLE                  200
-#define CELL_GAME_PARAMID_TITLE_DEFAULT          201
-#define CELL_GAME_PARAMID_APP_VER_STR            202
-#define CELL_GAME_PARAMID_VERSION                203
+/* Compatibility name used by older callers in this runtime. */
+#define CELL_GAME_PARAMID_APP_VER_STR CELL_GAME_PARAMID_APP_VER
 
 /* Size info mode */
 #define CELL_GAME_SIZEKB_NOTCALC    (-1)
@@ -108,6 +129,10 @@ void cellGame_set_title(const char* title);
 
 /* Set the content info path root */
 void cellGame_set_content_path(const char* path);
+
+/* Set the boot medium reported by cellGameBootCheck.  Digital PSN titles
+ * must report HDD so their content loader selects the installed PDIPFS. */
+void cellGame_set_game_type(u32 game_type);
 
 /* ---------------------------------------------------------------------------
  * Functions

@@ -6,6 +6,8 @@
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -117,6 +119,13 @@ int64_t sys_semaphore_create(ppu_context* ctx)
         write_be32(id_out_addr, sem_id);
     }
 
+    if (getenv("GT6_SEM_TRACE") && sem_id == 5) {
+        fprintf(stderr,
+                "[GT6 SEM] create sem=5 initial=%d max=%d proto=%u tid=%llu lr=%08X\n",
+                initial, max_val, s->protocol, (unsigned long long)ctx->thread_id,
+                (uint32_t)ctx->lr);
+    }
+
     sem_table_unlock();
     return CELL_OK;
 }
@@ -172,6 +181,17 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    if (getenv("GT6_SEM_TRACE") && sem_id == 5) {
+        static unsigned wait_count;
+        if (wait_count++ < 32) {
+            fprintf(stderr,
+                    "[GT6 SEM] wait sem=5 value=%d timeout=%llu tid=%llu lr=%08X sp=%08X\n",
+                    s->value, (unsigned long long)timeout_us,
+                    (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr,
+                    (uint32_t)ctx->gpr[1]);
+        }
+    }
 
 #ifdef _WIN32
     DWORD result;
@@ -294,6 +314,17 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    if (getenv("GT6_SEM_TRACE") && sem_id == 5) {
+        static unsigned post_count;
+        if (post_count++ < 32) {
+            fprintf(stderr,
+                    "[GT6 SEM] post sem=5 count=%d value=%d max=%d tid=%llu lr=%08X sp=%08X\n",
+                    count, s->value, s->max_value,
+                    (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr,
+                    (uint32_t)ctx->gpr[1]);
+        }
+    }
 
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);

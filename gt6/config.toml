@@ -1,0 +1,16 @@
+[input]
+# Decrypted bootstrap executable currently supplied for this project.
+elf_path = "E:/Emulation/storage/rpcs3/dev_hdd0/game/NPUA81049/USRDIR/EBOOT.elf"
+
+# GT6's actual game code is EMAIN.SELF. Replace this path with a legally
+# decrypted EMAIN.ELF and rerun the analysis/lift pipeline to port the game.
+
+[output]
+output_dir = "recompiled/"
+func_prefix = "func_"
+generate_func_table = true
+
+[debug]
+log_hle_calls = true
+log_missing_nids = true
+break_on_unimplemented = false

@@ -7,11 +7,18 @@
 
 #include "cellFs.h"
 #include "ps3emu/endian.h"
+#include "../../runtime/ppu/ppu_context.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <errno.h>
+
+/* All buffers supplied by the context-aware wrappers live in the flat guest
+ * VM.  Keep the diagnostic address in guest notation rather than a host VA. */
+extern uint8_t* vm_base;
+extern __declspec(thread) ppu_context* g_active_ctx;
+extern void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -60,6 +67,30 @@ typedef struct {
 static PathMapping s_path_mappings[MAX_PATH_MAPPINGS];
 static char s_root_path[CELL_FS_MAX_FS_PATH_LENGTH] = ".";
 
+static int host_path_is_absolute(const char* path)
+{
+    if (!path || !path[0]) return 0;
+#ifdef _WIN32
+    return ((path[0] >= 'A' && path[0] <= 'Z') ||
+            (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':';
+#else
+    return path[0] == '/';
+#endif
+}
+
+/* Defaults are installed lazily on the first filesystem operation.  A title
+ * may configure a mount before that point, so defaults must never overwrite a
+ * caller-provided mapping for the same PS3 prefix. */
+static void add_default_path_mapping(const char* ps3_prefix, const char* host_path)
+{
+    for (int i = 0; i < MAX_PATH_MAPPINGS; i++) {
+        if (s_path_mappings[i].in_use &&
+            strcmp(s_path_mappings[i].ps3_prefix, ps3_prefix) == 0)
+            return;
+    }
+    cellfs_add_path_mapping(ps3_prefix, host_path);
+}
+
 static void init_default_mappings(void)
 {
     static int s_initialized = 0;
@@ -67,11 +98,13 @@ static void init_default_mappings(void)
         return;
     s_initialized = 1;
 
-    cellfs_add_path_mapping("/dev_hdd0/",  "gamedata/dev_hdd0/");
-    cellfs_add_path_mapping("/dev_bdvd/",  "gamedata/dev_bdvd/");
-    cellfs_add_path_mapping("/dev_flash/", "gamedata/dev_flash/");
-    cellfs_add_path_mapping("/app_home/",  "gamedata/app_home/");
-    cellfs_add_path_mapping("/dev_usb000/","gamedata/dev_usb/");
+    add_default_path_mapping("/dev_hdd0/",  "gamedata/dev_hdd0/");
+    add_default_path_mapping("/dev_bdvd/",  "gamedata/dev_bdvd/");
+    add_default_path_mapping("/dev_flash/", "gamedata/dev_flash/");
+    add_default_path_mapping("/app_home/",  "gamedata/app_home/");
+    add_default_path_mapping("/dev_usb000/","gamedata/dev_usb/");
+    add_default_path_mapping("/pagefile.sys", "gamedata/pagefile.sys");
+    add_default_path_mapping("/dev_flash3/", "gamedata/dev_flash3/"); // just in case
 }
 
 void cellfs_set_root_path(const char* root)
@@ -134,8 +167,16 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
         return -1;
 
     const char* remainder = ps3_path + best_len;
-    snprintf(host_buf, buf_size, "%s/%s%s", s_root_path,
-             s_path_mappings[best].host_path, remainder);
+    if (host_path_is_absolute(s_path_mappings[best].host_path)) {
+        /* A title can combine data installed under the emulated HDD with a
+         * large immutable source file held elsewhere (for example a physical
+         * disc image).  Keep that mapping out of the configured root. */
+        snprintf(host_buf, buf_size, "%s%s", s_path_mappings[best].host_path,
+                 remainder);
+    } else {
+        snprintf(host_buf, buf_size, "%s/%s%s", s_root_path,
+                 s_path_mappings[best].host_path, remainder);
+    }
 
     /* Normalize slashes */
     for (char* p = host_buf; *p; p++) {
@@ -239,6 +280,8 @@ typedef struct {
     char   path[CELL_FS_MAX_FS_PATH_LENGTH];
     FILE*  host_fp;
     s32    flags;
+    u64    trace_read_calls;
+    u64    trace_read_bytes;
 } FsFileSlot;
 
 typedef struct {
@@ -383,6 +426,8 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     s_files[slot].path[CELL_FS_MAX_FS_PATH_LENGTH - 1] = '\0';
     s_files[slot].flags   = flags;
     s_files[slot].host_fp = fp;
+    s_files[slot].trace_read_calls = 0;
+    s_files[slot].trace_read_bytes = 0;
 
     *fd = (CellFsFd)ps3_bswap32((u32)slot);   /* guest reads the fd big-endian */
     printf("[cellFs] Open: fd=%d -> '%s'\n", slot, host_path);
@@ -396,6 +441,14 @@ s32 cellFsClose(CellFsFd fd)
 
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
+
+    if (getenv("GT6_PFS_TRACE") && strstr(s_files[fd].path, "/PDIPFS/")) {
+        fprintf(stderr,
+                "[GT6 PFS] close fd=%d path='%s' reads=%llu bytes=%llu\n",
+                fd, s_files[fd].path,
+                (unsigned long long)s_files[fd].trace_read_calls,
+                (unsigned long long)s_files[fd].trace_read_bytes);
+    }
 
     if (s_files[fd].host_fp) {
         fclose(s_files[fd].host_fp);
@@ -417,8 +470,62 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 
     u64 bytes_read = 0;
 
+    s64 start_position = -1;
+    if (getenv("GT6_PFS_TRACE") && strstr(s_files[fd].path, "/PDIPFS/")) {
+#ifdef _MSC_VER
+        start_position = (s64)_ftelli64(s_files[fd].host_fp);
+#else
+        start_position = (s64)ftello(s_files[fd].host_fp);
+#endif
+    }
+
     if (s_files[fd].host_fp) {
+#ifdef _WIN32
+        /* The EMAIN runner reserves the 4 GiB guest window and commits pages
+         * lazily from its vectored exception handler.  Reading a large file
+         * directly into that window is not safe: the CRT ultimately passes
+         * the destination to ReadFile(), and the kernel rejects an output
+         * range containing uncommitted pages without raising a user-mode
+         * access violation.  Stage reads through ordinary committed host
+         * memory, then memcpy into the guest range; the latter faults in and
+         * commits pages through the runner's normal handler. */
+        const size_t staging_capacity = 64u * 1024u;
+        unsigned char* staging = (unsigned char*)malloc(staging_capacity);
+        if (!staging && nbytes != 0)
+            return CELL_ENOMEM;
+
+        while (bytes_read < nbytes) {
+            const u64 remaining = nbytes - bytes_read;
+            const size_t requested = remaining < (u64)staging_capacity
+                ? (size_t)remaining : staging_capacity;
+            const size_t got = fread(staging, 1, requested, s_files[fd].host_fp);
+            if (got != 0) {
+                memcpy((unsigned char*)buf + (size_t)bytes_read, staging, got);
+                bytes_read += (u64)got;
+            }
+            if (got != requested)
+                break;
+        }
+        free(staging);
+#else
         bytes_read = (u64)fread(buf, 1, (size_t)nbytes, s_files[fd].host_fp);
+#endif
+    }
+
+    s_files[fd].trace_read_calls++;
+    s_files[fd].trace_read_bytes += bytes_read;
+    if (start_position >= 0) {
+        fprintf(stderr,
+                "[GT6 PFS] read fd=%d path='%s' buf=%08X off=0x%llX requested=0x%llX got=0x%llX first=%02X%02X%02X%02X\n",
+                fd, s_files[fd].path,
+                (unsigned)((unsigned char*)buf - vm_base),
+                (unsigned long long)start_position,
+                (unsigned long long)nbytes,
+                (unsigned long long)bytes_read,
+                bytes_read >= 1 ? ((unsigned char*)buf)[0] : 0,
+                bytes_read >= 2 ? ((unsigned char*)buf)[1] : 0,
+                bytes_read >= 3 ? ((unsigned char*)buf)[2] : 0,
+                bytes_read >= 4 ? ((unsigned char*)buf)[3] : 0);
     }
 
     if (nread)
@@ -516,6 +623,21 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
 /* NID: 0x2CB51F0D */
 s32 cellFsStat(const char* path, CellFsStat* sb)
 {
+    if (getenv("GT6_EMPTY_STAT_TRACE") && path && path[0] == '\0') {
+        static unsigned empty_stat_trace_count = 0;
+        if (empty_stat_trace_count++ < 4) {
+            ppu_context* ctx = g_active_ctx;
+            fprintf(stderr,
+                    "[GT6 empty-cellfs-stat] path=%p stat=%p tid=%llu cia=%08X lr=%08X r3..r7=%08X/%08X/%08X/%08X/%08X\n",
+                    (const void*)path, (void*)sb,
+                    ctx ? (unsigned long long)ctx->thread_id : 0ull,
+                    ctx ? (uint32_t)ctx->cia : 0u, ctx ? (uint32_t)ctx->lr : 0u,
+                    ctx ? (uint32_t)ctx->gpr[3] : 0u, ctx ? (uint32_t)ctx->gpr[4] : 0u,
+                    ctx ? (uint32_t)ctx->gpr[5] : 0u, ctx ? (uint32_t)ctx->gpr[6] : 0u,
+                    ctx ? (uint32_t)ctx->gpr[7] : 0u);
+            if (ctx) ppu_dump_guest_stack(ctx, "empty-cellfs-stat");
+        }
+    }
     printf("[cellFs] Stat(path='%s')\n", path ? path : "<null>");
 
     if (!path || !sb)

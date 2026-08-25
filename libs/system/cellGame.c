@@ -33,6 +33,7 @@
 
 static char s_title_id[64]  = "BLES00000";
 static char s_title[256]    = "Unknown Title";
+static char s_version[16]   = "01.00";
 static char s_app_ver[16]   = "01.00";
 
 /* Content info / usrdir paths */
@@ -97,6 +98,13 @@ void cellGame_set_content_path(const char* path)
     if (!path) return;
     strncpy(s_content_path, path, sizeof(s_content_path) - 1);
     s_content_path[sizeof(s_content_path) - 1] = '\0';
+}
+
+void cellGame_set_game_type(u32 game_type)
+{
+    if (game_type >= CELL_GAME_GAMETYPE_DISC &&
+        game_type <= CELL_GAME_GAMETYPE_HOME)
+        s_game_type = game_type;
 }
 
 /* ---------------------------------------------------------------------------
@@ -178,6 +186,9 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
     }
     if (sfo_read_string(sfo_path, "TITLE", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_title, tmp, sizeof(s_title) - 1); s_title[sizeof(s_title) - 1] = '\0';
+    }
+    if (sfo_read_string(sfo_path, "VERSION", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_version, tmp, sizeof(s_version) - 1); s_version[sizeof(s_version) - 1] = '\0';
     }
     if (sfo_read_string(sfo_path, "APP_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_app_ver, tmp, sizeof(s_app_ver) - 1); s_app_ver[sizeof(s_app_ver) - 1] = '\0';
@@ -263,11 +274,12 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
 
 s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
 {
-    printf("[cellGame] DataCheck(type=%u, dir='%s')\n",
-           type, dirName ? dirName : "<null>");
-
     uint32_t dir_ea = (uint32_t)(uintptr_t)dirName;   /* guest addr */
     const char* check_dir = dir_ea ? (const char*)(vm_base + dir_ea) : s_title_id;
+    /* dirName is a PPU effective address.  Do not pass the raw value to the
+     * host C runtime: printf would dereference an unmapped host address such
+     * as 0x0FEFF650 before the guest-memory translation below can occur. */
+    printf("[cellGame] DataCheck(type=%u, dir='%s')\n", type, check_dir);
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", s_content_path, check_dir);
 
@@ -357,9 +369,6 @@ s32 cellGameGetParamInt(s32 id, s32* value)
 
     uint32_t v = 0;
     switch (id) {
-    case CELL_GAME_PARAMID_APP_VER:
-        v = 100; /* 1.00 as integer */
-        break;
     case CELL_GAME_PARAMID_PARENTAL_LEVEL:
     case CELL_GAME_PARAMID_RESOLUTION:
     case CELL_GAME_PARAMID_SOUND_FORMAT:
@@ -390,10 +399,31 @@ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
     const char* src = "";
     switch (id) {
     case CELL_GAME_PARAMID_TITLE:
-    case CELL_GAME_PARAMID_TITLE_DEFAULT:  src = s_title;    break;
-    case CELL_GAME_PARAMID_TITLE_ID:       src = s_title_id; break;
-    case CELL_GAME_PARAMID_APP_VER_STR:
-    case CELL_GAME_PARAMID_VERSION:        src = s_app_ver;  break;
+    case CELL_GAME_PARAMID_TITLE_DEFAULT:
+    case CELL_GAME_PARAMID_TITLE_JAPANESE:
+    case CELL_GAME_PARAMID_TITLE_ENGLISH:
+    case CELL_GAME_PARAMID_TITLE_FRENCH:
+    case CELL_GAME_PARAMID_TITLE_SPANISH:
+    case CELL_GAME_PARAMID_TITLE_GERMAN:
+    case CELL_GAME_PARAMID_TITLE_ITALIAN:
+    case CELL_GAME_PARAMID_TITLE_DUTCH:
+    case CELL_GAME_PARAMID_TITLE_PORTUGUESE:
+    case CELL_GAME_PARAMID_TITLE_RUSSIAN:
+    case CELL_GAME_PARAMID_TITLE_KOREAN:
+    case CELL_GAME_PARAMID_TITLE_CHINESE_T:
+    case CELL_GAME_PARAMID_TITLE_CHINESE_S:
+    case CELL_GAME_PARAMID_TITLE_FINNISH:
+    case CELL_GAME_PARAMID_TITLE_SWEDISH:
+    case CELL_GAME_PARAMID_TITLE_DANISH:
+    case CELL_GAME_PARAMID_TITLE_NORWEGIAN:
+    case CELL_GAME_PARAMID_TITLE_POLISH:
+    case CELL_GAME_PARAMID_TITLE_PORTUGUESE_BRAZIL:
+    case CELL_GAME_PARAMID_TITLE_ENGLISH_UK:
+    case CELL_GAME_PARAMID_TITLE_TURKISH:   src = s_title;      break;
+    case CELL_GAME_PARAMID_TITLE_ID:        src = s_title_id;   break;
+    case CELL_GAME_PARAMID_VERSION:         src = s_version;    break;
+    case CELL_GAME_PARAMID_APP_VER:         src = s_app_ver;    break;
+    case CELL_GAME_PARAMID_PS3_SYSTEM_VER:  src = "04.8000";   break;
     default:
         printf("[cellGame] WARNING: unknown param string id %d\n", id);
         break;

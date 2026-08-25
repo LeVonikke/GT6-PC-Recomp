@@ -14,9 +14,13 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value) {
     if (channel == SPU_WrOutMbox) { g_out = value._u32[0]; g_wrote = 1; }
 }
 void spu_indirect_branch(spu_context* ctx) {
-    (void)ctx; fprintf(stderr, "FAIL: indirect branch (bi $r0 should have become a return)\n");
+    if (spu_host_call_is_return(ctx, ctx->pc))
+        return;
+    fprintf(stderr, "FAIL: unexpected indirect branch to 0x%X\n", ctx->pc);
 }
 void spu_register_function(uint32_t addr, void (*fn)(spu_context*)) { (void)addr; (void)fn; }
+void spu_stop(spu_context* ctx) { (void)ctx; }
+void spu_halt(spu_context* ctx) { (void)ctx; }
 
 int main(void) {
     spu_context ctx;

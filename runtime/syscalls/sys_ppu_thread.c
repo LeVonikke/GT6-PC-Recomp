@@ -85,7 +85,18 @@ static void* ppu_host_thread_proc(void* param)
 
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
+#ifdef _WIN32
+        __try {
+            g_ppu_thread_entry_trampoline(&info->ctx);
+        } __except (1 /* EXCEPTION_EXECUTE_HANDLER */) {
+            fprintf(stderr, "[THREAD %llu] CRASH! Exception code: 0x%08X\n",
+                    (unsigned long long)info->ctx.thread_id,
+                    GetExceptionCode());
+            ExitProcess(1);
+        }
+#else
         g_ppu_thread_entry_trampoline(&info->ctx);
+#endif
         fprintf(stderr, "[THREAD %llu] entry RETURNED (r3=0x%llX) -- thread finished\n",
                 (unsigned long long)info->ctx.thread_id,
                 (unsigned long long)info->ctx.gpr[3]);
@@ -274,7 +285,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
     int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
     if (_gate_this) _initflag |= CREATE_SUSPENDED;
-    t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
+    t->host_thread = (HANDLE)_beginthreadex(NULL, 1024u * 1024 * 1024,
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
     if (t->host_thread == NULL) {
@@ -332,8 +343,15 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     }
     table_unlock();
 
-    /* In a real implementation this would terminate the calling thread.
-     * The thread proc wrapper handles this after return. */
+    /* This syscall never returns to guest code.  Returning here lets a
+     * recompiled worker continue past its exit path and reuse queues already
+     * destroyed by its joiner (the audio/resource worker then spins on an
+     * inactive event queue).  The main bootstrap context is not a host-created
+     * PPU worker, so only terminate registered worker threads. */
+#ifdef _WIN32
+    if (tid != 0)
+        ExitThread(0);
+#endif
     return CELL_OK;
 }
 

@@ -11,6 +11,20 @@
 
 /* Track which modules have been "loaded" */
 static int s_module_loaded[CELL_SYSMODULE_MAX_ID];
+/* Retail titles may request private firmware modules in the 0xF000 range.
+ * They do not need a separate host DLL when their imported NIDs are already
+ * provided by the linked HLE set, but the loader must acknowledge them or the
+ * title retries forever. */
+static int s_private_module_loaded[0x1000];
+
+static int* sysmodule_loaded_slot(u16 id)
+{
+    if (id < CELL_SYSMODULE_MAX_ID)
+        return &s_module_loaded[id];
+    if (id >= 0xF000)
+        return &s_private_module_loaded[id - 0xF000];
+    return NULL;
+}
 
 static const char* sysmodule_id_to_name(u16 id)
 {
@@ -66,43 +80,41 @@ s32 cellSysmoduleFinalize(void)   { return CELL_OK; }
 
 s32 cellSysmoduleLoadModule(u16 id)
 {
-    printf("[cellSysmodule] LoadModule(id=0x%04X '%s')\n",
-           id, sysmodule_id_to_name(id));
-
-    if (id >= CELL_SYSMODULE_MAX_ID)
+    int* loaded = sysmodule_loaded_slot(id);
+    if (!loaded)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    if (s_module_loaded[id])
+    if (!*loaded)
+        printf("[cellSysmodule] LoadModule(id=0x%04X '%s')\n",
+               id, id >= 0xF000 ? "PRIVATE_FIRMWARE_MODULE" : sysmodule_id_to_name(id));
+
+    if (*loaded)
         return CELL_OK;  /* Already loaded — return success (some games treat DUPLICATED as fatal) */
 
-    s_module_loaded[id] = 1;
+    *loaded = 1;
     return CELL_OK;
 }
 
 /* NID: 0x112A5EE9 */
 s32 cellSysmoduleUnloadModule(u16 id)
 {
-    printf("[cellSysmodule] UnloadModule(id=0x%04X '%s')\n",
-           id, sysmodule_id_to_name(id));
-
-    if (id >= CELL_SYSMODULE_MAX_ID)
+    int* loaded = sysmodule_loaded_slot(id);
+    if (!loaded)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    if (!s_module_loaded[id])
+    if (!*loaded)
         return CELL_SYSMODULE_ERROR_UNLOADED;
 
-    s_module_loaded[id] = 0;
+    *loaded = 0;
     return CELL_OK;
 }
 
 /* NID: 0x5A59E258 */
 s32 cellSysmoduleIsLoaded(u16 id)
 {
-    printf("[cellSysmodule] IsLoaded(id=0x%04X '%s')\n",
-           id, sysmodule_id_to_name(id));
-
-    if (id >= CELL_SYSMODULE_MAX_ID)
+    int* loaded = sysmodule_loaded_slot(id);
+    if (!loaded)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    return s_module_loaded[id] ? CELL_OK : CELL_SYSMODULE_ERROR_UNLOADED;
+    return *loaded ? CELL_OK : CELL_SYSMODULE_ERROR_UNLOADED;
 }

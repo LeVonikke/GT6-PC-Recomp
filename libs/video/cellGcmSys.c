@@ -112,6 +112,27 @@ static CellGcmControl s_control;
 static u16 s_io_address_table[65536];
 static u16 s_ea_address_table[65536];
 
+/* The SDK exposes the offset table to PPU code.  The arrays above are host
+ * state, so returning their native pointers turns a 32-bit guest stack pointer
+ * into a host write and crashes as soon as GT6 calls cellGcmGetOffsetTable.
+ * Mirror them at stable guest EAs instead.  They use 64K u16 entries each. */
+#define GCM_OFFSET_IO_TABLE_GUEST_ADDR 0x03010000u
+#define GCM_OFFSET_EA_TABLE_GUEST_ADDR 0x03030000u
+static int s_offset_table_exposed = 0;
+
+static void gcm_write_offset_entry(u32 table_ea, u32 index, u16 value)
+{
+    vm_write16(table_ea + index * (u32)sizeof(u16), value);
+}
+
+static void gcm_sync_offset_tables_to_guest(void)
+{
+    for (u32 i = 0; i < 65536; i++) {
+        gcm_write_offset_entry(GCM_OFFSET_IO_TABLE_GUEST_ADDR, i, s_io_address_table[i]);
+        gcm_write_offset_entry(GCM_OFFSET_EA_TABLE_GUEST_ADDR, i, s_ea_address_table[i]);
+    }
+}
+
 static CellGcmOffsetTable s_offset_table = {
     s_io_address_table,
     s_ea_address_table,
@@ -128,6 +149,10 @@ typedef struct IoMapping {
     int active;     /* 1 if this slot is in use */
 } IoMapping;
 
+/* Capacity is title-facing: GT6 consumes more than the legacy 16 slots while
+ * setting up its renderer.  Keep this declaration in the implementation so
+ * non-dependency-scanning build generators rebuild it when the capacity is
+ * adjusted in cellGcmSys.h. */
 static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;
 
@@ -146,12 +171,18 @@ static u32 s_second_v_handler_opd = 0;
 extern u32 vm_read32(unsigned int);
 static u32 s_flip_handler_code    = 0;
 static u32 s_vblank_handler_code  = 0;
+static u32 s_user_handler_code    = 0;
 static void ydkj_restore_handler_opd(u32 opd, u32 code) {
-    if (!getenv("YDKJ_HANDLERFIX") || !opd || !code) return;
+    /* An OPD is a stable descriptor, not writable callback state. GT6's
+     * display handlers are observed as 0xFFFFFFFF after registration; the
+     * old repair covered only zeroes and required an unrelated title flag. */
+    if (!opd || !code) return;
     extern u8* vm_base; if (!vm_base) return;
-    if (vm_read32(opd) == 0) {
+    { const u32 current = vm_read32(opd);
+      if (current == 0 || current == 0xFFFFFFFFu) {
         u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
-        static int _n=0; if(_n++<6) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
+        static int _n=0; if(_n++<6) fprintf(stderr,"[GCM CALLBACK] restored OPD 0x%08X code=0x%08X\n",opd,code);
+      }
     }
 }
 /* Legacy host-typed slots kept around for any caller still treating
@@ -241,6 +272,10 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = (u16)(io_page + i);
         s_ea_address_table[io_page + i] = (u16)(ea_page + i);
+        if (s_offset_table_exposed) {
+            gcm_write_offset_entry(GCM_OFFSET_IO_TABLE_GUEST_ADDR, ea_page + i, (u16)(io_page + i));
+            gcm_write_offset_entry(GCM_OFFSET_EA_TABLE_GUEST_ADDR, io_page + i, (u16)(ea_page + i));
+        }
     }
 }
 
@@ -254,6 +289,10 @@ static void clear_offset_table(u32 ea, u32 io, u32 size)
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = 0xFFFF;
         s_ea_address_table[io_page + i] = 0xFFFF;
+        if (s_offset_table_exposed) {
+            gcm_write_offset_entry(GCM_OFFSET_IO_TABLE_GUEST_ADDR, ea_page + i, 0xFFFF);
+            gcm_write_offset_entry(GCM_OFFSET_EA_TABLE_GUEST_ADDR, io_page + i, 0xFFFF);
+        }
     }
 }
 
@@ -514,11 +553,24 @@ u32 cellGcmGetFlipStatus(void)
 void cellGcmTickVBlank(void)
 {
     s_vblank_count++;
-    if (getenv("YDKJ_HANDLERTRACE")) { static int _n=0; if(_n++<4) fprintf(stderr,"[GCM-TICK] VBlank #%llu vblank_handler_opd=0x%08X flip_handler_opd=0x%08X caller=%p\n",(unsigned long long)s_vblank_count,s_vblank_handler_opd,s_flip_handler_opd,(void*)g_ps3_guest_caller); }
+    if (getenv("YDKJ_HANDLERTRACE")) { fprintf(stderr,"[GCM-TICK] VBlank #%llu vblank_handler_opd=0x%08X flip_handler_opd=0x%08X caller=%p\n",(unsigned long long)s_vblank_count,s_vblank_handler_opd,s_flip_handler_opd,(void*)g_ps3_guest_caller); }
     ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
     if (s_vblank_handler_opd && g_ps3_guest_caller) {
         g_ps3_guest_caller(s_vblank_handler_opd,
                            (uint64_t)s_vblank_count, 0, 0, 0);
+    }
+    {
+        extern int sys_event_queue_push_by_id(uint32_t qid, uint64_t src, uint64_t d1, uint64_t d2, uint64_t d3);
+        
+        uint64_t current_time_us = 0;
+#ifdef _WIN32
+        #include <windows.h>
+        LARGE_INTEGER now, freq;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&now);
+        current_time_us = (now.QuadPart * 1000000ULL) / freq.QuadPart;
+#endif
+        sys_event_queue_push_by_id(1, 0x5044495047465358ULL, (uint64_t)s_vblank_count, current_time_us, 0);
     }
 }
 
@@ -527,7 +579,7 @@ void cellGcmTickFlip(void)
     /* A display refresh: the pending flip is now complete (unblocks a guest
      * cellGcmSetWaitFlip). */
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    if (getenv("YDKJ_HANDLERTRACE")) { static int _n=0; if(_n++<4) fprintf(stderr,"[GCM-TICK] Flip flip_handler_opd=0x%08X (invoked=%d)\n",s_flip_handler_opd,(s_flip_handler_opd && g_ps3_guest_caller)?1:0); }
+    if (getenv("YDKJ_HANDLERTRACE")) { fprintf(stderr,"[GCM-TICK] Flip flip_handler_opd=0x%08X (invoked=%d)\n",s_flip_handler_opd,(s_flip_handler_opd && g_ps3_guest_caller)?1:0); }
     ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
     if (s_flip_handler_opd && g_ps3_guest_caller) {
         g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0);
@@ -565,6 +617,11 @@ unsigned long long ps3_ms_now(void)
 
 static u32 s_fifo_getoff  = 0;
 static u32 s_fifo_calloff = 0;
+/* SET_OBJECT binds an engine class to each FIFO subchannel.  GT6 normally
+ * uses NV4097 (the 3D engine) on subchannel zero during early bring-up, but
+ * later command buffers are allowed to bind it elsewhere.  Routing solely by
+ * subchannel number silently drops those 3D methods as unimplemented 2D. */
+static u32 s_fifo_object[8];
 
 /* ---------------------------------------------------------------------------
  * 2D transfer engines (FIFO subchannels != 0).
@@ -592,6 +649,34 @@ static struct {
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
+    /* Keep the complete 14-bit RSX method visible while bringing up a title.
+     * In particular, subchannel 7 method 0x0B00 is register 0xEB00
+     * (GCM_SET_USER_COMMAND), not an unknown 2D-engine method. */
+    if (getenv("GCM_2DTRACE")) {
+        static unsigned trace_count = 0;
+        if (trace_count++ < 256)
+            fprintf(stderr,
+                    "[GCM-METHOD] reg=0x%04X subch=%u method=0x%04X data=0x%08X\n",
+                    subch * 0x2000u + method, subch, method, data);
+    }
+
+    /* SCE driver user interrupts occupy 0xEB00 and 0xEB04. The RSX interrupt
+     * thread calls the handler registered by cellGcmSetUserHandler with the
+     * FIFO argument as its cause. GT6 emits these during graphics bring-up;
+     * dropping them leaves its driver-side state machine unnotified. */
+    if (subch == 7 && (method == 0x0B00 || method == 0x0B04)) {
+        s_user_command = data;
+        ydkj_restore_handler_opd(s_user_handler_opd, s_user_handler_code);
+        if (getenv("GCM_2DTRACE"))
+            fprintf(stderr,
+                    "[GCM-USER] cause=0x%08X handler_opd=0x%08X invoked=%d\n",
+                    data, s_user_handler_opd,
+                    (s_user_handler_opd && g_ps3_guest_caller) ? 1 : 0);
+        if (s_user_handler_opd && g_ps3_guest_caller)
+            g_ps3_guest_caller(s_user_handler_opd, data, 0, 0, 0);
+        return;
+    }
+
     /* Subchannel bindings are libgcm-version-specific (SET_OBJECT binds are
      * not tracked): demosaic's SDK emits dest-surface on sub 3 and image-from-
      * CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 / 0xA400
@@ -611,7 +696,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         case 0x0308: s_gcm2d.size_out = data; return;
         case 0x030C: return;                /* SIZE_IN */
         }
-        if (method >= 0x0400 && method <= 0x07FC) {
+        if (method >= 0x0400 && method <= 0x1FFC) {
             /* COLOR data word: write into the destination surface. Inline
              * transfers use format Y32 (4 bytes/px, one row per point.y).
              * DMA 0xFEED0000 = local memory, 0xFEED0001 = main memory. */
@@ -671,7 +756,11 @@ void cellGcm_rsx_process_fifo(void)
     extern u32 g_rsx_last_reference;
 
     if (!s_gcm_context_ea) return;
-    if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
+    if (!s_inited) {
+        rsx_state_init(&s_state);
+        memset(s_fifo_object, 0, sizeof(s_fifo_object));
+        s_inited = 1;
+    }
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following
@@ -711,15 +800,33 @@ void cellGcm_rsx_process_fifo(void)
         }
 
         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+            if (getenv("GCM_FIFOTRACE")) {
+                static unsigned trace_control = 0;
+                if (trace_control++ < 256)
+                    fprintf(stderr, "[GCM FIFO] off=%08X JUMP -> %08X\n",
+                            s_fifo_getoff, w & 0x1FFFFFFCu);
+            }
             s_fifo_getoff = w & 0x1FFFFFFCu;
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+            if (getenv("GCM_FIFOTRACE")) {
+                static unsigned trace_control = 0;
+                if (trace_control++ < 256)
+                    fprintf(stderr, "[GCM FIFO] off=%08X CALL -> %08X ret=%08X\n",
+                            s_fifo_getoff, w & 0x1FFFFFFCu, s_fifo_getoff + 4);
+            }
             s_fifo_calloff = s_fifo_getoff + 4;
             s_fifo_getoff  = w & 0x1FFFFFFCu;
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
+            if (getenv("GCM_FIFOTRACE")) {
+                static unsigned trace_control = 0;
+                if (trace_control++ < 256)
+                    fprintf(stderr, "[GCM FIFO] off=%08X RET -> %08X\n",
+                            s_fifo_getoff, s_fifo_calloff);
+            }
             s_fifo_getoff = s_fifo_calloff;
             s_fifo_calloff = 0;
             continue;
@@ -728,14 +835,45 @@ void cellGcm_rsx_process_fifo(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            if (getenv("GCM_FIFOTRACE")) {
+                static unsigned trace_methods = 0;
+                if (trace_methods++ < 1024)
+                    fprintf(stderr,
+                            "[GCM FIFO] off=%08X type=%u subch=%u method=%04X count=%u object=%X\n",
+                            s_fifo_getoff, type, subch, method, count,
+                            s_fifo_object[subch]);
+                if (method >= 0x1800u && method < 0x1900u && count != 0) {
+                    static unsigned trace_vertex_words = 0;
+                    if (trace_vertex_words++ < 128) {
+                        fprintf(stderr, "[GCM FIFO]   data:");
+                        for (u32 i = 0; i < count && i < 16; ++i) {
+                            u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                            fprintf(stderr, " %08X", dea ? vm_read32(dea) : 0u);
+                        }
+                        fputc('\n', stderr);
+                    }
+                }
+            }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
-                if (subch == 0)
-                    rsx_process_method(&s_state, m, vm_read32(dea));
-                else
-                    gcm_2d_method(subch, m, vm_read32(dea));
+                u32 data = vm_read32(dea);
+
+                /* Method zero is the RSX SET_OBJECT bind command, not an
+                 * engine register.  It must be consumed before dispatch so
+                 * following methods use the class actually selected by the
+                 * guest command buffer. */
+                if (m == 0) {
+                    s_fifo_object[subch] = data;
+                    if (getenv("GCM_2DTRACE"))
+                        fprintf(stderr, "[GCM-OBJECT] subch=%u class=0x%X\n",
+                                subch, data);
+                } else if (subch == 0 || s_fifo_object[subch] == 0x4097u) {
+                    rsx_process_method(&s_state, m, data);
+                } else {
+                    gcm_2d_method(subch, m, data);
+                }
             }
             s_fifo_getoff += 4 + count * 4;
             continue;
@@ -958,6 +1096,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     printf("[cellGcmSys] SetUserHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_user_handler_opd = (u32)(size_t)handler;
     s_user_handler = handler;
+    { u32 c = s_user_handler_opd ? vm_read32(s_user_handler_opd) : 0; if (c) s_user_handler_code = c; }
 }
 
 /* NID: 0x21AC3697 */
@@ -973,10 +1112,16 @@ u64 cellGcmGetLastFlipTime(void)
 /* NID: 0x0E6B0DFF */
 s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
 {
-    if (!table)
+    u32 table_ea = (u32)(uintptr_t)table;
+    if (!table_ea || !vm_base)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    *table = s_offset_table;
+    /* `table` is a guest output address.  Its two fields are guest pointers,
+     * never host addresses. */
+    gcm_sync_offset_tables_to_guest();
+    s_offset_table_exposed = 1;
+    vm_write32(table_ea + 0, GCM_OFFSET_IO_TABLE_GUEST_ADDR);
+    vm_write32(table_ea + 4, GCM_OFFSET_EA_TABLE_GUEST_ADDR);
     return CELL_OK;
 }
 
@@ -1375,7 +1520,7 @@ u32 cellGcmGetTiledPitchSize(u32 size)
             if (s_valid_pitches[i] >= size) { r = s_valid_pitches[i]; break; }
         }
     }
-    { static int _n=0; if (_n++<4) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
+    { static int _n=0; fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
     return r;
 }
 
@@ -1707,3 +1852,4 @@ u32 cellGcmGetReportDataLocation(u32 index, u32 location)
 
     return s_report_data[index].value;
 }
+
