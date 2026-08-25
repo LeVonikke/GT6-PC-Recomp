@@ -17,7 +17,7 @@
 /* All buffers supplied by the context-aware wrappers live in the flat guest
  * VM.  Keep the diagnostic address in guest notation rather than a host VA. */
 extern uint8_t* vm_base;
-extern __declspec(thread) ppu_context* g_active_ctx;
+extern PPU_TLS ppu_context* g_active_ctx;
 extern void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand

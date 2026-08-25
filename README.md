@@ -1,5 +1,11 @@
 # ps3recomp
 
+> **This fork:** the GT6 (Gran Turismo 6 / NPUA81049) port lives in
+> [`gt6/`](gt6/README.md). For the session-by-session progress log, current
+> blocker, and exact resume point, see [`historico_ia.txt`](historico_ia.txt)
+> at the repo root. Everything below this point is the generic upstream
+> `ps3recomp` framework documentation, not GT6-specific.
+
 ### *Because the Cell processor deserves a second life*
 
 > Static recompilation runtime libraries for PlayStation 3 titles.

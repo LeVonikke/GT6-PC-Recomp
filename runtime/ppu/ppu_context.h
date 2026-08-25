@@ -13,6 +13,15 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Thread-local storage keyword, portable between MSVC and GCC/Clang.
+ * Mirrors SPU_TLS in runtime/spu/spu_channels.c -- same reasoning: MSVC-only
+ * __declspec(thread) doesn't parse on non-Windows targets. */
+#if defined(_MSC_VER)
+#  define PPU_TLS __declspec(thread)
+#else
+#  define PPU_TLS __thread
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -443,11 +443,19 @@ static mfc_engine* mfc_for(spu_context* ctx)
 extern uint8_t* vm_base;
 
 /* Global spinlock guarding all atomic line ops. _InterlockedExchange is a
- * clang-cl/MSVC intrinsic (no runtime library symbol needed). */
+ * clang-cl/MSVC intrinsic (no runtime library symbol needed); GCC/Clang on
+ * non-Windows targets use the equivalent C11 atomic exchange instead. */
+#if defined(_MSC_VER)
 #include <intrin.h>
 static volatile long g_resv_lock = 0;
 static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { } }
 static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
+#else
+#include <stdatomic.h>
+static atomic_int g_resv_lock = 0;
+static void resv_lock(void)   { while (atomic_exchange(&g_resv_lock, 1)) { } }
+static void resv_unlock(void) { atomic_exchange(&g_resv_lock, 0); }
+#endif
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)

@@ -18,6 +18,20 @@ static u32 s_gcm_context_ea = 0;
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
+/* 1ms host sleep, used by the flip-wait and FIFO-drain spins below. */
+static void gcm_sleep_1ms(void)
+{
+#if defined(_WIN32)
+    __declspec(dllimport) void __stdcall Sleep(unsigned long);
+    Sleep(1);
+#else
+    usleep(1000);
+#endif
+}
 #include <stdint.h>
 
 #ifdef _WIN32
@@ -520,9 +534,8 @@ void cellGcmSetWaitFlip(void)
      * via cellGcmTickFlip, ~once per display refresh). This throttles the title
      * to vsync; without it the guest loops unthrottled and many frames batch
      * into a single host present -> the console text stacks/duplicates. */
-    __declspec(dllimport) void __stdcall Sleep(unsigned long);
     for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
-        Sleep(1);
+        gcm_sleep_1ms();
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 }
 
@@ -932,7 +945,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
      * no commands are lost; a stalled ticker degrades to dropped commands. */
     int spins = 0;
-    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
+    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { gcm_sleep_1ms(); spins++; }
     if (spins >= 2000) {
         static int warned = 0;
         if (warned++ < 4)

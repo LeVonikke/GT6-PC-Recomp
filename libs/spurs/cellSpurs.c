@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
