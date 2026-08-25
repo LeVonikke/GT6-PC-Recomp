@@ -52,7 +52,13 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #    per-game against the lifter-generated ppu_recomp.h (and the game's RSX/D3D12
 #    backend), not as part of the game-agnostic runtime library. See
 #    docs/PPU_RECOMP.md.
-list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/")
+#  - spu_drain.c, spu_lockstep.c, spurs_policy.c: pulled in from upstream's
+#    2026-08-14 fold, but written against upstream's spu_context (fields like
+#    policy_mode/module_img_a00/int_enable/host_depth/list_stall_stat that
+#    ours doesn't have -- kept ours deliberately, see historico_ia.txt for
+#    why). spu_interp.c/spu_vm_pagemap.c/spurs_job.c/spurs_policy_blob_weak.c
+#    from the same fold compile fine as-is and are NOT excluded.
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_drain\\.c$|/spu_lockstep\\.c$|/spurs_policy\\.c$")
 
 # ---------------------------------------------------------------------------
 # Static library
