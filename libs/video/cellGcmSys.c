@@ -8,6 +8,15 @@
  * Actual rendering is handled elsewhere -- this module just tracks state.
  */
 
+#ifndef _WIN32
+/* usleep()/clock_gettime()/CLOCK_MONOTONIC are POSIX, but glibc's headers
+ * hide them under a strict standard mode unless a feature-test macro asks
+ * for them. Must come before any system header is included. The real build
+ * already defines _GNU_SOURCE (which implies this), so this only matters
+ * for a standalone/manual compile of this file. */
+#define _DEFAULT_SOURCE
+#endif
+
 #include "cellGcmSys.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
@@ -582,6 +591,16 @@ void cellGcmTickVBlank(void)
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&now);
         current_time_us = (now.QuadPart * 1000000ULL) / freq.QuadPart;
+#else
+        /* Was silently left at 0 on non-Windows -- historico_ia.txt records
+         * that the real high-resolution timestamp here (not just the right
+         * source id) is what let the guest's sys_event_queue_receive wait
+         * unblock. clock_gettime(CLOCK_MONOTONIC) is the POSIX equivalent
+         * of QueryPerformanceCounter for this purpose (monotonic, not
+         * wall-clock, but same microsecond-resolution intent). */
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        current_time_us = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
 #endif
         sys_event_queue_push_by_id(1, 0x5044495047465358ULL, (uint64_t)s_vblank_count, current_time_us, 0);
     }
