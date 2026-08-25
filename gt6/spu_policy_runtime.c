@@ -1,4 +1,10 @@
 /* C linkage bridge for GT6's raw CellSpurs policy module. */
+#ifndef _WIN32
+/* usleep() is POSIX, but glibc's <unistd.h> hides it under strict -std=c17
+ * unless a feature-test macro asks for it. Must come before any system
+ * header is included. */
+#define _DEFAULT_SOURCE
+#endif
 #include "spu_policy/spu_recomp.h"
 #include "spu_kernel/spu_recomp.h"
 #include "../runtime/spu/spu_lifted_job.h"
@@ -10,8 +16,105 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #ifdef _WIN32
 #include <windows.h>
+#define GT6_THREAD_RET DWORD WINAPI
+#else
+/* Portable stand-ins for the Win32 primitives this file uses: thread
+ * creation, a lazy-init critical section, and interlocked ops. Kept as a
+ * single local shim (mirrors SPU_TLS/PPU_TLS elsewhere) rather than a
+ * project-wide header, since nothing outside this file needs it. */
+#include <pthread.h>
+#include <unistd.h>
+
+typedef int32_t  LONG;
+typedef uint32_t DWORD;
+typedef void*    HANDLE;
+typedef void*    PVOID;
+typedef int      BOOL;
+#define TRUE 1
+#define FALSE 0
+#define CALLBACK
+/* GT6_THREAD_RET: the three CreateThread entry points below are declared
+ * `DWORD WINAPI name(void*)` on Windows; `return 0;` from them is also a
+ * valid null-pointer return under this void*-returning POSIX signature, so
+ * no call-site changes are needed beyond the declaration. */
+#define WINAPI
+#define GT6_THREAD_RET void*
+
+typedef volatile LONG INIT_ONCE;
+typedef INIT_ONCE* PINIT_ONCE;
+#define INIT_ONCE_STATIC_INIT 0
+
+static pthread_mutex_t s_init_once_guard = PTHREAD_MUTEX_INITIALIZER;
+static inline BOOL InitOnceExecuteOnce(PINIT_ONCE once,
+                                       BOOL (CALLBACK *fn)(PINIT_ONCE, PVOID, PVOID*),
+                                       PVOID param, PVOID* context)
+{
+    if (__atomic_load_n(once, __ATOMIC_ACQUIRE) == 0) {
+        pthread_mutex_lock(&s_init_once_guard);
+        if (__atomic_load_n(once, __ATOMIC_ACQUIRE) == 0) {
+            fn(once, param, context);
+            __atomic_store_n(once, 1, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&s_init_once_guard);
+    }
+    return TRUE;
+}
+
+typedef pthread_mutex_t CRITICAL_SECTION;
+static inline void InitializeCriticalSection(CRITICAL_SECTION* cs) { pthread_mutex_init(cs, NULL); }
+static inline void EnterCriticalSection(CRITICAL_SECTION* cs)      { pthread_mutex_lock(cs); }
+static inline void LeaveCriticalSection(CRITICAL_SECTION* cs)      { pthread_mutex_unlock(cs); }
+static inline void DeleteCriticalSection(CRITICAL_SECTION* cs)     { pthread_mutex_destroy(cs); }
+
+static inline LONG InterlockedExchange(volatile LONG* target, LONG value)
+{
+    return __atomic_exchange_n(target, value, __ATOMIC_SEQ_CST);
+}
+static inline LONG InterlockedCompareExchange(volatile LONG* dest, LONG exchange, LONG comparand)
+{
+    __atomic_compare_exchange_n(dest, &comparand, exchange, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return comparand; /* original *dest value, matching Win32 semantics either way */
+}
+static inline LONG InterlockedIncrement(volatile LONG* addend) { return __atomic_add_fetch(addend, 1, __ATOMIC_SEQ_CST); }
+static inline LONG InterlockedDecrement(volatile LONG* addend) { return __atomic_sub_fetch(addend, 1, __ATOMIC_SEQ_CST); }
+static inline LONG InterlockedOr(volatile LONG* dest, LONG value)  { return __atomic_fetch_or(dest, value, __ATOMIC_SEQ_CST); }
+static inline LONG InterlockedAnd(volatile LONG* dest, LONG value) { return __atomic_fetch_and(dest, value, __ATOMIC_SEQ_CST); }
+
+static inline void Sleep(DWORD ms) { usleep((useconds_t)ms * 1000u); }
+
+/* Same 6-argument shape as Win32 CreateThread so the three call sites below
+ * (stack_size 0 = default, or an explicit reservation) don't need to change. */
+static inline HANDLE CreateThread(void* attrs, size_t stack_size, GT6_THREAD_RET (*start)(void*),
+                                   void* param, DWORD flags, void* tid_out)
+{
+    (void)attrs; (void)flags; (void)tid_out;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    if (stack_size)
+        pthread_attr_setstacksize(&attr, stack_size);
+    pthread_t* thread = (pthread_t*)malloc(sizeof(pthread_t));
+    if (!thread) { pthread_attr_destroy(&attr); return NULL; }
+    if (pthread_create(thread, &attr, start, param) != 0) {
+        pthread_attr_destroy(&attr);
+        free(thread);
+        return NULL;
+    }
+    pthread_attr_destroy(&attr);
+    return (HANDLE)thread;
+}
+/* Win32 CloseHandle on a CreateThread handle doesn't join, it just stops
+ * tracking the thread (these are all fire-and-forget); pthread_detach is the
+ * equivalent "we will never join this" call. */
+static inline void CloseHandle(HANDLE h)
+{
+    if (!h) return;
+    pthread_t* thread = (pthread_t*)h;
+    pthread_detach(*thread);
+    free(thread);
+}
 #endif
 
 extern uint8_t* vm_base;
@@ -391,7 +494,7 @@ static int gt6_pdi_select_next_workload(const gt6_pdi_policy_job* job,
     return 1;
 }
 
-static DWORD WINAPI gt6_pdi_policy_ready_thread(void* opaque)
+static GT6_THREAD_RET gt6_pdi_policy_ready_thread(void* opaque)
 {
     const uint32_t queue = (uint32_t)(uintptr_t)opaque;
     /* Attaching a runnable workload raises its port once.  The previous
@@ -429,7 +532,7 @@ void gt6_pdi_policy_add_scheduler_tick(uint32_t queue)
     }
 }
 
-static DWORD WINAPI gt6_pdi_policy_thread(void* opaque)
+static GT6_THREAD_RET gt6_pdi_policy_thread(void* opaque)
 {
     gt6_pdi_policy_job* job = (gt6_pdi_policy_job*)opaque;
     const uint32_t workload_id = job->workload_id;
@@ -515,7 +618,7 @@ static DWORD WINAPI gt6_pdi_policy_thread(void* opaque)
 /* Preserve a ReadyCount edge when both physical lanes are busy. The guest
  * ready byte stays asserted; this thread merely retries the normal bounded
  * dispatch after a real lane returns, instead of opening a third lane. */
-static DWORD WINAPI gt6_pdi_policy_deferred_thread(void* opaque)
+static GT6_THREAD_RET gt6_pdi_policy_deferred_thread(void* opaque)
 {
     gt6_pdi_policy_job* job = (gt6_pdi_policy_job*)opaque;
     while (InterlockedCompareExchange(&s_policy_active_count, 0, 0) >=

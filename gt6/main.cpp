@@ -1,4 +1,5 @@
 #include "../runtime/syscalls/sys_ppu_thread.h"
+#include "../runtime/ppu/ppu_context.h"
 #include "cellGame.h"
 #include "ps3emu/guest_call.h"
 
@@ -13,6 +14,11 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#else
+#include <csignal>
+#include <cstring>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 extern "C" {
@@ -26,7 +32,7 @@ void gt6_register_hle(void);
 
 uint8_t* vm_base = nullptr;
 extern uint32_t ppu_vm_size; // owned by ppu_loader.cpp
-extern __declspec(thread) ppu_context* g_active_ctx;
+extern PPU_TLS ppu_context* g_active_ctx;
 extern uint32_t g_last_hle_nid;
 extern const char* g_last_hle_name;
 extern void ps3_hle_dump_recent_calls(void);
@@ -48,6 +54,13 @@ extern int rsx_d3d12_backend_init(uint32_t width, uint32_t height,
                                   const char* title);
 extern void rsx_d3d12_backend_present(void);
 extern int rsx_d3d12_backend_pump_messages(void);
+/* Non-Windows fallback: no real window yet (libs/video/rsx_null_backend.c
+ * has only a Win32 GDI implementation and a POSIX stub that just returns
+ * failure) -- see rsx_ok handling in gt6_vblank_ticker below, which already
+ * tolerates the backend being unavailable and keeps ticking VBlank/FIFO. */
+extern int rsx_null_backend_init(uint32_t width, uint32_t height, const char* title);
+extern void rsx_null_backend_shutdown(void);
+extern int rsx_null_backend_pump_messages(void);
 }
 
 /* MSVC reports the useful "vector<T> too long" message immediately before
@@ -113,8 +126,12 @@ namespace std {
     std::abort();
 }
 
-#ifdef _WIN32
+/* Size of the reserved (not committed) PS3 guest address space: the full
+ * 32-bit range plus a little slack. Shared by both the Windows VirtualAlloc
+ * path and the POSIX mmap path below. */
 static constexpr uintptr_t kGuestVmSize = 0x100010000ull;
+
+#ifdef _WIN32
 static DWORD g_main_host_tid = 0;
 static DWORD g_vblank_host_tid = 0;
 static uintptr_t g_host_image_base = 0;
@@ -313,66 +330,6 @@ static void gt6_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
     ppu_guest_call(opd, a0, a1, a2, a3);
 }
 
-/* Own the D3D12 window on this thread and emulate the two display interrupts
- * that libgcm expects.  The driver starts before game entry, but every routine
- * below is a no-op until cellGcmInit and the handlers have been registered. */
-void gt6_vblank_tick_safe() {
-#ifdef _WIN32
-    __try {
-        cellGcmTickVBlank();
-        cellGcmTickFlip();
-    } __except(1) {
-        std::fprintf(stderr, "[GT6 RSX] CRASH in VBlank/Flip thread! Exception code: 0x%08X\n", GetExceptionCode());
-        ExitProcess(1);
-    }
-#else
-    cellGcmTickVBlank();
-    cellGcmTickFlip();
-#endif
-}
-
-static DWORD WINAPI gt6_vblank_ticker(LPVOID)
-{
-    int rsx_ok = rsx_d3d12_backend_init(1280, 720, "Gran Turismo 6 (ps3recomp)") == 0;
-    std::fprintf(stderr, "[GT6 RSX] backend %s\n", rsx_ok ? "ready" : "unavailable");
-
-    ULONGLONG next_tick = GetTickCount64();
-    ULONGLONG next_boot_present = next_tick;
-    for (;;) {
-        Sleep(4);
-        const ULONGLONG now = GetTickCount64();
-        int fired = 0;
-        while (static_cast<LONGLONG>(now - next_tick) >= 0 && fired++ < 8) {
-            gt6_vblank_tick_safe();
-            next_tick += 16;
-        }
-        if (fired >= 8)
-            next_tick = now + 16;
-
-        if (!rsx_ok)
-            continue;
-
-        /* Drain at a short cadence: GT6 waits on RSX labels between setup
-         * passes, so servicing them only once per vblank causes a false stall. */
-        cellGcm_rsx_process_fifo();
-        if (cellGcm_take_flip_pending())
-            rsx_d3d12_backend_present();
-        else if (now >= next_boot_present) {
-            /* Make the live graphics surface visible even before GT6 submits
-             * its first flip. This is deliberately a backend clear only, not
-             * a fabricated game frame. */
-            rsx_d3d12_backend_present();
-            /* Keep the host surface paced to the PS3's 60 Hz vblank even
-             * while the title has not submitted a flip yet.  The old 500 ms
-             * fallback made the valid first draw appear as a 2 FPS window. */
-            next_boot_present = now + 16;
-        }
-
-        if (rsx_d3d12_backend_pump_messages() != 0)
-            rsx_ok = 0;
-    }
-}
-
 static LONG WINAPI report_unhandled_exception(EXCEPTION_POINTERS* ep)
 {
     const EXCEPTION_RECORD* record = ep->ExceptionRecord;
@@ -510,7 +467,143 @@ static LONG WINAPI commit_guest_page(EXCEPTION_POINTERS* ep)
         ? EXCEPTION_CONTINUE_EXECUTION
         : EXCEPTION_CONTINUE_SEARCH;
 }
+#else /* !_WIN32 */
+
+/* Diagnostic thread/register snapshot on a stall. Full parity with the
+ * Windows Toolhelp32-based version (which suspends and inspects every host
+ * thread's register state) isn't implemented yet on POSIX; this is a stub
+ * so the smoke-test watchdog still runs, not a claim of equivalent detail. */
+static void gt6_dump_thread_snapshot(void)
+{
+    std::fprintf(stderr, "[GT6 THREADS] snapshot not implemented on this platform\n");
+}
+
+static void gt6_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
+                             uint64_t a2, uint64_t a3)
+{
+    ppu_guest_call(opd, a0, a1, a2, a3);
+}
+
+/* POSIX equivalent of commit_guest_page above: vm_base is reserved with
+ * PROT_NONE (mmap, no upfront commit of ~4 GiB), so any touch faults with
+ * SIGSEGV. If the fault is inside the guest VM range, make that 64 KiB page
+ * readable/writable and retry the faulting instruction; otherwise this is a
+ * genuine host bug, so restore the default handler and re-raise so a normal
+ * core dump / diagnostic still happens. */
+static void gt6_posix_segv_handler(int sig, siginfo_t* info, void* uctx)
+{
+    (void)uctx;
+    const uintptr_t fault = reinterpret_cast<uintptr_t>(info->si_addr);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(vm_base);
+    if (vm_base && fault >= base && fault < base + kGuestVmSize) {
+        void* page = reinterpret_cast<void*>(fault & ~static_cast<uintptr_t>(0xFFFF));
+        if (mprotect(page, 0x10000, PROT_READ | PROT_WRITE) == 0)
+            return; /* retry the faulting instruction */
+    }
+    std::fprintf(stderr, "[GT6 CRASH] SIGSEGV addr=%p last-hle=0x%08X %s\n",
+                 info->si_addr, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "<none>");
+    if (g_active_ctx) {
+        std::fprintf(stderr,
+            "[GT6 CRASH] guest cia=%08X lr=%08X sp=%08X r3=%08X r4=%08X r5=%08X\n",
+            static_cast<uint32_t>(g_active_ctx->cia), static_cast<uint32_t>(g_active_ctx->lr),
+            static_cast<uint32_t>(g_active_ctx->gpr[1]), static_cast<uint32_t>(g_active_ctx->gpr[3]),
+            static_cast<uint32_t>(g_active_ctx->gpr[4]), static_cast<uint32_t>(g_active_ctx->gpr[5]));
+    }
+    std::fflush(stderr);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void gt6_install_posix_segv_handler(void)
+{
+    struct sigaction sa{};
+    sa.sa_sigaction = gt6_posix_segv_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, nullptr);
+}
 #endif
+
+/* Own the display/RSX pump on this thread and emulate the two display
+ * interrupts that libgcm expects.  The driver starts before game entry, but
+ * every routine below is a no-op until cellGcmInit and the handlers have
+ * been registered. Deliberately outside the big #ifdef _WIN32/#else block
+ * above (unlike that block, everything here is meant to run on both
+ * platforms; see the inner #ifdefs for the D3D12/null-backend split). */
+void gt6_vblank_tick_safe() {
+#ifdef _WIN32
+    __try {
+        cellGcmTickVBlank();
+        cellGcmTickFlip();
+    } __except(1) {
+        std::fprintf(stderr, "[GT6 RSX] CRASH in VBlank/Flip thread! Exception code: 0x%08X\n", GetExceptionCode());
+        ExitProcess(1);
+    }
+#else
+    cellGcmTickVBlank();
+    cellGcmTickFlip();
+#endif
+}
+
+/* Portable across Windows (D3D12) and non-Windows (null/headless backend --
+ * no real window yet, see the rsx_null_backend note above); only the actual
+ * backend calls differ, so this body is written once. Launched via
+ * std::thread from main() on both platforms. */
+static void gt6_vblank_ticker()
+{
+#ifdef _WIN32
+    int rsx_ok = rsx_d3d12_backend_init(1280, 720, "Gran Turismo 6 (ps3recomp)") == 0;
+#else
+    int rsx_ok = rsx_null_backend_init(1280, 720, "Gran Turismo 6 (ps3recomp)") == 0;
+#endif
+    std::fprintf(stderr, "[GT6 RSX] backend %s\n", rsx_ok ? "ready" : "unavailable");
+
+    using clock = std::chrono::steady_clock;
+    auto next_tick = clock::now();
+    auto next_boot_present = next_tick;
+    const auto tick_period = std::chrono::milliseconds(16);
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        const auto now = clock::now();
+        int fired = 0;
+        while (now >= next_tick && fired++ < 8) {
+            gt6_vblank_tick_safe();
+            next_tick += tick_period;
+        }
+        if (fired >= 8)
+            next_tick = now + tick_period;
+
+        if (!rsx_ok)
+            continue;
+
+        /* Drain at a short cadence: GT6 waits on RSX labels between setup
+         * passes, so servicing them only once per vblank causes a false stall. */
+        cellGcm_rsx_process_fifo();
+#ifdef _WIN32
+        if (cellGcm_take_flip_pending()) {
+            rsx_d3d12_backend_present();
+        } else if (now >= next_boot_present) {
+            /* Make the live graphics surface visible even before GT6 submits
+             * its first flip. This is deliberately a backend clear only, not
+             * a fabricated game frame. */
+            rsx_d3d12_backend_present();
+            /* Keep the host surface paced to the PS3's 60 Hz vblank even
+             * while the title has not submitted a flip yet.  The old 500 ms
+             * fallback made the valid first draw appear as a 2 FPS window. */
+            next_boot_present = now + tick_period;
+        }
+        if (rsx_d3d12_backend_pump_messages() != 0)
+            rsx_ok = 0;
+#else
+        /* No real present/pump on the headless POSIX stub yet -- just keep
+         * draining the FIFO so guest-side flip bookkeeping still advances. */
+        (void)cellGcm_take_flip_pending();
+        if (rsx_null_backend_pump_messages() != 0)
+            rsx_ok = 0;
+#endif
+    }
+}
+
 #ifdef _WIN32
 #include <windows.h>
 extern int g_s_depth;
@@ -566,8 +659,11 @@ int main(int argc, char** argv)
     vm_base = static_cast<uint8_t*>(VirtualAlloc(nullptr, kGuestVmSize,
                                                   MEM_RESERVE, PAGE_READWRITE));
 #else
-    std::fprintf(stderr, "This project runner currently targets Windows.\n");
-    return 1;
+    // POSIX equivalent: reserve the range with PROT_NONE (no upfront commit),
+    // then gt6_posix_segv_handler() below faults pages in on first touch.
+    void* reserved = mmap(nullptr, kGuestVmSize, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    vm_base = (reserved != MAP_FAILED) ? static_cast<uint8_t*>(reserved) : nullptr;
 #endif
     if (!vm_base) {
         std::fprintf(stderr, "Unable to reserve the PS3 guest address space.\n");
@@ -581,8 +677,10 @@ int main(int argc, char** argv)
     SetUnhandledExceptionFilter(report_unhandled_exception);
     AddVectoredExceptionHandler(1, commit_guest_page);
     AddVectoredExceptionHandler(0, report_host_access_violation);
-    setvbuf(stdout, nullptr, _IONBF, 0);
+#else
+    gt6_install_posix_segv_handler();
 #endif
+    setvbuf(stdout, nullptr, _IONBF, 0);
 
     const uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) {
@@ -606,13 +704,10 @@ int main(int argc, char** argv)
     lv2_init_syscalls();
     std::set_terminate(gt6_terminate_handler);
 
-#ifdef _WIN32
     /* Install callback dispatch before GT6 registers its vblank/flip OPDs,
-     * then run the synthetic RSX display loop on its own Win32/D3D thread. */
+     * then run the synthetic RSX display loop on its own thread. */
     g_ps3_guest_caller = gt6_guest_caller;
-    CreateThread(nullptr, 1024u * 1024 * 1024, gt6_vblank_ticker, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION,
-                 &g_vblank_host_tid);
-#endif
+    std::thread(gt6_vblank_ticker).detach();
 
     /* Opt-in smoke-test watchdog.  It makes a long-running logical stall
      * observable in CI/terminal runs without changing normal execution. */
@@ -623,7 +718,7 @@ int main(int argc, char** argv)
                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                 std::fprintf(stderr, "[GT6 SMOKE] watchdog after %ld ms\n", timeout_ms);
                 gt6_dump_thread_snapshot();
-                Sleep(200);
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 gt6_dump_thread_snapshot();
                 ps3_hle_dump_main_calls();
                 ps3_hle_dump_recent_calls();

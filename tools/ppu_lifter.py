@@ -41,6 +41,16 @@ HEADER_PREAMBLE = """\
 #pragma once
 #include <stdint.h>
 
+/* Thread-local storage keyword, portable between MSVC and GCC/Clang (mirrors
+ * PPU_TLS in runtime/ppu/ppu_context.h / SPU_TLS in runtime/spu/spu_channels.c).
+ * Needed here because this generated header keeps its own copy of ppu_context
+ * instead of including runtime/ppu/ppu_context.h. */
+#if defined(_MSC_VER)
+#  define PPU_TLS __declspec(thread)
+#else
+#  define PPU_TLS __thread
+#endif
+
 /* 128-bit vector register for VMX/AltiVec */
 typedef union {
     uint8_t  b[16];
@@ -347,8 +357,8 @@ extern "C" void ppu_nonlocal_clear(ppu_context* ctx);
 extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
 
 /* Trampoline function pointer for cross-fragment branches (TLS).
- * Must match the __declspec(thread) definition in indirect_dispatch. */
-extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
+ * Must match the PPU_TLS definition in indirect_dispatch. */
+extern "C" PPU_TLS void (*g_trampoline_fn)(void*);
 
 /* Drain pending trampolines after any call that might set g_trampoline_fn.
  * Converts cross-fragment fallthrough chains into iterative loops. */

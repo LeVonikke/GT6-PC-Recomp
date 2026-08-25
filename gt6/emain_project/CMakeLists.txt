@@ -8,7 +8,12 @@ string(REPLACE "/EHsc" "/EHa" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 string(REPLACE "/EHsc" "/EHa" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 
 get_filename_component(PS3RECOMP_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
-set(PS3RECOMP_RUNTIME_LIB "${PS3RECOMP_DIR}/build/ps3recomp_runtime.lib" CACHE FILEPATH
+if(MSVC)
+    set(PS3RECOMP_RUNTIME_LIB_DEFAULT "${PS3RECOMP_DIR}/build/ps3recomp_runtime.lib")
+else()
+    set(PS3RECOMP_RUNTIME_LIB_DEFAULT "${PS3RECOMP_DIR}/build/libps3recomp_runtime.a")
+endif()
+set(PS3RECOMP_RUNTIME_LIB "${PS3RECOMP_RUNTIME_LIB_DEFAULT}" CACHE FILEPATH
     "Pre-built ps3recomp runtime library")
 if(NOT EXISTS "${PS3RECOMP_RUNTIME_LIB}")
     message(FATAL_ERROR "Runtime not found: ${PS3RECOMP_RUNTIME_LIB}. Build ${PS3RECOMP_DIR} first.")
@@ -89,8 +94,13 @@ if(MSVC)
         /FORCE:MULTIPLE /MAP /STACK:1073741824,1048576)
 endif()
 
-target_link_libraries(GT6MainRecompHook PRIVATE
-    "${PS3RECOMP_RUNTIME_LIB}"
-    d3d12 dxgi d3dcompiler uuid dxguid
-    ws2_32 xinput ole32 bcrypt
-)
+target_link_libraries(GT6MainRecompHook PRIVATE "${PS3RECOMP_RUNTIME_LIB}")
+if(WIN32)
+    target_link_libraries(GT6MainRecompHook PRIVATE
+        d3d12 dxgi d3dcompiler uuid dxguid
+        ws2_32 xinput ole32 bcrypt
+    )
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(GT6MainRecompHook PRIVATE Threads::Threads)
+endif()

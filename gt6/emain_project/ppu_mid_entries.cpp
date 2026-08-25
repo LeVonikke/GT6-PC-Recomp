@@ -1,12 +1,22 @@
 #include "ppu_recomp.h"
 
+/* Thread-local storage keyword, portable between MSVC and GCC/Clang (mirrors
+ * SPU_TLS in runtime/spu/spu_channels.c). ppu_recomp.h keeps its own copy of
+ * ppu_context rather than including runtime/ppu/ppu_context.h, so this can't
+ * be picked up from there -- defined locally instead. */
+#if defined(_MSC_VER)
+#  define PPU_TLS __declspec(thread)
+#else
+#  define PPU_TLS __thread
+#endif
+
 /* These three addresses are valid bctr targets in func_009A79D4's callback
  * table.  They are internal basic-block entries, not independent functions,
  * so the original lift did not register them.  On PPU a bctr to one of them
  * continues with the live 009A79D4 stack frame; reproduce those blocks here
  * and restore exactly that frame at the shared epilogue. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);
-extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
+extern "C" PPU_TLS void (*g_trampoline_fn)(void*);
 
 static inline uint32_t gt6_u32(uint64_t value) {
     return (uint32_t)value;

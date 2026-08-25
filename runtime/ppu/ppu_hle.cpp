@@ -74,8 +74,21 @@ extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+/* Used only by the FLOW_HLETOC debug trace below, to turn a host return
+ * address into a module-relative RVA for the log line. */
+#if defined(_WIN32)
 extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
 static inline void* ps3_GetModuleHandleA(const char* m){ return GetModuleHandleA(m); }
+#else
+#include <dlfcn.h>
+static inline void* ps3_GetModuleHandleA(const char*)
+{
+    /* dladdr's dli_fbase for a symbol inside this executable is the POSIX
+     * equivalent of GetModuleHandleA(nullptr): the load base of this image. */
+    Dl_info info{};
+    return dladdr(reinterpret_cast<void*>(&ps3_GetModuleHandleA), &info) ? info.dli_fbase : nullptr;
+}
+#endif
 
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {

@@ -15,7 +15,7 @@
  * Game-agnostic: works on any decrypted PS3 PPU ELF. `vm_base` is owned by the
  * host (allocated large enough to cover the highest segment vaddr+memsz).
  *
- * Compiled as C++ to match the lifted output's `extern "C"` / __declspec(thread).
+ * Compiled as C++ to match the lifted output's `extern "C"` / PPU_TLS.
  */
 
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
@@ -25,6 +25,82 @@
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#else
+/* Portable stand-ins for the diagnostic-only Win32 calls sprinkled through
+ * this file's opt-in env-var-gated traces (YDKJ_RWATCH, FLOW_RVAL,
+ * YDKJ_BLOCKTRACE, the unresolved-indirect-call dump, ...). None of these
+ * affect control flow or correctness -- they only resolve a host return
+ * address / stack trace to a module-relative offset or a lifted func_
+ * symbol for a log line, or measure elapsed time in milliseconds. */
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <time.h>
+#include <unistd.h>
+
+static inline void Sleep(unsigned long ms) { usleep((useconds_t)ms * 1000u); }
+
+/* USHORT RtlCaptureStackBackTrace(ULONG FramesToSkip, ULONG FramesToCapture,
+ * PVOID* BackTrace, PULONG BackTraceHash) -- backtrace() is the POSIX
+ * equivalent; frame alignment/skip count may differ slightly, which is fine
+ * for a best-effort debug trace. */
+static inline unsigned short RtlCaptureStackBackTrace(unsigned long frames_to_skip,
+                                                       unsigned long frames_to_capture,
+                                                       void** back_trace,
+                                                       unsigned long* backtrace_hash)
+{
+    (void)frames_to_skip; (void)backtrace_hash;
+    const int n = backtrace(back_trace, (int)frames_to_capture);
+    return (unsigned short)(n < 0 ? 0 : n);
+}
+
+/* GetModuleHandleA(nullptr) == the current executable's load base. dladdr's
+ * dli_fbase for any symbol inside this binary gives the same address. */
+static inline void* GetModuleHandleA(const char*)
+{
+    Dl_info info{};
+    static int anchor;
+    return dladdr(reinterpret_cast<void*>(&anchor), &info) ? info.dli_fbase : nullptr;
+}
+
+/* GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, addr, &out) --
+ * only that one flag combination is used in this file, so the shim just
+ * covers that: the base of whichever module contains `addr`. */
+typedef void* HMODULE;
+typedef const char* LPCSTR;
+#define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 1
+#define GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 2
+static inline int GetModuleHandleExA(unsigned long flags, LPCSTR addr, HMODULE* out)
+{
+    (void)flags;
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(addr), &info) && info.dli_fbase) {
+        *out = info.dli_fbase;
+        return 1;
+    }
+    *out = nullptr;
+    return 0;
+}
+
+/* ULONGLONG GetTickCount64(void) -- monotonic milliseconds since some
+ * unspecified epoch, exactly what the YDKJ_BLOCKTRACE elapsed-time math
+ * below needs (it only ever takes differences of two calls). */
+typedef uint64_t ULONGLONG;
+static inline ULONGLONG GetTickCount64(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ULONGLONG)ts.tv_sec * 1000ull + (ULONGLONG)(ts.tv_nsec / 1000000);
+}
+#endif
+
+/* Thread-local storage keyword, portable between MSVC and GCC/Clang (mirrors
+ * SPU_TLS in runtime/spu/spu_channels.c). ppu_recomp.h keeps its own copy of
+ * ppu_context rather than including runtime/ppu/ppu_context.h, so this can't
+ * be picked up from there -- defined locally instead. */
+#if defined(_MSC_VER)
+#  define PPU_TLS __declspec(thread)
+#else
+#  define PPU_TLS __thread
 #endif
 
 extern "C" uint8_t* vm_base;   /* defined by the host */
@@ -133,7 +209,7 @@ static int vm_oob(uint32_t a, uint32_t n)
 /* Shared read-frequency histogram (YDKJ_HOTMAP): finds busy-loop polled
  * addresses across all read widths even when the loop touches several addresses
  * per iteration (so the consecutive HOTREAD detectors reset). */
-extern "C" __declspec(thread) ppu_context* g_active_ctx;  /* defined below; needed here for spin backtrace */
+extern "C" PPU_TLS ppu_context* g_active_ctx;  /* defined below; needed here for spin backtrace */
 /* YDKJ_FORCEPARSE helper: yield ~1ms so a concurrent loader thread can plump the
  * .gfx stream into the load-process before the parse worker reads it (chunk code
  * can't include <windows.h> to call Sleep). */
@@ -166,15 +242,15 @@ static void vm_hotmap(uint32_t ea, int width)
         for (uint32_t i = 0; i < NB; i++) cnt[i] = 0;
     }
 }
-extern "C" __declspec(thread) ppu_context* g_active_ctx;  /* fwd decl (defined below) */
+extern "C" PPU_TLS ppu_context* g_active_ctx;  /* fwd decl (defined below) */
 /* Tracks the most recent vm_read32 {addr,value} on this thread, so FLOW_WVAL can
  * report the SOURCE a copied value came from (poison propagation vs true origin). */
-static __declspec(thread) uint32_t g_last_rd_addr = 0;
-static __declspec(thread) uint32_t g_last_rd_val  = 0;
+static PPU_TLS uint32_t g_last_rd_addr = 0;
+static PPU_TLS uint32_t g_last_rd_val  = 0;
 /* Stack of currently-executing indirect-call (vtable) targets on this thread, so a
  * write hook can name the virtual method that is running when it writes a value. */
-static __declspec(thread) uint32_t g_vcall_stk[128];
-static __declspec(thread) int      g_vcall_sp = 0;
+static PPU_TLS uint32_t g_vcall_stk[128];
+static PPU_TLS int      g_vcall_sp = 0;
 extern "C" {
 uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
     /* YDKJ_LV2_SAT (diagnostic): the game polls 0x00543580 ("Continue... (Lv-2 is
@@ -186,12 +262,12 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
 #endif
-    { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
+    { static PPU_TLS uint32_t last=0xFFFFFFFFu; static PPU_TLS uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD8] spinning on 0x%08X\n", (uint32_t)a); n=0; } }
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
 uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
-    { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
+    { static PPU_TLS uint32_t last=0xFFFFFFFFu; static PPU_TLS uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
@@ -272,7 +348,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; uint32_t v
           } } } }
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
-    { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
+    { static PPU_TLS uint32_t last=0xFFFFFFFFu; static PPU_TLS uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X)\n", (uint32_t)a, __builtin_bswap32(v)); n=0;
 #ifdef _WIN32
         { static int64_t wa=-2; if(wa==-2){const char*e=getenv("YDKJ_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
@@ -287,7 +363,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; uint32_t v
     /* Per-thread periodic guest-CIA dump (YDKJ_SPINCIA): locates a spin by CODE
      * position (deterministic) even when the polled data address varies per run. */
     { static int en=-1; if(en<0) en=getenv("YDKJ_SPINCIA")?1:0;
-      if(en && g_active_ctx){ static __declspec(thread) uint32_t rc=0;
+      if(en && g_active_ctx){ static PPU_TLS uint32_t rc=0;
         if(++rc >= 3000000u){ rc=0;
           fprintf(stderr,"[SPINCIA] cia=0x%08X lr=0x%08X reading=0x%08X\n",
                   (uint32_t)g_active_ctx->cia,(uint32_t)g_active_ctx->lr,(uint32_t)a);
@@ -313,7 +389,7 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
 #endif
-    { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
+    { static PPU_TLS uint32_t last=0xFFFFFFFFu; static PPU_TLS uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX)\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v)); n=0;
 #ifdef _WIN32
         { static int64_t wa=-2; if(wa==-2){const char*e=getenv("YDKJ_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
@@ -483,11 +559,11 @@ void flow_lookup_alloc(unsigned int p) {
 }
 
 /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
-extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
+extern "C" PPU_TLS void (*g_trampoline_fn)(void*) = nullptr;
 
 /* Per-thread active guest context, for the crash handler to report the guest PC
  * (ctx->pc, updated by lifted code at block boundaries) of a host AV. */
-extern "C" __declspec(thread) ppu_context* g_active_ctx = nullptr;
+extern "C" PPU_TLS ppu_context* g_active_ctx = nullptr;
 
 /* Caller LR of the guest function currently in an HLE call (for HLE-side
  * diagnostics: pin which lifted function invoked us). 0 if none. */
@@ -1365,7 +1441,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
 
     /* Private scratch stack high in the guest stack region, distinct from the
      * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static __declspec(thread) uint32_t s_cb_sp = 0;
+    static PPU_TLS uint32_t s_cb_sp = 0;
     if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
 
     ppu_context ctx;
@@ -1398,7 +1474,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
-    static __declspec(thread) uint32_t s_cb_sp = 0;
+    static PPU_TLS uint32_t s_cb_sp = 0;
     if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
 
     ppu_context ctx;
