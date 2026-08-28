@@ -578,6 +578,31 @@ static GT6_THREAD_RET gt6_pdi_policy_thread(void* opaque)
               if (parsed >= 1 && parsed <= (long)GT6_PDI_WORKER_COUNT)
                   dispatch_limit = (uint32_t)parsed;
           } }
+        /* GT6_PDI_CAPTURE_SNAPSHOT=<path prefix>: dump the exact inputs to the
+         * first dispatch below (local_store, workload_data, poll_status) to a
+         * file, once. Lets an offline, single-threaded tool replay this exact
+         * job through both the lifted and interpreted engines without the
+         * live boot's real thread-scheduling non-determinism -- see
+         * historico_ia.txt (2026-08-25, interpreter oracle inconclusive from
+         * live-boot noise) for why this is needed. Purely diagnostic. */
+        { static volatile LONG s_captured = 0;
+          const char* snap_prefix = getenv("GT6_PDI_CAPTURE_SNAPSHOT");
+          if (snap_prefix && InterlockedCompareExchange(&s_captured, 1, 0) == 0) {
+              char path[512];
+              snprintf(path, sizeof path, "%s.bin", snap_prefix);
+              FILE* sf = fopen(path, "wb");
+              if (sf) {
+                  uint64_t wd = job->workload_data;
+                  uint32_t ps = poll_status;
+                  fwrite("GT6PDISNAP1", 1, 12, sf);           /* magic+version, 12 bytes */
+                  fwrite(&wd, sizeof wd, 1, sf);               /* workload_data (u64)     */
+                  fwrite(&ps, sizeof ps, 1, sf);               /* poll_status (u32)       */
+                  fwrite(local_store, 1, SPU_LS_SIZE, sf);     /* full 256 KiB LS         */
+                  fclose(sf);
+                  fprintf(stderr, "[GT6 SPURS] PDI snapshot captured -> %s\n", path);
+              }
+          }
+        }
         for (uint32_t dispatch = 0; dispatch < dispatch_limit; ++dispatch) {
             spu_run_lifted_pdi_policy(gt6_pdi_policy_spu_func_00000A00,
                                       local_store, job->workload_data,
