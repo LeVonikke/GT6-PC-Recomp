@@ -16,6 +16,7 @@
 #include <stdlib.h>
 
 #include "spu_context.h"
+#include "spu_interp.h"   /* spu_interp_run: GT6_PDI_USE_INTERPRETER oracle, see below */
 #include <string.h>
 #include <stdio.h>
 
@@ -177,16 +178,30 @@ static inline int32_t spu_run_lifted_pdi_policy(spu_lifted_entry_fn entry,
         ctx.gpr[4]._u32[1] = 0;
     ctx.gpr[5]._u32[0] = poll_status;
 
+    /* GT6_PDI_USE_INTERPRETER: run the same job through spu_interp.c (from the
+     * 2026-08-14 upstream fold) instead of the statically lifted entry, as a
+     * correctness oracle -- interp_run shares this exact spu_context and calls
+     * the same spu_<mnemonic> helpers the lifter emits, so any behavioral
+     * difference against the normal lifted path points at a real lifter bug
+     * rather than a runtime/ABI mismatch. Purely diagnostic; off by default. */
+    const int use_interp = getenv("GT6_PDI_USE_INTERPRETER") != NULL;
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
       extern int spu_resume_with_halt(spu_context*);
       extern int spu_system_service_lockwait(spu_context*);
-      int halted = spu_run_with_halt(entry, &ctx);
+      int halted;
+      if (use_interp) {
+          ctx.stop_code = spu_interp_run(&ctx, 0x0A00u);
+          halted = 1;
+      } else {
+          halted = spu_run_with_halt(entry, &ctx);
+      }
       /* A persistent Kernel1 lane must park system-service work outside the
        * generated C call chain.  Resuming through the dispatcher retains the
        * same context/MFC state but starts with an empty host-call stack, which
        * matches the SPU's independent execution stack.  This mode is entirely
-       * opt-in and handles only the real WID-32 idle boundary. */
-      if (getenv("GT6_PDI_SYSTEM_SERVICE_LOCKWAIT")) {
+       * opt-in and handles only the real WID-32 idle boundary. Interpreter path
+       * has no host call chain to resume this way -- skip it there. */
+      if (!use_interp && getenv("GT6_PDI_SYSTEM_SERVICE_LOCKWAIT")) {
           while (halted && ctx.stop_code == 0x7ffeu) {
               if (!spu_system_service_lockwait(&ctx))
                   break;

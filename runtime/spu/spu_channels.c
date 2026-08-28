@@ -856,8 +856,10 @@ extern void gt6_spurs_kernel_spu_func_00000818(spu_context* ctx);
 extern void gt6_spurs_kernel_spu_func_00000844(spu_context* ctx);
 extern void gt6_spurs_kernel_spu_func_00000290(spu_context* ctx);
 /* Generated from the second policy module in the user's local libsre.prx.
- * This is distinct from GT6's raw PDI workload policy (image 24). */
-static void spu_spurs_taskset_syscall(spu_context* ctx)
+ * This is distinct from GT6's raw PDI workload policy (image 24).
+ * Non-static: also called directly by the pure interpreter (spu_interp.c,
+ * upstream 2026-08-14 fold) when it reaches this LS address itself. */
+void spu_spurs_taskset_syscall(spu_context* ctx)
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
     uint32_t num = raw & 0x0F;
