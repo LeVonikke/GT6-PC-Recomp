@@ -10,6 +10,12 @@
 #include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
                         * leaves per-thread CRT state uninit -> buffered fread() silently
                         * returns 0 on those threads). */
+#else
+#include <unistd.h>
+#include <sys/syscall.h>   /* SYS_gettid: temporary diagnostic to map our internal
+                            * thread_id to the real kernel tid for strace -p, so idle
+                            * worker threads can be inspected from outside our own
+                            * (rate-capped) trace fprintf()s. */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -79,9 +85,16 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
 
+#ifndef _WIN32
+    fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX kerneltid=%ld\n",
+            (unsigned long long)info->ctx.thread_id,
+            (unsigned long long)info->entry_addr,
+            (long)syscall(SYS_gettid));
+#else
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX\n",
             (unsigned long long)info->ctx.thread_id,
             (unsigned long long)info->entry_addr);
+#endif
 
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
