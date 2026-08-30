@@ -1,3 +1,10 @@
+# Real Sony PS3 system firmware modules (SPU .prx libraries), needed on disk
+# for local development (GT6_PDI_REAL_KERNEL1) but never to be committed --
+# copyrighted Sony binaries, not this project's code. Scrubbed from git
+# history 2026-08-30 (git-filter-repo); see historico_ia.txt. Get your own
+# copy from firmware you're licensed to use.
+fw_spu/*.prx
+
 # Build directories
 build/
 build-linux/
