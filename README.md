@@ -1,64 +1,105 @@
 # GT6 PC Recomp
 
-**Static recompilation of Gran Turismo 6 (PS3, title ID `NPUA81049`) into a native PC executable — no PS3 emulator involved.**
+**Static recompilation of Gran Turismo 6 (PS3, title `NPUA81049`) into a native PC executable — no PS3 emulator involved.**
 
-This is a private fork of [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp), a general-purpose PS3 static-recompilation toolkit. Instead of interpreting PowerPC/SPU instructions at runtime the way an emulator (e.g. RPCS3) does, `ps3recomp` lifts the game's PPU/SPU code ahead of time into C/C++ and compiles it with a normal compiler. This repository is the GT6-specific application of that toolkit: the lifted game code, the HLE (high-level emulation) bridges for the PS3 system calls GT6 actually calls, and the SPURS/PDI runtime work needed to get the title running.
+Instead of interpreting PowerPC/SPU instructions at runtime the way an emulator (RPCS3) does, this project lifts GT6's actual PPU and SPU machine code ahead of time into plain C/C++ and compiles it with a normal compiler. The output is a real native executable that runs GT6's own code directly on the CPU — the same approach used by projects like Zelda64Recomp, N64: Recompiled, and the [ps3recomp](https://github.com/sp00nznet/ps3recomp) framework this is built on.
 
-## Status
+**If you're new here: read [`historico_ia.txt`](historico_ia.txt) before touching anything.** It's the project's real memory — a dated, append-only log of every session, every hypothesis tried, every bug found and fixed, and every dead end already ruled out. This README is an entry point and orientation; that file is the actual source of truth, and it is *long* (hundreds of dated entries) for a good reason: this kind of reverse-engineering work is easy to accidentally re-investigate from scratch if the history isn't kept.
 
-**Boots, does not yet render or reach gameplay.** This is genuinely hard, ongoing reverse-engineering work — see [`historico_ia.txt`](historico_ia.txt) for the authoritative, session-by-session log (what was tried, what was proven, and the exact point to resume). As of the last confirmed session:
+## Status, honestly
 
-- The recompiled `EMAIN.ELF` (GT6's real main executable, 69,453 lifted PPU functions) loads, sets up TLS, dispatches to the entry point, and creates PPU worker threads.
-- It reaches the D3D12 backend, sets up render targets/shaders, and issues `CLEAR_SURFACE`/`DRAW_IMMEDIATE` — but never a real draw call, so every captured frame is still a flat background color.
-- SPURS/PDI (the PS3's cooperative SPU scheduler, which GT6 uses to stream its `PDIPFS` game data) real workloads (WIDs 5/6/7) get scheduled and run DMA against real `PDIPFS` files, but the specific completion callback that should hand control to the game's own UI/menu code (`func_00A70974` → `func_00A710FC`, reached through a vtable slot, not a direct call) is never invoked.
-- Root cause of that last gap is still open. Static analysis alone (reading the lifted/disassembled code without running it) hasn't been enough to pin it down — see the bottom of `historico_ia.txt` for what was ruled out and what's still untested.
+**Boots deep into real PS3 system emulation. Does not yet render a frame or reach gameplay.** Concretely, on a real run against the actual decrypted `EMAIN.elf`:
 
-Building and running the game harness currently requires **Windows + MSVC + a D3D12-capable GPU** (see below). The GT6-specific harness code (`gt6/main.cpp`) calls the D3D12 backend directly; porting it to also build headless on Linux (there's already an `rsx_null_backend` upstream that could stand in for D3D12) is a known, not-yet-done next step.
+- The executable loads, sets up TLS, dispatches to the real entry point, and creates ~29 PPU worker threads matching the game's own boot sequence (peripheral detection, `cellMouse`/`cellKb` init and teardown, GCM/RSX setup, tile binding, `SetPrepareFlip`).
+- SPURS/PDI (the PS3's cooperative SPU task scheduler, which GT6 uses to stream its `PDIPFS` game data) initializes for real, dispatches real workloads, and issues real DMA against real `PDIPFS` files on disk.
+- A real, hardware-verified job-dispatch mechanism exists in the game's own code — at least two independent "worker pool" dispatch loops were found and confirmed live with `gdb` — but **the actual job/work pointer these loops are supposed to receive is never installed**. The loops run correctly, forever, doing nothing, because nobody ever hands them anything to do.
+- Three real bugs have been found and fixed in *our own* runtime this way (not GT6's code): a genuine deadlock in the thread-join cleanup path, a missing `pthread_exit()` equivalent on Linux that let "finished" threads keep running, and a completely unimplemented LV2 syscall (`sys_mmapper_enable_page_fault_notification`) that GT6 depends on for on-demand memory streaming. Each fix measurably unblocked more of the boot sequence — but none of them, alone or together, has yet reached the actual root cause above.
+
+**The root cause is still open.** It's the single most-searched-for thing in this project's history. See the most recent entries in `historico_ia.txt` for exactly what's been ruled out (with live `gdb` watchpoint evidence, not guesses) and the concrete next place to look — the current best lead is to trace one level further up the call graph, to whoever *allocates and initializes* the job-dispatch slot objects, since the missing piece has to be something that would affect multiple independent dispatch loops at once, not a bug local to any single one.
+
+## It builds and boots on both Windows and Linux
+
+This is worth stating plainly because past documentation (including in this repo, and in `ps3recomp` upstream) assumed Windows/MSVC/D3D12 as a hard requirement. That's no longer true. The runtime and the GT6 harness both build and run natively on Linux (verified on Arch, GCC), headless (no D3D12 dependency — non-Windows builds skip straight to the RSX-null path). Most of the deep debugging work in this project's recent history was done entirely on Linux, using `gdb` live against the running process — hardware watchpoints on guest memory, breakpoints inside the recompiled code, the works. That workflow is genuinely one of this project's strengths: because the game's code is *compiled*, not interpreted, a normal debugger sees real, named C++ functions and can set real breakpoints inside GT6's own recompiled logic. See `historico_ia.txt`'s recent entries for the actual technique (including the non-obvious `handle SIGSEGV nostop noprint pass` gdb setting needed, since this project relies on real SIGSEGVs for lazy guest-memory commit).
+
+## Branches
+
+- **`merge-upstream-fold`** (default) — the actively developed branch. Includes 542 commits merged in from upstream `ps3recomp` (safely, cherry-picked/reconciled rather than blindly merged — see `historico_ia.txt` around 2026-08-25 for the reasoning and what was deliberately *not* adopted, e.g. an independent SPURS rewrite with real endianness-regression risk), plus all of this project's own SPU/PPU lifter fixes, HLE work, and the live-debugging investigation described above. **Start here.**
+- **`master`** — an older, more conservative snapshot, kept as a stable reference point from before the upstream merge. It does not have the three bug fixes or the deepest boot investigation described above.
 
 ## Repository layout
 
-- [`gt6/`](gt6/README.md) — the GT6-specific worktree: HLE bridges (`gt6_hle.cpp`), the native runner (`main.cpp`), SPU job/policy images, and the `emain_project/` CMake target that builds `GT6MainRecomp.exe`.
-- [`historico_ia.txt`](historico_ia.txt) — the project's memory. Read this before touching anything; it has the full history, closed decisions, measurements, and mistakes already made.
-- `runtime/` — game-agnostic PPU/SPU emulation core (context, memory, syscalls, lifecycle).
-- `libs/` — HLE implementations of the PS3 system libraries GT6 calls (`cellFs`, `cellSpurs`, `cellGcmSys`, audio, input, etc.).
-- `tools/` — the Python lifter/disassembler/analysis pipeline (`ppu_lifter.py`, `spu_lifter.py`, `show_func.py`, and friends) that turns the decrypted ELF into the C++ under `gt6/`.
-- `docs/` — the upstream `ps3recomp` framework documentation (architecture, build system, platform abstraction, NID system, etc.) — not GT6-specific, but explains the machinery GT6's port is built on.
+- [`gt6/`](gt6/README.md) — the GT6-specific application: HLE bridges (`gt6_hle.cpp`), the native runner (`main.cpp`), SPU job/policy images, the `emain_project/` CMake target that builds `GT6MainRecompHook`, and `emain_recompiled/` (gitignored — the lifter's actual C++ output; regenerate it yourself from your own game copy, see below).
+- [`historico_ia.txt`](historico_ia.txt) — read this first. The project's full history, closed decisions, measurements, live-debugging findings, and mistakes already made and fixed. Dated, append-only, in Portuguese.
+- `runtime/` — game-agnostic PPU/SPU emulation core: guest memory, LV2 syscalls, thread lifecycle, the PPU/SPU execution context.
+- `libs/` — HLE implementations of the PS3 system libraries GT6 calls (`cellFs`, `cellSpurs`, `cellGcmSys`, audio, input, font, codec, etc.).
+- `tools/` — the Python lifter/disassembler/analysis pipeline (`ppu_lifter.py`, `spu_lifter.py`, `find_functions.py`, `elf_symbols.py`, and others) that turns a decrypted PS3 ELF into the C++ under `gt6/emain_recompiled/`.
+- `docs/` — the upstream `ps3recomp` framework's own documentation (architecture, build system, NID system, platform abstraction) — not GT6-specific, but explains the machinery this port is built on.
 
 ## Building
 
-### Windows (primary target — needed for actual gameplay testing)
+Both platforms build the same two-step way: the game-agnostic runtime library first, then the GT6-specific harness against it.
 
-Visual Studio 2022 (MSVC) + CMake + Ninja, per [`docs/BUILDING.md`](docs/BUILDING.md):
+### Linux
+
+```bash
+# 1. Runtime library
+cmake -B build-linux -G Ninja
+cmake --build build-linux
+
+# 2. GT6 harness
+cd gt6/emain_project
+cmake -B build-linux -G Ninja
+cmake --build build-linux --target GT6MainRecompHook
+```
+
+**Memory warning, seriously:** the lifter's generated C++ chunks (`gt6/emain_recompiled/ppu_recomp_0XX.cpp`) are enormous — each one can use 4-5GB of RAM to compile even at `-O0`. On a machine with 16GB or less, **never build with high `-j` parallelism** for these specific files; `-j1` or `-j2` at most, or you will OOM the machine (this has happened, more than once, documented in `historico_ia.txt`).
+
+### Windows
+
+MSVC + CMake + Ninja, same two-step structure:
 
 ```powershell
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel 4
+cmake --build build --parallel 2
 
 cd gt6\emain_project
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 2
 ```
 
-Run against your own **legally decrypted** `EMAIN.ELF` (see [`gt6/emain_project/README.md`](gt6/emain_project/README.md) for where the runner expects the PDIPFS-mounted game data):
+Same memory warning applies.
 
-```powershell
-.\build\GT6MainRecomp.exe "path\to\EMAIN.ELF"
-```
-
-### Linux (runtime library only, experimental)
-
-The game-agnostic `ps3recomp_runtime` library builds clean natively with GCC/Clang — verified with GCC 16 on Arch:
+## Running
 
 ```bash
-cmake -B build -G Ninja
-cmake --build build
+./gt6/emain_project/build-linux/GT6MainRecompHook /path/to/your/decrypted/EMAIN.elf
 ```
 
-The GT6 game harness (`gt6/emain_project`) does **not** build on Linux yet — it needs the D3D12 → `rsx_null_backend` swap and a couple more `_WIN32`-guard fixes described in `historico_ia.txt`'s most recent entry.
+A handful of environment variables gate specific, still-experimental code paths (all opt-in, all default off/safe):
 
-## Game files
+| Variable | Effect |
+|---|---|
+| `GT6_RPCS3_STORAGE` | Root of your RPCS3-style storage tree (where `dev_hdd0/game/NPUA81049/USRDIR` lives). Defaults to a stale hardcoded path — always set this explicitly. |
+| `GT6_PDI_REAL_KERNEL1` | Enables the real SPURS Kernel1 bridge instead of the earlier HLE shortcut. Needed to get past early boot. |
+| `GT6_PDI_KERNEL1_RECONCILE_FLAG`, `GT6_PDI_KERNEL1_DISPATCH_ABI` | Companion fixes for the same bridge (dispatch ABI r4/r5 reconstruction). Used together with the above in every recent working session. |
+| `GT6_SMOKE_TIMEOUT_MS` | Passive watchdog: dumps a thread snapshot after N ms and exits (Windows) or just logs (Linux). Doesn't change execution otherwise. |
+| `YDKJ_HANDLERTRACE` | Verbose trace of the VBlank/Flip handler dispatch path. |
 
-**No game data, ROM/ISO images, decrypted executables, or PS3 firmware modules are included in this repository.** You need your own legally owned copy of Gran Turismo 6 and must decrypt/extract `EMAIN.ELF` and the `PDIPFS` data yourself. `.gitignore` deliberately excludes `*.elf`, `*.self`, `*.bin`, `*.pkg`, and similar extensions for this reason.
+There are many more `GT6_*`/`YDKJ_*` flags scattered through the codebase gating specific diagnostic probes added during investigation — grep for `getenv("GT6_` / `getenv("YDKJ_` if you need one, and check `historico_ia.txt` for what a given session was using at the time.
+
+## Game files — not included, and never will be
+
+**No game data, disc images, decrypted executables, save data, or PS3 firmware modules are included in this repository**, and `fw_spu/*.prx` is `.gitignore`d specifically because early in this project's history real Sony PS3 system firmware modules were accidentally committed — they've since been scrubbed from the entire git history with `git-filter-repo`. You need:
+
+1. Your own **legally owned** copy of Gran Turismo 6, decrypted yourself (`EMAIN.elf`, `EBOOT.BIN`, the `PDIPFS` data).
+2. Your own copy of the specific PS3 SPU firmware modules referenced under `fw_spu/` (`libsre.prx` and friends) — same rule: get these from firmware you're licensed to use, drop them in `fw_spu/`, do not ask for or share copies.
+
+## How to continue this
+
+1. Read `historico_ia.txt`, at least the last 10-15 dated entries, to get the actual current state (this README is a snapshot; that file is live).
+2. Build on Linux — it's the faster iteration loop and where the deepest debugging happened.
+3. Run with the env vars above against your own game copy, attach `gdb` (`sudo gdb -p <pid>`, remembering `handle SIGSEGV nostop noprint pass` before continuing), and pick up the specific next-step pointer at the bottom of the most recent `historico_ia.txt` entry.
+4. When you find something — confirm it live before writing it down. This project's history has a hard-won discipline of "verified in a live run, not guessed from reading code," and it's the reason genuinely wrong dead-end theories from months ago don't keep getting re-investigated. Keep it that way; append to `historico_ia.txt`, don't rewrite it.
 
 ## Credits
 
