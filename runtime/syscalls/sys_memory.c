@@ -9,9 +9,19 @@
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
-sys_mem_alloc_info       g_sys_mem_allocs[SYS_MEMORY_ALLOC_MAX];
-sys_mem_container_info   g_sys_mem_containers[SYS_MEMORY_CONTAINER_MAX];
-sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
+sys_mem_alloc_info          g_sys_mem_allocs[SYS_MEMORY_ALLOC_MAX];
+sys_mem_container_info      g_sys_mem_containers[SYS_MEMORY_CONTAINER_MAX];
+sys_mmapper_shared_info     g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
+sys_mmapper_pf_notify_info  g_sys_mmapper_pf_notify[SYS_MMAPPER_PF_NOTIFY_MAX];
+
+/* Remembers (addr, size) for the last few sys_mmapper_allocate_address calls,
+ * purely so a LATER sys_mmapper_enable_page_fault_notification(addr, queue)
+ * call -- which only receives the address, not a size -- can recover the
+ * region's extent. Small and separate from g_sys_mmapper_pf_notify itself
+ * because most allocations never get notification enabled. */
+#define SYS_MMAPPER_ALLOC_HISTORY_MAX 32
+static struct { uint32_t addr; uint32_t size; } s_mmapper_alloc_history[SYS_MMAPPER_ALLOC_HISTORY_MAX];
+static int s_mmapper_alloc_history_n = 0;
 
 /* Bump allocator for main memory pool.
  * Starts after a reasonable offset to avoid the low addresses used by ELF. */
@@ -329,14 +339,110 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
 
     bump_unlock();
 
-    /* Commit the reserved region */
-    vm_commit(alloc_addr, size);
+    /* Deliberately NOT vm_commit() here (that would make the whole region
+     * readable/writable immediately). The comment above already documented
+     * the intent -- "pages are committed on demand" -- but an eager commit
+     * had crept in, which defeats sys_mmapper_enable_page_fault_notification
+     * below: a region that's already accessible never faults, so the
+     * notification event this title relies on (see that function) would
+     * never fire. Leaving the region PROT_NONE and letting the existing
+     * global lazy-commit path (gt6_posix_segv_handler, gt6/main.cpp) mprotect
+     * it on first real touch is exactly the same mechanism every other guest
+     * page already depends on -- this isn't a new risk, just consistency. */
+    if (s_mmapper_alloc_history_n < SYS_MMAPPER_ALLOC_HISTORY_MAX) {
+        s_mmapper_alloc_history[s_mmapper_alloc_history_n].addr = alloc_addr;
+        s_mmapper_alloc_history[s_mmapper_alloc_history_n].size = size;
+        s_mmapper_alloc_history_n++;
+    } else {
+        /* History is a small ring in practice this never fills; if it does,
+         * drop the oldest rather than the newest (most likely to still be
+         * pending a matching enable_page_fault_notification call). */
+        memmove(&s_mmapper_alloc_history[0], &s_mmapper_alloc_history[1],
+                sizeof(s_mmapper_alloc_history[0]) * (SYS_MMAPPER_ALLOC_HISTORY_MAX - 1));
+        s_mmapper_alloc_history[SYS_MMAPPER_ALLOC_HISTORY_MAX - 1].addr = alloc_addr;
+        s_mmapper_alloc_history[SYS_MMAPPER_ALLOC_HISTORY_MAX - 1].size = size;
+    }
 
     if (addr_out != 0) {
         write_be32(addr_out, alloc_addr);
     }
 
     return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_mmapper_enable_page_fault_notification  (syscall 327)
+ *
+ * r3 = start_addr (must match an address returned by allocate_address above)
+ * r4 = event_queue_id
+ *
+ * Real LV2 semantics: the FIRST access to any page in [start_addr, +size)
+ * delivers an event to event_queue_id instead of just completing, and the
+ * game's own recovery syscall (sys_ppu_thread_recover_page_fault, not yet
+ * implemented here) lets the faulting access proceed once the game's own
+ * handler has done whatever it needed to. We approximate this: the notify
+ * event fires (see sys_mmapper_pf_notify_lookup, called from
+ * gt6_posix_segv_handler in gt6/main.cpp) but the faulting access is allowed
+ * to complete immediately afterward rather than genuinely blocking -- a
+ * pragmatic simplification, not a faithful implementation of the recovery
+ * handshake. Good enough to test whether GT6 is actually waiting on this
+ * event at all; see historico_ia.txt 2026-08-30.
+ * -----------------------------------------------------------------------*/
+int64_t sys_mmapper_enable_page_fault_notification(ppu_context* ctx)
+{
+    uint32_t start_addr     = LV2_ARG_U32(ctx, 0);
+    uint32_t event_queue_id = LV2_ARG_U32(ctx, 1);
+
+    uint32_t size = 0;
+    for (int i = 0; i < s_mmapper_alloc_history_n; i++) {
+        if (s_mmapper_alloc_history[i].addr == start_addr) {
+            size = s_mmapper_alloc_history[i].size;
+            break;
+        }
+    }
+    if (size == 0) {
+        /* Live 2026-08-30: GT6 actually calls this for fixed, well-known
+         * region starts (observed addr=0x20000000 and addr=0x50000000 --
+         * the low end of the real valid range, and our own allocator's
+         * bump-end boundary, respectively) rather than an address it just
+         * got back from allocate_address. There's nothing to look up a real
+         * size from for these. Fall back to a generous default rather than
+         * silently rejecting the registration -- real LV2's valid range for
+         * this syscall is documented as 0x20000000-0xC0000000; cap there. */
+        const uint32_t default_size = 0xC0000000u - start_addr;
+        size = default_size;
+        fprintf(stderr, "[sys_mmapper] enable_page_fault_notification(addr=%08X eq=%u): "
+                        "no matching allocate_address call, using default size=%08X\n",
+                start_addr, event_queue_id, size);
+    }
+
+    int slot = -1;
+    for (int i = 0; i < SYS_MMAPPER_PF_NOTIFY_MAX; i++) {
+        if (!g_sys_mmapper_pf_notify[i].active) { slot = i; break; }
+    }
+    if (slot < 0) return (int64_t)(int32_t)CELL_ENOMEM;
+
+    g_sys_mmapper_pf_notify[slot].active         = 1;
+    g_sys_mmapper_pf_notify[slot].start_addr     = start_addr;
+    g_sys_mmapper_pf_notify[slot].size           = size;
+    g_sys_mmapper_pf_notify[slot].event_queue_id = event_queue_id;
+
+    fprintf(stderr, "[sys_mmapper] enable_page_fault_notification(addr=%08X size=%08X eq=%u) registered\n",
+            start_addr, size, event_queue_id);
+
+    return CELL_OK;
+}
+
+uint32_t sys_mmapper_pf_notify_lookup(uint32_t fault_addr)
+{
+    for (int i = 0; i < SYS_MMAPPER_PF_NOTIFY_MAX; i++) {
+        if (!g_sys_mmapper_pf_notify[i].active) continue;
+        uint32_t start = g_sys_mmapper_pf_notify[i].start_addr;
+        uint32_t end   = start + g_sys_mmapper_pf_notify[i].size;
+        if (fault_addr >= start && fault_addr < end)
+            return g_sys_mmapper_pf_notify[i].event_queue_id;
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -427,6 +533,8 @@ void sys_memory_init(lv2_syscall_table* tbl)
     memset(g_sys_mem_allocs,     0, sizeof(g_sys_mem_allocs));
     memset(g_sys_mem_containers, 0, sizeof(g_sys_mem_containers));
     memset(g_sys_mmapper_shared, 0, sizeof(g_sys_mmapper_shared));
+    memset(g_sys_mmapper_pf_notify, 0, sizeof(g_sys_mmapper_pf_notify));
+    s_mmapper_alloc_history_n = 0;
     g_sys_mem_bump_ptr = 0;
     s_total_allocated  = 0;
 
@@ -441,4 +549,5 @@ void sys_memory_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_MMAPPER_FREE_ADDRESS,        sys_mmapper_free_address);
     lv2_syscall_register(tbl, SYS_MMAPPER_ALLOCATE_SHARED_MEMORY, sys_mmapper_allocate_shared_memory);
     lv2_syscall_register(tbl, SYS_MMAPPER_MAP_SHARED_MEMORY,  sys_mmapper_map_shared_memory);
+    lv2_syscall_register(tbl, SYS_MMAPPER_ENABLE_PAGE_FAULT_NOTIFICATION, sys_mmapper_enable_page_fault_notification);
 }

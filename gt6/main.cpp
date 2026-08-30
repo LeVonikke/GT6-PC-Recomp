@@ -1,4 +1,6 @@
 #include "../runtime/syscalls/sys_ppu_thread.h"
+#include "../runtime/syscalls/sys_memory.h"
+#include "../runtime/syscalls/sys_event.h"
 #include "../runtime/ppu/ppu_context.h"
 #include "cellGame.h"
 #include "ps3emu/guest_call.h"
@@ -497,6 +499,20 @@ static void gt6_posix_segv_handler(int sig, siginfo_t* info, void* uctx)
     const uintptr_t fault = reinterpret_cast<uintptr_t>(info->si_addr);
     const uintptr_t base = reinterpret_cast<uintptr_t>(vm_base);
     if (vm_base && fault >= base && fault < base + kGuestVmSize) {
+        const uint32_t guest_addr = static_cast<uint32_t>(fault - base);
+        /* sys_mmapper_enable_page_fault_notification (2026-08-30): this first
+         * real touch of a registered mmapper region is meant to behave like a
+         * genuine PS3 page fault -- deliver an event instead of transparently
+         * granting access. Not async-signal-safe in the strict POSIX sense
+         * (same caveat this handler already accepted for the fprintf below),
+         * but consistent with the project's existing tolerance for that. */
+        const uint32_t pf_queue = sys_mmapper_pf_notify_lookup(guest_addr);
+        if (pf_queue) {
+            fprintf(stderr, "[GT6 PF] page fault notification: addr=%08X -> queue=%u\n",
+                    guest_addr, pf_queue);
+            sys_event_queue_push_by_id(pf_queue, /*source=*/0, /*data1=*/guest_addr,
+                                        /*data2=*/0, /*data3=*/0);
+        }
         void* page = reinterpret_cast<void*>(fault & ~static_cast<uintptr_t>(0xFFFF));
         if (mprotect(page, 0x10000, PROT_READ | PROT_WRITE) == 0)
             return; /* retry the faulting instruction */
