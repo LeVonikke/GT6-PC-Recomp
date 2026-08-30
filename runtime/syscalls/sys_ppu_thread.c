@@ -360,10 +360,18 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
      * recompiled worker continue past its exit path and reuse queues already
      * destroyed by its joiner (the audio/resource worker then spins on an
      * inactive event queue).  The main bootstrap context is not a host-created
-     * PPU worker, so only terminate registered worker threads. */
+     * PPU worker, so only terminate registered worker threads.
+     * ExitThread() covered this on Windows, but the non-Windows side had no
+     * equivalent -- pthread_exit() is it. Confirmed live (2026-08-30): without
+     * this, a joined worker (e.g. tid=15) keeps running past its own exit and
+     * re-enters event_queue_receive on a queue its joiner may already be
+     * tearing down. See historico_ia.txt. */
 #ifdef _WIN32
     if (tid != 0)
         ExitThread(0);
+#else
+    if (tid != 0)
+        pthread_exit(NULL);
 #endif
     return CELL_OK;
 }
@@ -423,20 +431,36 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 #endif
     }
 
-    /* Clean up */
-    table_lock();
+    /* Clean up. pthread_join() must NOT run under s_table_lock: the target
+     * thread's own ppu_host_thread_proc still needs that same lock (to record
+     * PPU_THREAD_STATE_FINISHED and, for a detached thread, FREE) between
+     * returning from the recompiled entry and actually exiting the host
+     * thread -- t->finished/state==FINISHED being set is not the same event
+     * as the host OS thread having terminated. Holding s_table_lock across
+     * pthread_join() here deadlocks the moment another thread reaches that
+     * same table_lock() first: this joiner blocks in pthread_join() waiting
+     * for an OS-level exit that can only happen after that other thread's
+     * table_lock() succeeds, which it never will while we hold it. Reproduced
+     * live (gdb, both sides caught mid-deadlock: the joiner inside
+     * pthread_join with s_table_lock.__owner == its own tid, at least one
+     * worker parked in table_lock() at ppu_host_thread_proc's "Mark as
+     * finished" step) -- see historico_ia.txt 2026-08-30. */
 #ifdef _WIN32
     CloseHandle(t->host_thread);
     CloseHandle(t->finish_event);
+    table_lock();
     t->host_thread = NULL;
     t->finish_event = NULL;
+    t->state = PPU_THREAD_STATE_FREE;
+    table_unlock();
 #else
     pthread_join(t->host_thread, NULL);
     pthread_mutex_destroy(&t->finish_mutex);
     pthread_cond_destroy(&t->finish_cond);
-#endif
+    table_lock();
     t->state = PPU_THREAD_STATE_FREE;
     table_unlock();
+#endif
 
     return CELL_OK;
 }

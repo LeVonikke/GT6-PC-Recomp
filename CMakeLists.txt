@@ -130,6 +130,13 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
         -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
+        -g   # CMAKE_BUILD_TYPE is left unset for this project, so nothing else
+             # adds debug info -- without it gdb can resolve line numbers (from
+             # the .c filename embedded in fprintf strings, coincidentally) but
+             # not local variables or struct types in this library, making live
+             # debugging (gdb attach + watch/print) far less useful than it is
+             # for the executable's own sources (compiled with a different
+             # default). See historico_ia.txt 2026-08-30.
     )
 elseif(MSVC)
     target_compile_options(ps3recomp_runtime PRIVATE
