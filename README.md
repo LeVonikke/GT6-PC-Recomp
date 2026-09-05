@@ -1,6 +1,6 @@
 # GT6 PC Recomp
 
-![C++](https://img.shields.io/badge/C%2B%2B-blue) ![Status](https://img.shields.io/badge/status-ativo-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey) ![License](https://img.shields.io/badge/license-see%20LICENSE-informational)
+![C++](https://img.shields.io/badge/C%2B%2B-blue) ![Status](https://img.shields.io/badge/status-active-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey) ![License](https://img.shields.io/badge/license-see%20LICENSE-informational)
 
 **Static recompilation of Gran Turismo 6 (PS3, title `NPUA81049`) into a native PC executable — no PS3 emulator involved.**
 
