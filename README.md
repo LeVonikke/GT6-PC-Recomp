@@ -1,5 +1,7 @@
 # GT6 PC Recomp
 
+![C++](https://img.shields.io/badge/C%2B%2B-blue) ![Status](https://img.shields.io/badge/status-ativo-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey) ![License](https://img.shields.io/badge/license-see%20LICENSE-informational)
+
 **Static recompilation of Gran Turismo 6 (PS3, title `NPUA81049`) into a native PC executable — no PS3 emulator involved.**
 
 Instead of interpreting PowerPC/SPU instructions at runtime the way an emulator (RPCS3) does, this project lifts GT6's actual PPU and SPU machine code ahead of time into plain C/C++ and compiles it with a normal compiler. The output is a real native executable that runs GT6's own code directly on the CPU — the same approach used by projects like Zelda64Recomp, N64: Recompiled, and the [ps3recomp](https://github.com/sp00nznet/ps3recomp) framework this is built on.
